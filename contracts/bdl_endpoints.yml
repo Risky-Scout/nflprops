@@ -1,0 +1,1060 @@
+meta:
+  provider: balldontlie
+  openapi_version: 3.1.0
+  api_title: BALLDONTLIE - NFL API
+  api_version: 1.0.0
+  base_url: https://api.balldontlie.io
+  auth:
+    scheme: api_key
+    location: header
+    header_name: Authorization
+    value: <raw api key, no Bearer prefix>
+  spec_pin:
+    path: specs/providers/bdl/nfl.yml
+    sha256: PENDING__populate_by_running__nflprops_provider_pin_bdl
+    captured_at: PENDING
+  ignored_spec_endpoints:
+    /nfl/v1/fantasy/adp: Not consumed by the fundamental player-prop model; external fantasy consensus is excluded from the
+      fundamental forecast.
+    /nfl/v1/fantasy/projections: Not consumed by the fundamental player-prop model; external projections are challenger/market-context
+      data only.
+    /nfl/v1/fantasy/rankings: Not consumed by the fundamental player-prop model; external rankings are challenger/market-context
+      data only.
+    /nfl/v1/fantasy/scoring_formats: Fantasy scoring metadata is outside the player-prop simulation contract.
+    /nfl/v1/fantasy/weekly_stats: Not required because structured NFL player game stats are the ground-truth source for core
+      prop settlement.
+pagination:
+  style: cursor
+  request_params:
+  - cursor
+  - per_page
+  per_page_default: 25
+  per_page_max: 100
+  response_meta_fields:
+  - next_cursor
+  - prev_cursor
+  - per_page
+  termination: stop when meta.next_cursor is null
+  exceptions:
+  - endpoint: /nfl/v1/odds/player_props
+    note: Returns ALL props for a game in one response; does NOT use the standard cursor loop.
+  - endpoint: /nfl/v1/odds/player_props/opening
+    note: Has no cursor/per_page query parameters; treat as a single-response endpoint.
+enums:
+  season_type:
+    '1': preseason
+    '2': regular_season
+    '3': postseason
+  game_status_state:
+  - scheduled
+  - in_progress
+  - final
+  - postponed
+  - canceled
+  - delayed
+  - suspended
+  - abandoned
+  - unknown
+  player_prop_vendors:
+  - draftkings
+  - fanduel
+  - caesars
+  - betmgm
+  - fanatics
+  - betrivers
+  player_prop_types:
+  - anytime_td
+  - anytime_td_1h
+  - anytime_td_1q
+  - anytime_td_2h
+  - fg_made
+  - fg_made_1h
+  - first_td
+  - interceptions
+  - kicking_points
+  - longest_pass
+  - longest_reception
+  - longest_rush
+  - passing_attempts
+  - passing_completions
+  - passing_tds
+  - passing_tds_1h
+  - passing_yards
+  - passing_yards_1h
+  - receiving_yards
+  - receiving_yards_1h
+  - receptions
+  - rushing_attempts
+  - rushing_receiving_yards
+  - rushing_yards
+  - rushing_yards_1h
+  market_type:
+    over_under:
+      fields:
+      - over_odds
+      - under_odds
+    milestone:
+      fields:
+      - odds
+endpoints:
+  teams:
+    path: /nfl/v1/teams
+    method: GET
+    criticality: core
+    params:
+      division:
+        type: string
+        required: false
+      conference:
+        type: string
+        required: false
+    schema: NFLTeam
+    fields:
+    - id
+    - conference
+    - division
+    - location
+    - name
+    - full_name
+    - abbreviation
+  team:
+    path: /nfl/v1/teams/{id}
+    method: GET
+    criticality: core
+    params:
+      id:
+        type: integer
+        required: true
+        in: path
+    schema: NFLTeam
+    fields:
+    - id
+    - conference
+    - division
+    - location
+    - name
+    - full_name
+    - abbreviation
+  roster:
+    path: /nfl/v1/teams/{id}/roster
+    method: GET
+    criticality: core
+    tier: goat
+    availability: 2025 season onward
+    params:
+      id:
+        type: integer
+        required: true
+        in: path
+      season:
+        type: integer
+        required: false
+    schema: NFLRosterEntry
+    fields:
+    - player
+    - position
+    - depth
+    - player_name
+    - injury_status
+    nested:
+      player:
+        fields:
+        - id
+        - first_name
+        - last_name
+        - position
+        - position_abbreviation
+        - height
+        - weight
+        - jersey_number
+        - college
+        - experience
+        - age
+  players:
+    path: /nfl/v1/players
+    method: GET
+    criticality: core
+    params:
+      cursor:
+        type: integer
+        required: false
+      per_page:
+        type: integer
+        required: false
+      team_ids:
+        type: array
+        required: false
+        array_param: true
+      player_ids:
+        type: array
+        required: false
+        array_param: true
+      search:
+        type: string
+        required: false
+      first_name:
+        type: string
+        required: false
+      last_name:
+        type: string
+        required: false
+    schema: NFLPlayer
+    fields:
+    - id
+    - first_name
+    - last_name
+    - position
+    - position_abbreviation
+    - height
+    - weight
+    - jersey_number
+    - college
+    - experience
+    - age
+    - team
+  active_players:
+    path: /nfl/v1/players/active
+    method: GET
+    criticality: core
+    params:
+      cursor:
+        type: integer
+      per_page:
+        type: integer
+      team_ids:
+        type: array
+        array_param: true
+      player_ids:
+        type: array
+        array_param: true
+      search:
+        type: string
+      first_name:
+        type: string
+      last_name:
+        type: string
+    schema: NFLPlayer
+    fields_ref: players
+  player:
+    path: /nfl/v1/players/{id}
+    method: GET
+    criticality: core
+    params:
+      id:
+        type: integer
+        required: true
+        in: path
+    schema: NFLPlayer
+    fields_ref: players
+  games:
+    path: /nfl/v1/games
+    method: GET
+    criticality: core
+    params:
+      cursor:
+        type: integer
+      per_page:
+        type: integer
+      dates:
+        type: array
+        array_param: true
+      team_ids:
+        type: array
+        array_param: true
+      seasons:
+        type: array
+        array_param: true
+      season_type:
+        type: array
+        array_param: false
+        note: ARRAY on this endpoint; default = [2,3]
+      weeks:
+        type: array
+        array_param: true
+    schema: NFLGame
+    fields:
+    - id
+    - visitor_team
+    - home_team
+    - summary
+    - venue
+    - week
+    - date
+    - season
+    - postseason
+    - status
+    - status_state
+    - home_team_score
+    - visitor_team_score
+    - home_team_q1
+    - home_team_q2
+    - home_team_q3
+    - home_team_q4
+    - home_team_ot
+    - visitor_team_q1
+    - visitor_team_q2
+    - visitor_team_q3
+    - visitor_team_q4
+    - visitor_team_ot
+  game:
+    path: /nfl/v1/games/{id}
+    method: GET
+    criticality: core
+    params:
+      id:
+        type: integer
+        required: true
+        in: path
+    schema: NFLGame
+    fields_ref: games
+  stats:
+    path: /nfl/v1/stats
+    method: GET
+    criticality: essential
+    role: PRIMARY GROUND TRUTH for player full-game outcomes
+    params:
+      cursor:
+        type: integer
+      per_page:
+        type: integer
+      player_ids:
+        type: array
+        array_param: true
+      game_ids:
+        type: array
+        array_param: true
+      seasons:
+        type: array
+        array_param: true
+      season_type:
+        type: integer
+        note: SCALAR on this endpoint; default 2
+    schema: NFLStats
+    field_groups:
+      references:
+      - player
+      - team
+      - game
+      passing:
+      - passing_completions
+      - passing_attempts
+      - passing_yards
+      - yards_per_pass_attempt
+      - passing_touchdowns
+      - passing_interceptions
+      - sacks
+      - sacks_loss
+      - qbr
+      - qb_rating
+      rushing:
+      - rushing_attempts
+      - rushing_yards
+      - yards_per_rush_attempt
+      - rushing_touchdowns
+      - long_rushing
+      receiving:
+      - receptions
+      - receiving_yards
+      - yards_per_reception
+      - receiving_touchdowns
+      - long_reception
+      - receiving_targets
+      fumbles:
+      - fumbles
+      - fumbles_lost
+      - fumbles_recovered
+      - fumbles_touchdowns
+      defense:
+      - total_tackles
+      - defensive_sacks
+      - solo_tackles
+      - tackles_for_loss
+      - passes_defended
+      - qb_hits
+      - defensive_interceptions
+      - interception_yards
+      - interception_touchdowns
+      kick_returns:
+      - kick_returns
+      - kick_return_yards
+      - yards_per_kick_return
+      - long_kick_return
+      - kick_return_touchdowns
+      punt_returns:
+      - punt_returns
+      - punt_return_yards
+      - yards_per_punt_return
+      - long_punt_return
+      - punt_return_touchdowns
+      kicking:
+      - field_goal_attempts
+      - field_goals_made
+      - field_goal_pct
+      - long_field_goal_made
+      - extra_points_made
+      - total_points
+      punting:
+      - punts
+      - punt_yards
+      - gross_avg_punt_yards
+      - touchbacks
+      - punts_inside_20
+      - long_punt
+    retention_rule: Raw storage retains EVERY property including defense/special teams.
+  season_stats:
+    path: /nfl/v1/season_stats
+    method: GET
+    criticality: qa_and_priors
+    leakage_rule: NEVER used as a point-in-time historical feature. QA / reconciliation only.
+    params:
+      season:
+        type: integer
+        required: true
+      player_ids:
+        type: array
+        array_param: true
+      team_id:
+        type: integer
+      season_type:
+        type: integer
+        note: preseason unavailable
+      sort_by:
+        type: string
+      sort_order:
+        type: string
+        enum:
+        - asc
+        - desc
+    schema: NFLSeasonStats
+    field_groups:
+      references:
+      - player
+      - games_played
+      - season
+      - postseason
+      passing:
+      - passing_completions
+      - passing_attempts
+      - passing_yards
+      - passing_yards_per_game
+      - passing_touchdowns
+      - passing_interceptions
+      - passing_completion_pct
+      - passing_first_downs
+      - passing_first_down_pct
+      - passing_20_plus_yards
+      - passing_40_plus_yards
+      - passing_long
+      - passing_sacks
+      - passing_sack_yards
+      - qb_rating
+      rushing:
+      - rushing_attempts
+      - rushing_yards
+      - rushing_yards_per_game
+      - rushing_average
+      - rushing_touchdowns
+      - rushing_first_downs
+      - rushing_first_down_pct
+      - rushing_20_plus_yards
+      - rushing_40_plus_yards
+      - rushing_long
+      - rushing_fumbles
+      receiving:
+      - receptions
+      - receiving_yards
+      - receiving_yards_per_game
+      - receiving_average
+      - receiving_touchdowns
+      - receiving_targets
+      - receiving_first_downs
+      - receiving_first_down_pct
+      - receiving_20_plus_yards
+      - receiving_40_plus_yards
+      - receiving_long
+      - receiving_fumbles
+      fumbles:
+      - fumbles
+      - fumbles_lost
+      - fumbles_forced
+      - fumbles_recovered
+      - fumbles_touchdowns
+  advanced_passing:
+    path: /nfl/v1/advanced_stats/passing
+    method: GET
+    criticality: essential
+    params:
+      cursor:
+        type: integer
+      per_page:
+        type: integer
+      season:
+        type: integer
+        required: true
+      player_id:
+        type: integer
+      week:
+        type: integer
+        note: 0 = full season
+      season_type:
+        type: integer
+        note: preseason unavailable
+    schema: NFLAdvancedPassingStats
+    fields:
+    - player
+    - season
+    - week
+    - postseason
+    - aggressiveness
+    - attempts
+    - avg_air_distance
+    - avg_air_yards_differential
+    - avg_air_yards_to_sticks
+    - avg_completed_air_yards
+    - avg_intended_air_yards
+    - avg_time_to_throw
+    - completion_percentage
+    - completion_percentage_above_expectation
+    - completions
+    - expected_completion_percentage
+    - games_played
+    - interceptions
+    - max_air_distance
+    - max_completed_air_distance
+    - pass_touchdowns
+    - pass_yards
+    - passer_rating
+  advanced_rushing:
+    path: /nfl/v1/advanced_stats/rushing
+    method: GET
+    criticality: essential
+    params:
+      cursor:
+        type: integer
+      per_page:
+        type: integer
+      season:
+        type: integer
+        required: true
+      player_id:
+        type: integer
+      week:
+        type: integer
+        note: 0 = full season
+      season_type:
+        type: integer
+        note: preseason unavailable
+    schema: NFLAdvancedRushingStats
+    fields:
+    - player
+    - season
+    - week
+    - postseason
+    - avg_time_to_los
+    - expected_rush_yards
+    - rush_attempts
+    - rush_pct_over_expected
+    - rush_touchdowns
+    - rush_yards
+    - rush_yards_over_expected
+    - rush_yards_over_expected_per_att
+    - efficiency
+    - percent_attempts_gte_eight_defenders
+    - avg_rush_yards
+  advanced_receiving:
+    path: /nfl/v1/advanced_stats/receiving
+    method: GET
+    criticality: essential
+    params:
+      cursor:
+        type: integer
+      per_page:
+        type: integer
+      season:
+        type: integer
+        required: true
+      player_id:
+        type: integer
+      week:
+        type: integer
+        note: 0 = full season
+      season_type:
+        type: integer
+        note: preseason unavailable
+    schema: NFLAdvancedReceivingStats
+    fields:
+    - player
+    - season
+    - week
+    - postseason
+    - avg_cushion
+    - avg_expected_yac
+    - avg_intended_air_yards
+    - avg_separation
+    - avg_yac
+    - avg_yac_above_expectation
+    - catch_percentage
+    - percent_share_of_intended_air_yards
+    - rec_touchdowns
+    - receptions
+    - targets
+    - yards
+  team_stats:
+    path: /nfl/v1/team_stats
+    method: GET
+    criticality: essential
+    quirk: 'Param names are UNBRACKETED here: team_ids, seasons, game_ids.'
+    params:
+      cursor:
+        type: integer
+      per_page:
+        type: integer
+      team_ids:
+        type: array
+        array_param: false
+      seasons:
+        type: array
+        array_param: false
+      game_ids:
+        type: array
+        array_param: false
+      season_type:
+        type: integer
+        note: scalar
+    schema: NFLTeamStat
+    fields:
+    - game
+    - team
+    - home_away
+    - first_downs
+    - first_downs_passing
+    - first_downs_rushing
+    - third_down_efficiency
+    - third_down_conversions
+    - third_down_attempts
+    - total_yards
+    - yards_per_play
+    - net_passing_yards
+    - passing_completions
+    - passing_attempts
+    - sacks
+    - rushing_yards
+    - rushing_attempts
+    - turnovers
+    - fumbles_lost
+    - interceptions_thrown
+    - penalties
+    - penalty_yards
+    - possession_time
+  team_season_stats:
+    path: /nfl/v1/team_season_stats
+    method: GET
+    criticality: qa
+    warning: 'Endpoint DESCRIPTION claims offense/defense/special-teams/opponent coverage, but the published SCHEMA exposes
+      only the fields listed below. Do NOT invent defensive or opponent fields from this endpoint. Build opponent features
+      by reversing team_stats rows within a game.
+
+      '
+    params:
+      team_ids:
+        type: array
+        required: true
+      season:
+        type: integer
+        required: true
+      cursor:
+        type: integer
+      per_page:
+        type: integer
+      season_type:
+        type: integer
+    schema: NFLTeamSeasonStat
+    fields:
+    - team
+    - season
+    - season_type
+    - games_played
+    - total_offensive_yards
+    - total_offensive_yards_per_game
+    - total_points
+    - total_points_per_game
+    - passing_completions
+    - passing_yards
+    - passing_yards_per_game
+    - passing_attempts
+    - passing_touchdowns
+    - passing_interceptions
+    - rushing_yards
+    - rushing_yards_per_game
+    - rushing_attempts
+    - rushing_touchdowns
+    - receiving_receptions
+    - receiving_yards
+    - receiving_touchdowns
+  injuries:
+    path: /nfl/v1/player_injuries
+    method: GET
+    criticality: essential
+    params:
+      cursor:
+        type: integer
+      per_page:
+        type: integer
+      team_ids:
+        type: array
+        array_param: true
+      player_ids:
+        type: array
+        array_param: true
+    schema: NFLPlayerInjury
+    fields:
+    - player
+    - status
+    - comment
+    - date
+    storage_rule: Append-only snapshots. NEVER overwrite an earlier snapshot.
+  standings:
+    path: /nfl/v1/standings
+    method: GET
+    criticality: optional
+    params:
+      season:
+        type: integer
+        required: true
+    schema: NFLStandings
+    fields:
+    - team
+    - win_streak
+    - points_for
+    - points_against
+    - playoff_seed
+    - point_differential
+    - overall_record
+    - conference_record
+    - division_record
+    - wins
+    - losses
+    - ties
+    - home_record
+    - road_record
+    - season
+  plays:
+    path: /nfl/v1/plays
+    method: GET
+    criticality: essential
+    ordering: chronological by wallclock
+    params:
+      game_id:
+        type: integer
+        required: true
+      cursor:
+        type: integer
+      per_page:
+        type: integer
+    schema: NFLPlay
+    fields:
+    - id
+    - game
+    - type_slug
+    - type_abbreviation
+    - type_text
+    - text
+    - short_text
+    - away_score
+    - home_score
+    - scoring_play
+    - period
+    - clock_display
+    - team
+    - start_yard_line
+    - start_down
+    - start_distance
+    - end_yard_line
+    - end_down
+    - end_distance
+    - stat_yardage
+    - home_win_probability
+    - wallclock
+    absent_fields_do_not_hallucinate:
+    - player_id
+    - epa
+    - route_participation
+    - snap_pct
+    - weather
+    - practice_participation
+    semantics_warning: 'start_yard_line / end_yard_line are integers but the spec does not define orientation. DO NOT assume
+      a 0-100 offense-oriented coordinate system until tests/provider_contract/test_bdl_yardline_semantics.py passes.
+
+      '
+  game_odds:
+    path: /nfl/v1/odds
+    method: GET
+    criticality: essential
+    params:
+      cursor:
+        type: integer
+      per_page:
+        type: integer
+      season:
+        type: integer
+        required_group: season+week OR game_ids
+      week:
+        type: integer
+        required_group: season+week OR game_ids
+      season_type:
+        type: integer
+        note: week queries default to regular+postseason
+      game_ids:
+        type: array
+        required_group: season+week OR game_ids
+    schema: NFLBettingOdd
+    fields:
+    - id
+    - game_id
+    - vendor
+    - spread_home_value
+    - spread_home_odds
+    - spread_away_value
+    - spread_away_odds
+    - moneyline_home_odds
+    - moneyline_away_odds
+    - total_value
+    - total_over_odds
+    - total_under_odds
+    - updated_at
+    type_rule: Line/value strings parse to Decimal at ingestion. Never binary float.
+  opening_game_odds:
+    path: /nfl/v1/odds/opening
+    method: GET
+    criticality: essential
+    tier: goat
+    params:
+      cursor:
+        type: integer
+      per_page:
+        type: integer
+      season:
+        type: integer
+      week:
+        type: integer
+      season_type:
+        type: integer
+      game_ids:
+        type: array
+    schema: NFLOpeningBettingOdd
+    fields:
+    - id
+    - game_id
+    - vendor
+    - spread_home_value
+    - spread_home_odds
+    - spread_away_value
+    - spread_away_odds
+    - moneyline_home_odds
+    - moneyline_away_odds
+    - total_value
+    - total_over_odds
+    - total_under_odds
+    - opened_at
+  player_props:
+    path: /nfl/v1/odds/player_props
+    method: GET
+    criticality: essential
+    live_only: true
+    warning: 'BDL documents these props as LIVE and real-time. Historical live snapshots are NOT stored upstream. All props
+      for a game return in ONE response (no cursor pagination). You MUST run your own collector or CLV/market-timing analysis
+      is impossible.
+
+      '
+    params:
+      game_id:
+        type: integer
+        required: true
+      player_id:
+        type: integer
+      prop_type:
+        type: string
+        enum_ref: player_prop_types
+      vendors:
+        type: array
+        enum_ref: player_prop_vendors
+    schema: NFLPlayerProp
+    fields:
+    - id
+    - game_id
+    - player_id
+    - vendor
+    - prop_type
+    - line_value
+    - market
+    - updated_at
+    nested:
+      market_over_under:
+      - type
+      - over_odds
+      - under_odds
+      market_milestone:
+      - type
+      - odds
+  opening_player_props:
+    path: /nfl/v1/odds/player_props/opening
+    method: GET
+    criticality: essential
+    tier: goat
+    coverage: most recently completed season + ongoing seasons where available
+    params:
+      game_id:
+        type: integer
+        required: true
+      player_id:
+        type: integer
+      prop_type:
+        type: string
+        enum_ref: player_prop_types
+      vendors:
+        type: array
+        enum_ref: player_prop_vendors
+    schema: NFLOpeningPlayerProp
+    fields:
+    - id
+    - game_id
+    - player_id
+    - vendor
+    - prop_type
+    - line_value
+    - market
+    - opened_at
+    spec_inconsistency:
+      description: 'Schema marks `updated_at` REQUIRED, but the property definition provides `opened_at`. Adapter accepts
+        either; canonical layer exposes ONLY opened_at.
+
+        '
+      adapter_rule: opened_at = payload.get("opened_at") or payload.get("updated_at")
+  dfs_slates:
+    path: /nfl/v1/dfs/slates
+    method: GET
+    criticality: optional
+    tier: goat
+    params:
+      slate_ids[]:
+        type: array[integer]
+        required: false
+      providers[]:
+        type: array[string]
+        required: false
+      formats[]:
+        type: array[string]
+        required: false
+      scopes[]:
+        type: array[string]
+        required: false
+      active:
+        type: boolean
+        required: false
+      start_date:
+        type: string(date)
+        required: false
+      end_date:
+        type: string(date)
+        required: false
+      seasons[]:
+        type: array[integer]
+        required: false
+      weeks[]:
+        type: array[integer]
+        required: false
+      cursor:
+        type: integer
+        required: false
+      per_page:
+        type: integer
+        required: false
+        max: 100
+    response_schema: DfsSlateListResponse
+  dfs_slate:
+    path: /nfl/v1/dfs/slates/{id}
+    method: GET
+    criticality: optional
+    tier: goat
+    params:
+      id:
+        type: integer
+        required: true
+        in: path
+    response_schema: DfsSlateDetailResponse
+  dfs_draftables:
+    path: /nfl/v1/dfs/draftables
+    method: GET
+    criticality: optional
+    tier: goat
+    params:
+      slate_ids[]:
+        type: array[integer]
+        required: false
+      game_ids[]:
+        type: array[integer]
+        required: false
+      player_ids[]:
+        type: array[integer]
+        required: false
+      team_ids[]:
+        type: array[integer]
+        required: false
+      positions[]:
+        type: array[string]
+        required: false
+      active:
+        type: boolean
+        required: false
+        note: defaults true; false exposes inactive history
+      cursor:
+        type: integer
+        required: false
+      per_page:
+        type: integer
+        required: false
+        max: 100
+    schema: DfsDraftable
+    fields:
+    - id
+    - slate_id
+    - slate_event_id
+    - roster_slot_id
+    - game_id
+    - player_id
+    - team_id
+    - entity_type
+    - first_name
+    - last_name
+    - display_name
+    - short_name
+    - position
+    - salary
+    - status
+    - is_swappable
+    - is_disabled
+    - team_abbreviation
+    - active
+    - updated_at
+    nullable_fields:
+    - game_id
+    - player_id
+    - team_id
+    gate: '[features.dfs] enabled = false by default'
+retry_policy:
+  retry_on_status:
+  - 408
+  - 429
+  - 500
+  - 502
+  - 503
+  - 504
+  no_retry_on_status:
+  - 400
+  - 401
+  - 403
+  - 404
+  retry_on_transport_error: true
+  backoff: exponential_with_bounded_jitter
+  max_retries: 5
+  timeout_seconds: 30

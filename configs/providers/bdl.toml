@@ -1,0 +1,38 @@
+# BALLDONTLIE NFL provider configuration. SPEC §10, §15.
+
+[provider.bdl]
+name = "balldontlie"
+base_url = "https://api.balldontlie.io"
+api_key_env = "BDL_API_KEY"          # value is read from env ONLY, never stored
+timeout_seconds = 30
+max_retries = 5
+per_page = 100
+
+[provider.bdl.spec]
+path = "specs/providers/bdl/nfl.yml"
+# Populated by `nflprops provider pin bdl`. Until then the contract is UNVERIFIED.
+sha256 = ""
+captured_at = ""
+version = "1.0.0"
+openapi_version = "3.1.0"
+
+[provider.bdl.retry]
+retry_status = [408, 429, 500, 502, 503, 504]
+no_retry_status = [400, 401, 403, 404]
+backoff_base_seconds = 0.5
+backoff_max_seconds = 30.0
+jitter = true
+honor_retry_after = true
+
+[provider.bdl.tier]
+# Set to true only if your key has GOAT access. Endpoints below fail fast with a
+# clear message rather than an opaque 403 mid-bootstrap.
+goat = true
+goat_endpoints = [
+  "/nfl/v1/teams/{id}/roster",
+  "/nfl/v1/odds/opening",
+  "/nfl/v1/odds/player_props/opening",
+  "/nfl/v1/dfs/slates",
+  "/nfl/v1/dfs/slates/{id}",
+  "/nfl/v1/dfs/draftables",
+]

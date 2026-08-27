@@ -1,0 +1,606 @@
+# =====================================================================
+# FEATURE REGISTRY (NORMATIVE)
+# Rule: a feature that is not in this registry MUST NOT reach a model.
+# CI test tests/leakage/test_feature_registry_complete.py enforces that
+# every column in player_features / game_features has a registry entry.
+#
+# Required keys per feature:
+#   family        game|team|opponent|player_state|role|advanced|market
+#   inputs        source table.column list
+#   formula       exact definition
+#   available_at  rule that determines earliest legitimate knowledge time
+#   lag           how far back the input window is shifted
+#   nullable      true|false
+#   null_policy   what to do when missing (NEVER blanket zero)
+#   consumers     which model modules read it
+#   owner_version registry version that introduced/last changed it
+# =====================================================================
+version: "2026.1.0"
+
+null_policy_vocabulary:
+  positional_prior:    "fall back to position-group population prior"
+  population_posterior: "fall back to league population posterior for the metric"
+  configured_default:  "explicit value from configs/base.toml; must be documented"
+  feature_unavailable: "emit is_missing=1 and let the consumer branch"
+  forbidden:           "must never be null; ingestion bug if it is"
+
+encoding_rule: >
+  Every feature is materialized as TWO columns: <name> and <name>__is_missing.
+  Blanket zero-filling is prohibited.
+
+features:
+
+  # ---------------- GAME FAMILY ----------------
+  is_home:
+    family: game
+    inputs: [games.home_team_id]
+    formula: "1 if player's team == home_team else 0"
+    available_at: "game.available_at (schedule publication)"
+    lag: none
+    nullable: false
+    null_policy: forbidden
+    consumers: [plays, pass_mix, opportunities]
+    owner_version: "2026.1.0"
+
+  week:
+    family: game
+    inputs: [games.week]
+    formula: "games.week"
+    available_at: "schedule publication"
+    lag: none
+    nullable: false
+    null_policy: forbidden
+    consumers: [plays, state]
+    owner_version: "2026.1.0"
+
+  rest_days:
+    family: game
+    inputs: [games.date]
+    formula: "game.date - previous_final_game.date for the team"
+    available_at: "schedule publication"
+    lag: one_game
+    nullable: true
+    null_policy: configured_default
+    consumers: [plays, opportunities]
+    owner_version: "2026.1.0"
+
+  market_total:
+    family: market
+    inputs: [game_odds_snapshots.total_value]
+    formula: "consensus (median across vendors) total at or before as_of"
+    available_at: "collector_received_at"
+    lag: none
+    nullable: true
+    null_policy: feature_unavailable
+    consumers: [plays, touchdowns, kicking]
+    owner_version: "2026.1.0"
+
+  market_home_spread:
+    family: market
+    inputs: [game_odds_snapshots.spread_home_value]
+    formula: "consensus (median across vendors) home spread at or before as_of"
+    available_at: "collector_received_at"
+    lag: none
+    nullable: true
+    null_policy: feature_unavailable
+    consumers: [plays, pass_mix, touchdowns]
+    owner_version: "2026.1.0"
+
+  implied_team_points:
+    family: market
+    inputs: [market_total, market_home_spread]
+    formula: "home: total/2 - home_spread/2 ; away: total/2 + home_spread/2"
+    available_at: "max(available_at of inputs)"
+    lag: none
+    nullable: true
+    null_policy: feature_unavailable
+    consumers: [touchdowns, kicking, plays]
+    owner_version: "2026.1.0"
+    worked_example: "total=47, home_spread=-3 => home=25, away=22"
+
+  spread_movement:
+    family: market
+    inputs: [game_opening_odds.spread_home_value, market_home_spread]
+    formula: "current_home_spread - opening_home_spread"
+    available_at: "collector_received_at of current quote"
+    lag: none
+    nullable: true
+    null_policy: feature_unavailable
+    consumers: [plays, pass_mix]
+    owner_version: "2026.1.0"
+
+  total_movement:
+    family: market
+    inputs: [game_opening_odds.total_value, market_total]
+    formula: "current_total - opening_total"
+    available_at: "collector_received_at of current quote"
+    lag: none
+    nullable: true
+    null_policy: feature_unavailable
+    consumers: [plays]
+    owner_version: "2026.1.0"
+
+  book_disagreement_total:
+    family: market
+    inputs: [game_odds_snapshots.total_value]
+    formula: "stdev of total_value across vendors in the latest snapshot <= as_of"
+    available_at: "collector_received_at"
+    lag: none
+    nullable: true
+    null_policy: feature_unavailable
+    consumers: [plays]
+    owner_version: "2026.1.0"
+
+  # ---------------- TEAM FAMILY ----------------
+  team_pace_state:
+    family: team
+    inputs: [team_states.offensive_plays]
+    formula: "EB posterior mean of team offensive plays per game"
+    available_at: "state snapshot as_of"
+    lag: one_game
+    nullable: false
+    null_policy: population_posterior
+    consumers: [plays]
+    owner_version: "2026.1.0"
+
+  team_pass_tendency:
+    family: team
+    inputs: [team_game_stats.passing_attempts, team_game_stats.sacks, team_game_stats.rushing_attempts]
+    formula: "EB posterior of dropbacks / offensive_plays"
+    available_at: "state snapshot as_of"
+    lag: one_game
+    nullable: false
+    null_policy: population_posterior
+    consumers: [pass_mix]
+    owner_version: "2026.1.0"
+
+  team_sack_rate_allowed:
+    family: team
+    inputs: [team_game_stats.sacks, team_game_stats.passing_attempts]
+    formula: "EB posterior of sacks / (passing_attempts + sacks)"
+    available_at: "state snapshot as_of"
+    lag: one_game
+    nullable: false
+    null_policy: population_posterior
+    consumers: [sacks]
+    owner_version: "2026.1.0"
+
+  team_third_down_rate:
+    family: team
+    inputs: [team_game_stats.third_down_conversions, team_game_stats.third_down_attempts]
+    formula: "EB posterior of conversions / attempts"
+    available_at: "state snapshot as_of"
+    lag: one_game
+    nullable: false
+    null_policy: population_posterior
+    consumers: [plays]
+    owner_version: "2026.1.0"
+
+  team_directed_target_rate:
+    family: team
+    inputs: [player_game_stats.receiving_targets, team_game_stats.passing_attempts]
+    formula: "EB posterior of sum(player targets) / team pass attempts"
+    available_at: "state snapshot as_of"
+    lag: one_game
+    nullable: false
+    null_policy: population_posterior
+    consumers: [opportunities]
+    owner_version: "2026.1.0"
+    note: "This is p_directed in simulation Stage F. It is strictly <= 1."
+
+  team_offensive_td_rate:
+    family: team
+    inputs: [player_game_stats.rushing_touchdowns, player_game_stats.receiving_touchdowns, team_game_stats]
+    formula: "EB posterior of offensive TDs per offensive play"
+    available_at: "state snapshot as_of"
+    lag: one_game
+    nullable: false
+    null_policy: population_posterior
+    consumers: [touchdowns]
+    owner_version: "2026.1.0"
+
+  # ---------------- OPPONENT FAMILY ----------------
+  opp_plays_allowed:
+    family: opponent
+    inputs: [team_game_stats]
+    formula: "EB posterior of offensive plays allowed, built by REVERSING team_game_stats rows within a game"
+    available_at: "state snapshot as_of"
+    lag: one_game
+    nullable: false
+    null_policy: population_posterior
+    consumers: [plays]
+    owner_version: "2026.1.0"
+    warning: "Do NOT source this from /nfl/v1/team_season_stats; that schema has no opponent fields."
+
+  opp_pass_efficiency_allowed:
+    family: opponent
+    inputs: [team_game_stats.net_passing_yards, team_game_stats.passing_attempts]
+    formula: "EB posterior of opponent net passing yards per attempt allowed"
+    available_at: "state snapshot as_of"
+    lag: one_game
+    nullable: false
+    null_policy: population_posterior
+    consumers: [receiving, catch, passing]
+    owner_version: "2026.1.0"
+
+  opp_rush_efficiency_allowed:
+    family: opponent
+    inputs: [team_game_stats.rushing_yards, team_game_stats.rushing_attempts]
+    formula: "EB posterior of opponent rushing yards per attempt allowed"
+    available_at: "state snapshot as_of"
+    lag: one_game
+    nullable: false
+    null_policy: population_posterior
+    consumers: [rushing]
+    owner_version: "2026.1.0"
+
+  opp_sack_generation:
+    family: opponent
+    inputs: [team_game_stats.sacks]
+    formula: "EB posterior of sacks generated per opponent dropback"
+    available_at: "state snapshot as_of"
+    lag: one_game
+    nullable: false
+    null_policy: population_posterior
+    consumers: [sacks]
+    owner_version: "2026.1.0"
+
+  opp_int_rate:
+    family: opponent
+    inputs: [team_game_stats.interceptions_thrown]
+    formula: "EB posterior of INTs generated per opponent pass attempt"
+    available_at: "state snapshot as_of"
+    lag: one_game
+    nullable: false
+    null_policy: population_posterior
+    consumers: [interceptions]
+    owner_version: "2026.1.0"
+
+  # ---------------- PLAYER STATE FAMILY ----------------
+  target_share:
+    family: player_state
+    inputs: [player_game_stats.receiving_targets, team_directed_targets]
+    formula: "player_targets / team_directed_targets"
+    available_at: "last completed game available_at"
+    lag: one_game
+    nullable: false
+    null_policy: positional_prior
+    consumers: [opportunities]
+    owner_version: "2026.1.0"
+
+  rush_share:
+    family: player_state
+    inputs: [player_game_stats.rushing_attempts, team_game_stats.rushing_attempts]
+    formula: "player_rush_attempts / team_rush_attempts"
+    available_at: "last completed game available_at"
+    lag: one_game
+    nullable: false
+    null_policy: positional_prior
+    consumers: [opportunities]
+    owner_version: "2026.1.0"
+
+  catch_probability:
+    family: player_state
+    inputs: [player_game_stats.receptions, player_game_stats.receiving_targets]
+    formula: "EB posterior of receptions / targets"
+    available_at: "last completed game available_at"
+    lag: one_game
+    nullable: false
+    null_policy: positional_prior
+    consumers: [catch]
+    owner_version: "2026.1.0"
+
+  receiving_efficiency:
+    family: player_state
+    inputs: [player_game_stats.receiving_yards, player_game_stats.receptions]
+    formula: "EB posterior of receiving yards per reception"
+    available_at: "last completed game available_at"
+    lag: one_game
+    nullable: false
+    null_policy: positional_prior
+    consumers: [receiving]
+    owner_version: "2026.1.0"
+
+  rush_efficiency:
+    family: player_state
+    inputs: [player_game_stats.rushing_yards, player_game_stats.rushing_attempts]
+    formula: "EB posterior of rushing yards per attempt"
+    available_at: "last completed game available_at"
+    lag: one_game
+    nullable: false
+    null_policy: positional_prior
+    consumers: [rushing]
+    owner_version: "2026.1.0"
+
+  qb_completion_probability:
+    family: player_state
+    inputs: [player_game_stats.passing_completions, player_game_stats.passing_attempts]
+    formula: "EB posterior of completions / attempts"
+    available_at: "last completed game available_at"
+    lag: one_game
+    nullable: false
+    null_policy: positional_prior
+    consumers: [catch, passing]
+    owner_version: "2026.1.0"
+
+  qb_int_probability:
+    family: player_state
+    inputs: [player_game_stats.passing_interceptions, player_game_stats.passing_attempts]
+    formula: "EB posterior of INTs / attempts"
+    available_at: "last completed game available_at"
+    lag: one_game
+    nullable: false
+    null_policy: positional_prior
+    consumers: [interceptions]
+    owner_version: "2026.1.0"
+
+  qb_sack_probability:
+    family: player_state
+    inputs: [player_game_stats.sacks, player_game_stats.passing_attempts]
+    formula: "EB posterior of sacks / dropbacks"
+    available_at: "last completed game available_at"
+    lag: one_game
+    nullable: false
+    null_policy: positional_prior
+    consumers: [sacks]
+    owner_version: "2026.1.0"
+
+  td_receiving_share:
+    family: player_state
+    inputs: [player_game_stats.receiving_touchdowns, team receiving TDs]
+    formula: "EB posterior of player receiving TDs / team receiving TDs"
+    available_at: "last completed game available_at"
+    lag: one_game
+    nullable: false
+    null_policy: positional_prior
+    consumers: [touchdowns]
+    owner_version: "2026.1.0"
+
+  td_rush_share:
+    family: player_state
+    inputs: [player_game_stats.rushing_touchdowns, team rushing TDs]
+    formula: "EB posterior of player rushing TDs / team rushing TDs"
+    available_at: "last completed game available_at"
+    lag: one_game
+    nullable: false
+    null_policy: positional_prior
+    consumers: [touchdowns]
+    owner_version: "2026.1.0"
+
+  fg_make_probability:
+    family: player_state
+    inputs: [player_game_stats.field_goals_made, player_game_stats.field_goal_attempts]
+    formula: "EB posterior of FGM / FGA"
+    available_at: "last completed game available_at"
+    lag: one_game
+    nullable: false
+    null_policy: positional_prior
+    consumers: [kicking]
+    owner_version: "2026.1.0"
+
+  posterior_uncertainty:
+    family: player_state
+    inputs: [player_states.posterior_var]
+    formula: "posterior variance of the metric being consumed"
+    available_at: "state snapshot as_of"
+    lag: one_game
+    nullable: false
+    null_policy: population_posterior
+    consumers: [allocations]
+    owner_version: "2026.1.0"
+    note: "Drives Dirichlet concentration kappa. Higher uncertainty -> lower kappa -> more share variance."
+
+  # ---------------- ROLE FAMILY ----------------
+  depth_chart_position:
+    family: role
+    inputs: [roster_snapshots.depth]
+    formula: "latest roster snapshot depth <= as_of"
+    available_at: "roster_snapshots.available_at"
+    lag: none
+    nullable: true
+    null_policy: feature_unavailable
+    consumers: [opportunities, roles]
+    owner_version: "2026.1.0"
+    note: "Roster endpoint is 2025+ and GOAT tier. Pre-2025 rows will be missing by design."
+
+  injury_status:
+    family: role
+    inputs: [injury_snapshots.status]
+    formula: "latest injury snapshot status <= as_of, normalized to internal category"
+    available_at: "injury_snapshots.available_at"
+    lag: none
+    nullable: true
+    null_policy: configured_default
+    consumers: [opportunities, availability]
+    owner_version: "2026.1.0"
+    null_default_config_key: "features.injury.missing_row_means"
+
+  hours_since_status_change:
+    family: role
+    inputs: [injury_snapshots.status, injury_snapshots.available_at]
+    formula: "as_of - available_at of most recent status transition"
+    available_at: "injury_snapshots.available_at"
+    lag: none
+    nullable: true
+    null_policy: feature_unavailable
+    consumers: [availability]
+    owner_version: "2026.1.0"
+
+  comment_changed:
+    family: role
+    inputs: [injury_snapshots.comment]
+    formula: "1 if comment text differs from previous snapshot else 0"
+    available_at: "injury_snapshots.available_at"
+    lag: none
+    nullable: true
+    null_policy: feature_unavailable
+    consumers: [availability]
+    owner_version: "2026.1.0"
+
+  teammate_availability_index:
+    family: role
+    inputs: [injury_snapshots, roster_snapshots]
+    formula: "share-weighted fraction of same-position-group teammates available"
+    available_at: "max(available_at of inputs)"
+    lag: none
+    nullable: true
+    null_policy: feature_unavailable
+    consumers: [opportunities, roles]
+    owner_version: "2026.1.0"
+
+  # ---------------- ADVANCED FAMILY ----------------
+  cpoe:
+    family: advanced
+    inputs: [advanced_passing_weekly.completion_percentage_above_expectation]
+    formula: "EB posterior of CPOE"
+    available_at: "advanced stat week publication"
+    lag: one_week
+    nullable: true
+    null_policy: population_posterior
+    consumers: [catch, passing]
+    owner_version: "2026.1.0"
+
+  adot_qb:
+    family: advanced
+    inputs: [advanced_passing_weekly.avg_intended_air_yards]
+    formula: "EB posterior of average intended air yards"
+    available_at: "advanced stat week publication"
+    lag: one_week
+    nullable: true
+    null_policy: population_posterior
+    consumers: [catch, receiving]
+    owner_version: "2026.1.0"
+
+  time_to_throw:
+    family: advanced
+    inputs: [advanced_passing_weekly.avg_time_to_throw]
+    formula: "EB posterior"
+    available_at: "advanced stat week publication"
+    lag: one_week
+    nullable: true
+    null_policy: population_posterior
+    consumers: [sacks]
+    owner_version: "2026.1.0"
+
+  aggressiveness:
+    family: advanced
+    inputs: [advanced_passing_weekly.aggressiveness]
+    formula: "EB posterior"
+    available_at: "advanced stat week publication"
+    lag: one_week
+    nullable: true
+    null_policy: population_posterior
+    consumers: [catch, interceptions]
+    owner_version: "2026.1.0"
+
+  air_yards_to_sticks:
+    family: advanced
+    inputs: [advanced_passing_weekly.avg_air_yards_to_sticks]
+    formula: "EB posterior"
+    available_at: "advanced stat week publication"
+    lag: one_week
+    nullable: true
+    null_policy: population_posterior
+    consumers: [catch]
+    owner_version: "2026.1.0"
+
+  air_yard_share:
+    family: advanced
+    inputs: [advanced_receiving_weekly.percent_share_of_intended_air_yards]
+    formula: "EB posterior of share of team intended air yards"
+    available_at: "advanced stat week publication"
+    lag: one_week
+    nullable: true
+    null_policy: population_posterior
+    consumers: [opportunities, receiving]
+    owner_version: "2026.1.0"
+
+  adot_receiver:
+    family: advanced
+    inputs: [advanced_receiving_weekly.avg_intended_air_yards]
+    formula: "EB posterior"
+    available_at: "advanced stat week publication"
+    lag: one_week
+    nullable: true
+    null_policy: population_posterior
+    consumers: [catch, receiving]
+    owner_version: "2026.1.0"
+
+  separation:
+    family: advanced
+    inputs: [advanced_receiving_weekly.avg_separation]
+    formula: "EB posterior"
+    available_at: "advanced stat week publication"
+    lag: one_week
+    nullable: true
+    null_policy: population_posterior
+    consumers: [catch]
+    owner_version: "2026.1.0"
+
+  cushion:
+    family: advanced
+    inputs: [advanced_receiving_weekly.avg_cushion]
+    formula: "EB posterior"
+    available_at: "advanced stat week publication"
+    lag: one_week
+    nullable: true
+    null_policy: population_posterior
+    consumers: [catch, receiving]
+    owner_version: "2026.1.0"
+
+  yacoe:
+    family: advanced
+    inputs: [advanced_receiving_weekly.avg_yac_above_expectation]
+    formula: "EB posterior"
+    available_at: "advanced stat week publication"
+    lag: one_week
+    nullable: true
+    null_policy: population_posterior
+    consumers: [receiving]
+    owner_version: "2026.1.0"
+
+  ryoe_per_att:
+    family: advanced
+    inputs: [advanced_rushing_weekly.rush_yards_over_expected_per_att]
+    formula: "EB posterior"
+    available_at: "advanced stat week publication"
+    lag: one_week
+    nullable: true
+    null_policy: population_posterior
+    consumers: [rushing]
+    owner_version: "2026.1.0"
+
+  eight_defender_rate:
+    family: advanced
+    inputs: [advanced_rushing_weekly.percent_attempts_gte_eight_defenders]
+    formula: "EB posterior"
+    available_at: "advanced stat week publication"
+    lag: one_week
+    nullable: true
+    null_policy: population_posterior
+    consumers: [rushing]
+    owner_version: "2026.1.0"
+
+  time_to_los:
+    family: advanced
+    inputs: [advanced_rushing_weekly.avg_time_to_los]
+    formula: "EB posterior"
+    available_at: "advanced stat week publication"
+    lag: one_week
+    nullable: true
+    null_policy: population_posterior
+    consumers: [rushing]
+    owner_version: "2026.1.0"
+
+  # ---------------- OPTIONAL / GATED ----------------
+  dfs_salary_share:
+    family: role
+    gated_by: "[features.dfs] enabled"
+    inputs: [dfs_draftables.salary]
+    formula: "player salary / sum of same-position salaries on slate"
+    available_at: "dfs_draftables.updated_at"
+    lag: none
+    nullable: true
+    null_policy: feature_unavailable
+    consumers: [roles]
+    owner_version: "2026.1.0"

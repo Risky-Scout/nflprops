@@ -1,0 +1,208 @@
+# =====================================================================
+# BDL PROP TYPE -> SIMULATOR RESULT MAPPING (NORMATIVE)
+# Every prop is DERIVED from the same simulated games. No prop has its
+# own independent regressor. If a prop is not in this file, the system
+# does not price it.
+#
+# outcome_kind:
+#   count     -> integer support, push possible on integer lines
+#   yardage   -> continuous-ish integer support, push possible on int lines
+#   binary    -> 0/1 event
+#   selection -> categorical over players (+ NONE)
+# =====================================================================
+
+version: "2026.1.0"
+
+props:
+
+  passing_attempts:
+    outcome_kind: count
+    derivation: "QB official pass attempts, full game"
+    simulator_field: qb.pass_attempts
+    confidence_tier: 1
+    requires_pbp_high: false
+
+  passing_completions:
+    outcome_kind: count
+    derivation: "sum of receptions on passes thrown by this QB"
+    simulator_field: qb.completions
+    coherence: "qb.completions == sum(receptions caught on this QB's targets)"
+    confidence_tier: 1
+    requires_pbp_high: false
+
+  passing_yards:
+    outcome_kind: yardage
+    derivation: "sum of receiving gains on passes thrown by this QB"
+    simulator_field: qb.passing_yards
+    coherence: "qb.passing_yards == sum(receiving_yards_by_qb)"
+    confidence_tier: 1
+    requires_pbp_high: false
+
+  interceptions:
+    outcome_kind: count
+    derivation: "QB passing interceptions, full game"
+    simulator_field: qb.interceptions
+    confidence_tier: 1
+    requires_pbp_high: false
+
+  rushing_attempts:
+    outcome_kind: count
+    derivation: "player carries, full game"
+    simulator_field: player.rush_attempts
+    confidence_tier: 1
+    requires_pbp_high: false
+
+  rushing_yards:
+    outcome_kind: yardage
+    derivation: "sum of player rush gains, full game"
+    simulator_field: player.rushing_yards
+    confidence_tier: 1
+    requires_pbp_high: false
+
+  receptions:
+    outcome_kind: count
+    derivation: "player completions caught, full game"
+    simulator_field: player.receptions
+    coherence: "player.receptions <= player.targets"
+    confidence_tier: 1
+    requires_pbp_high: false
+
+  receiving_yards:
+    outcome_kind: yardage
+    derivation: "sum of player reception gains, full game"
+    simulator_field: player.receiving_yards
+    confidence_tier: 1
+    requires_pbp_high: false
+
+  rushing_receiving_yards:
+    outcome_kind: yardage
+    derivation: "player.rushing_yards + player.receiving_yards, same simulation draw"
+    simulator_field: player.rush_rec_yards
+    coherence: "rush_rec_yards == rushing_yards + receiving_yards"
+    confidence_tier: 1
+    requires_pbp_high: false
+
+  passing_tds:
+    outcome_kind: count
+    derivation: "count of simulated TD events assigned to completions thrown by this QB"
+    simulator_field: qb.passing_tds
+    coherence: "qb.passing_tds == sum(receiving_tds thrown by this QB)"
+    confidence_tier: 2
+    requires_pbp_high: false
+
+  anytime_td:
+    outcome_kind: binary
+    derivation: "player total TDs (rush + rec [+ optional return/defensive per settlement rule]) >= 1"
+    simulator_field: player.total_tds
+    settlement_rule_ref: market/rules/anytime_td.yml
+    confidence_tier: 2
+    requires_pbp_high: false
+
+  kicking_points:
+    outcome_kind: count
+    derivation: "3 * field_goals_made + extra_points_made"
+    simulator_field: kicker.kicking_points
+    coherence: "kicking_points == 3*fg_made + xp_made"
+    confidence_tier: 2
+    requires_pbp_high: false
+
+  fg_made:
+    outcome_kind: count
+    derivation: "kicker field goals made, full game"
+    simulator_field: kicker.fg_made
+    confidence_tier: 2
+    requires_pbp_high: false
+
+  longest_rush:
+    outcome_kind: yardage
+    derivation: "max(player rush gain events), 0 if no carries"
+    simulator_field: player.longest_rush
+    confidence_tier: 2
+    requires_pbp_high: false
+
+  longest_reception:
+    outcome_kind: yardage
+    derivation: "max(player reception gain events), 0 if no receptions"
+    simulator_field: player.longest_reception
+    confidence_tier: 2
+    requires_pbp_high: false
+
+  # ---- Tier 3: label construction depends on validated PBP parsing -----
+  passing_yards_1h:
+    outcome_kind: yardage
+    derivation: "Q1 + Q2 QB passing yards"
+    simulator_field: qb.passing_yards_1h
+    confidence_tier: 3
+    requires_pbp_high: true
+
+  passing_tds_1h:
+    outcome_kind: count
+    derivation: "Q1 + Q2 QB passing TDs"
+    simulator_field: qb.passing_tds_1h
+    confidence_tier: 3
+    requires_pbp_high: true
+
+  receiving_yards_1h:
+    outcome_kind: yardage
+    derivation: "Q1 + Q2 player receiving yards"
+    simulator_field: player.receiving_yards_1h
+    confidence_tier: 3
+    requires_pbp_high: true
+
+  rushing_yards_1h:
+    outcome_kind: yardage
+    derivation: "Q1 + Q2 player rushing yards"
+    simulator_field: player.rushing_yards_1h
+    confidence_tier: 3
+    requires_pbp_high: true
+
+  fg_made_1h:
+    outcome_kind: count
+    derivation: "Q1 + Q2 kicker FG made"
+    simulator_field: kicker.fg_made_1h
+    confidence_tier: 3
+    requires_pbp_high: true
+
+  anytime_td_1h:
+    outcome_kind: binary
+    derivation: "player TDs in Q1+Q2 >= 1"
+    simulator_field: player.tds_1h
+    confidence_tier: 3
+    requires_pbp_high: true
+
+  anytime_td_2h:
+    outcome_kind: binary
+    derivation: "player TDs in Q3+Q4 >= 1"
+    simulator_field: player.tds_2h
+    confidence_tier: 3
+    requires_pbp_high: true
+
+  anytime_td_1q:
+    outcome_kind: binary
+    derivation: "player TDs in Q1 >= 1"
+    simulator_field: player.tds_1q
+    confidence_tier: 3
+    requires_pbp_high: true
+
+  first_td:
+    outcome_kind: selection
+    derivation: >
+      Player of the earliest TD event by (quarter, event_order). If the simulated
+      game has zero TDs the outcome is NONE. NONE must remain in the probability
+      space and must not be renormalized away.
+    simulator_field: game.first_td_player
+    includes_none_state: true
+    confidence_tier: 3
+    requires_pbp_high: true
+
+  longest_pass:
+    outcome_kind: yardage
+    derivation: "max completed pass gain thrown by this QB"
+    simulator_field: qb.longest_pass
+    confidence_tier: 3
+    requires_pbp_high: true
+
+confidence_tiers:
+  1: "Highest confidence. Structured full-game BDL labels exist directly in /nfl/v1/stats."
+  2: "Good confidence. Structured labels exist but event-level allocation adds model risk."
+  3: "Gated. Historical labels require validated PBP text parsing (pbp_quality == HIGH)."

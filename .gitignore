@@ -1,0 +1,60 @@
+# --- secrets ---------------------------------------------------------------
+.env
+*.key
+*credentials*
+
+# --- data ------------------------------------------------------------------
+# Raw provider responses and derived parquet are large and are reproduced from
+# manifests. They do not belong in git.
+data/raw/
+data/bronze/
+data/silver/
+data/features/
+data/states/
+data/market_snapshots/
+data/predictions/
+data/backtests/
+data/canonical/
+data/manifests/
+data/*.duckdb
+data/*.duckdb.*
+artifacts/
+!data/.gitkeep
+
+# --- python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- editors ---------------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+
+# --- transient verification outputs ----------------------------------------
+.release-pytest.log
+# --- local environment variants --------------------------------------------
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+
+# --- local archives / patch backups ----------------------------------------
+*.zip
+*.zip.sha256
+*.tar
+*.tar.gz
+*.tgz
+*.before_*
+*.bak
+*.orig

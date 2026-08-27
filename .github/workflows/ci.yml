@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Nightly provider schema-drift check. SPEC §7.
+    - cron: "0 9 * * *"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+
+      - name: Validate machine-readable contracts
+        run: python tools/validate_contracts.py
+
+      - name: Verify packaged runtime resources are synchronized
+        run: python tools/sync_runtime_resources.py --check
+
+      - name: Build wheel and source distribution
+        run: python -m build
+
+      - name: Lint
+        run: ruff check src tests
+
+      - name: Type check
+        run: mypy
+
+      - name: Test
+        run: pytest -q
+
+      # --- architectural guards. These are the rules that keep the package
+      # --- maintainable; they run on every commit, not on review discipline.
+      - name: Guard - endpoint strings contained
+        run: |
+          ! grep -rn "nfl/v1" src/ --include=*.py \
+            | grep -v "providers/bdl/endpoints.py" \
+            || (echo "FAIL: BDL endpoint string outside endpoints.py"; exit 1)
+
+      - name: Guard - no provider imports in model layers
+        run: |
+          ! grep -rn "^\s*\(from\|import\).*providers\." \
+            src/nflprops/models src/nflprops/features src/nflprops/simulation \
+            src/nflprops/state src/nflprops/calibration src/nflprops/backtest \
+            || (echo "FAIL: provider imported into a provider-independent layer"; exit 1)
+
+      - name: Guard - no secrets committed
+        run: |
+          ! grep -rniE "(api[_-]?key|secret|token)\s*=\s*['\"][A-Za-z0-9_\-]{16,}" \
+            src/ configs/ tools/ \
+            || (echo "FAIL: possible hardcoded credential"; exit 1)
+
+  provider-contract:
+    # Phase 1 is not complete while the authoritative BDL spec is a placeholder.
+    # This job deliberately fails closed until the exact spec bytes are pinned.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[dev]"
+      - name: Verify pinned BDL OpenAPI contract
+        run: nflprops provider verify bdl --strict-fields
+      - name: Provider contract tests
+        run: pytest tests/provider_contract -q
+
+
+  leakage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[dev]"
+      - name: Point-in-time leakage detectors (SPEC §66)
+        run: pytest tests/leakage -q
+
+  invariants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[dev]"
+      - name: Simulation invariants + determinism (SPEC §4, §67)
+        run: pytest tests/invariants tests/determinism -q
+
+  spec-drift:
+    # Nightly only. Never silently upgrades production. SPEC §7.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[dev]"
+      - name: Detect BDL schema drift
+        env:
+          BDL_API_KEY: ${{ secrets.BDL_API_KEY }}
+        run: nflprops provider drift bdl

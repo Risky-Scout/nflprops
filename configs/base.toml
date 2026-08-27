@@ -1,0 +1,132 @@
+# Base configuration. SPEC §71: ALL mutable behavior lives in config, never as a
+# magic number in source. Any constant a reviewer might question belongs here.
+#
+# Values marked FIT_ME are placeholders that MUST be replaced with validated values
+# from Phase 5/6/8 output before production use. They are deliberately not "sensible
+# defaults" — a sensible-looking wrong number is worse than an obvious one.
+
+[run]
+data_root = "./data"
+artifacts_root = "./artifacts"
+log_level = "INFO"
+
+[model]
+version = "2026.1.0"
+
+# --- empirical Bayes --------------------------------------------------------
+# k and lambda are FITTED per metric (SPEC §25). These are only the grid bounds and
+# the fallback priors used before any fit exists.
+[state]
+k_grid_min = 1.0
+k_grid_max = 60.0
+k_grid_steps = 20
+lambda_grid_min = 0.50
+lambda_grid_max = 0.995
+lambda_grid_steps = 20
+# SPEC §26: enforced after fitting. Role must react faster than skill.
+assert_role_lambda_below_skill_lambda = true
+
+# Lean production baseline state speeds. Opportunity must move faster than skill.
+# These are explicit so walk-forward tuning can change them without code edits.
+role_half_life_days = 35.0
+target_role_half_life_days = 35.0
+rush_role_half_life_days = 35.0
+skill_half_life_days = 180.0
+team_half_life_days = 120.0
+role_prior_opportunities = 12.0
+target_role_prior_opportunities = 12.0
+rush_role_prior_opportunities = 12.0
+skill_prior_opportunities = 35.0
+td_prior_events = 8.0
+team_games_prior = 4.0
+team_rate_prior_attempts = 80.0
+team_efficiency_prior_attempts = 60.0
+
+# --- simulation -------------------------------------------------------------
+[simulation]
+min_draws = 20000
+max_draws = 100000
+batch_size = 5000
+probability_se_target = 0.0025
+# Longshot floor: for small p, absolute SE is a bad target. SPEC §52.
+relative_se_floor = 0.05
+include_overtime = true
+retain_joint_draws = 5000        # per-draw player rows retained for SGP/correlation
+abort_on_invariant_violation = true   # NOT configurable in practice; here for audit
+
+[simulation.allocation]
+# These remain challenger-fit targets; the runnable baseline uses the explicit
+# interpretable values in [simulation.baseline] below until walk-forward tuning.
+base_kappa = "FIT_ME"
+kappa_uncertainty_scale = "FIT_ME"
+
+[simulation.baseline]
+# Runnable, auditable baseline values. They are NOT claims of optimality.
+# Promotion requires same-timestamp walk-forward superiority to the market.
+pace_opponent_weight = 0.35
+pace_shock_sd = 0.045
+scoring_shock_sd = 0.12
+script_logit_per_point = -0.035
+fourth_quarter_script_multiplier = 1.35
+pregame_spread_logit_per_point = 0.012
+market_td_weight = 0.55
+points_per_expected_td = 8.5
+pass_td_base = 0.62
+target_kappa_base = 70.0
+rush_kappa_base = 55.0
+uncertainty_kappa_scale = 500.0
+receiving_gain_sd = 8.5
+rushing_gain_sd = 5.0
+gain_df = 4.0
+overtime_play_fraction = 0.12
+max_play_count = 100
+
+# --- market -----------------------------------------------------------------
+[market]
+close_buffer_seconds = 60
+default_devig = "proportional"
+max_confidence_tier = 2            # Tier 3 remains research-only until PBP labels validate
+consensus_method = "logit_median"
+truth_source_vendors = []        # empty: BDL has no sharp book. SPEC §6.
+
+[market.collector]
+# SPEC §58 — BDL retains no live prop history. Deploy this before week 1.
+checkpoints = ["OPEN","T-48H","T-24H","T-12H","T-6H","T-3H","T-1H","T-30M","T-10M","CLOSE"]
+poll_seconds_far = 3600
+poll_seconds_near = 60
+near_threshold_minutes = 180
+alert_on_missing_checkpoint = true
+
+# --- play-by-play -----------------------------------------------------------
+[pbp]
+minimum_reconciliation_score = 0.99
+medium_reconciliation_score = 0.95
+low_reconciliation_score = 0.85
+# Gated until tests/provider_contract/test_bdl_yardline_semantics.py passes.
+yardline_semantics_validated = false
+
+# --- features ---------------------------------------------------------------
+[features]
+emit_is_missing_columns = true
+forbid_blanket_zero_fill = true
+
+[features.injury]
+# Explicit and documented, per SPEC §23. An absent injury row is NOT automatically
+# a healthy player; this states what we assume and makes it auditable.
+missing_row_means = "active"
+
+[features.dfs]
+enabled = false                  # SPEC §35-lineage: core model must not depend on DFS
+
+# --- calibration ------------------------------------------------------------
+[calibration]
+use_out_of_fold_only = true      # not negotiable; here so violations are visible
+fallback_order = ["prop_family", "position", "global"]
+min_samples_per_group = 200
+require_pit_histogram = true
+
+# --- backtest ---------------------------------------------------------------
+[backtest]
+split = "expanding_window"       # random splits are a hard failure
+stability_slices = [[1,4],[14,22]]
+report_conditional_on_close_availability = true

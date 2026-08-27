@@ -1,0 +1,6 @@
+"""Market system.
+
+SPEC: docs/IMPLEMENTATION_SPEC.md §54
+PHASE: 9
+STATUS: SKELETON
+"""

@@ -1,0 +1,73 @@
+# =====================================================================
+# SIMULATION INVARIANTS (NORMATIVE)
+# Asserted on EVERY simulated game. Any failure ABORTS the prediction run.
+# Implemented in src/nflprops/simulation/invariants.py
+# Tested in tests/invariants/
+# =====================================================================
+version: "2026.1.0"
+on_failure: abort_run          # never warn-and-continue
+tolerance_yards: 0             # integer yardage must match exactly
+
+team_level:
+  - id: INV001
+    rule: "team_sacks + team_pass_attempts == team_dropbacks"
+  - id: INV002
+    rule: "team_pass_attempts <= team_dropbacks"
+  - id: INV003
+    rule: "team_dropbacks + team_rush_attempts == team_offensive_plays"
+  - id: INV004
+    rule: "directed_targets <= team_pass_attempts"
+    why: "throwaways and spikes are attempts without a directed receiver"
+  - id: INV005
+    rule: "sum(player_targets) == directed_targets"
+  - id: INV006
+    rule: "sum(player_rush_attempts) == team_rush_attempts"
+  - id: INV007
+    rule: "team_interceptions <= team_pass_attempts"
+
+player_level:
+  - id: INV010
+    rule: "all(player.receptions <= player.targets)"
+  - id: INV011
+    rule: "all(player.rush_rec_yards == player.rushing_yards + player.receiving_yards)"
+  - id: INV012
+    rule: "all(player.longest_rush == 0 when player.rush_attempts == 0)"
+  - id: INV013
+    rule: "all(player.longest_reception == 0 when player.receptions == 0)"
+
+qb_coherence:
+  - id: INV020
+    rule: "qb.completions == sum(receptions on targets thrown by qb)"
+  - id: INV021
+    rule: "qb.passing_yards == sum(receiving_yards on completions thrown by qb)"
+  - id: INV022
+    rule: "qb.passing_tds == sum(receiving_tds on completions thrown by qb)"
+  - id: INV023
+    rule: "sum over QBs of qb.pass_attempts == team_pass_attempts"
+
+kicking:
+  - id: INV030
+    rule: "kicker.kicking_points == 3 * kicker.fg_made + kicker.xp_made"
+  - id: INV031
+    rule: "kicker.fg_made <= kicker.fg_attempts"
+  - id: INV032
+    rule: "team_xp_attempts <= team_touchdowns"
+
+availability:
+  - id: INV040
+    rule: "inactive_player_opportunities == 0"
+    scope: "targets, carries, pass attempts, FG attempts"
+  - id: INV041
+    rule: "no QB receives attempts while flagged inactive in the availability scenario"
+
+period_consistency:
+  - id: INV050
+    rule: "sum over quarters of any per-quarter counter == full-game counter"
+  - id: INV051
+    rule: "value_1h == q1 + q2 and value_2h == q3 + q4"
+
+first_td:
+  - id: INV060
+    rule: "P(first_td == NONE) == P(game_total_tds == 0)"
+  - id: INV061
+    rule: "sum of first_td player probabilities + P(NONE) == 1"

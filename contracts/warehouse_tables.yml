@@ -1,0 +1,176 @@
+# =====================================================================
+# CANONICAL WAREHOUSE TABLE INVENTORY (NORMATIVE)
+# Storage: Parquet files queried through DuckDB. No database server.
+# Layers: raw -> bronze -> silver -> features/states -> predictions
+# =====================================================================
+version: "2026.1.0"
+
+storage:
+  format: parquet
+  engine: duckdb
+  compression: zstd
+
+pit_columns_required_on_time_varying_tables:
+  - event_time        # when the real-world event happened
+  - available_at      # earliest timestamp this record could legitimately be known
+  - ingested_at       # when WE wrote it
+  - provider
+  - provider_record_id
+
+layers:
+  raw: "data/raw/bdl/<endpoint>/ — immutable JSON + sidecar metadata"
+  bronze: "1:1 typed parquet of raw payloads, provider IDs still present"
+  silver: "canonical IDs, normalized types, deduplicated"
+  features: "point-in-time feature rows keyed by (as_of, entity)"
+  states: "empirical-Bayes posterior snapshots keyed by (as_of, entity, metric)"
+
+tables:
+
+  identity:
+    teams:
+      key: [canonical_team_id]
+      pit: false
+    players:
+      key: [canonical_player_id]
+      pit: false
+    provider_team_ids:
+      key: [provider, provider_team_id]
+      pit: false
+    provider_player_ids:
+      key: [provider, provider_player_id]
+      pit: false
+    provider_game_ids:
+      key: [provider, provider_game_id]
+      pit: false
+
+  schedule:
+    games:
+      key: [canonical_game_id, available_at]
+      pit: true
+      note: "append-only schedule/final snapshots; training outcomes use status_state == 'final' only"
+
+  snapshots:
+    roster_snapshots:
+      key: [canonical_team_id, canonical_player_id, available_at]
+      pit: true
+      rule: "append-only; never overwrite"
+    injury_snapshots:
+      key: [canonical_player_id, available_at]
+      pit: true
+      rule: "append-only; Saturday never overwrites Monday"
+
+  outcomes:
+    player_game_stats:
+      key: [canonical_game_id, canonical_player_id]
+      pit: true
+      note: "PRIMARY GROUND TRUTH; retain every provider column"
+    player_season_stats:
+      key: [canonical_player_id, season, season_type]
+      pit: false
+      leakage: "QA only; never a point-in-time feature"
+    team_game_stats:
+      key: [canonical_game_id, canonical_team_id]
+      pit: true
+      note: "opponent features are built by REVERSING these rows within a game"
+    team_season_stats:
+      key: [canonical_team_id, season, season_type]
+      pit: false
+      warning: "schema exposes no opponent or defensive fields despite its description"
+
+  advanced:
+    advanced_passing_weekly:
+      key: [canonical_player_id, season, week]
+      pit: true
+    advanced_rushing_weekly:
+      key: [canonical_player_id, season, week]
+      pit: true
+    advanced_receiving_weekly:
+      key: [canonical_player_id, season, week]
+      pit: true
+
+  pbp:
+    plays_raw:
+      key: [canonical_game_id, play_id]
+      pit: true
+    plays_parsed:
+      key: [canonical_game_id, play_id]
+      pit: true
+    pbp_reconciliation:
+      key: [canonical_game_id]
+      pit: true
+      columns: [pbp_quality, score, mismatch_report]
+
+  market:
+    game_odds_snapshots:
+      key: [canonical_game_id, vendor, collector_received_at]
+      pit: true
+    game_opening_odds:
+      key: [canonical_game_id, vendor]
+      pit: true
+    player_prop_snapshots:
+      key: [canonical_game_id, canonical_player_id, prop_type, vendor, collector_received_at]
+      pit: true
+      note: "BDL retains no live prop history — this table IS the history"
+    player_prop_openings:
+      key: [canonical_game_id, canonical_player_id, prop_type, vendor]
+      pit: true
+
+  dfs:
+    dfs_slates:
+      key: [slate_id]
+      pit: true
+      optional: true
+    dfs_draftables:
+      key: [slate_id, draftable_id]
+      pit: true
+      optional: true
+
+  state:
+    player_states:
+      key: [canonical_player_id, metric, as_of]
+      pit: true
+      columns: [posterior_mean, posterior_var, effective_n, prior_mean, last_updated]
+    team_states:
+      key: [canonical_team_id, metric, as_of]
+      pit: true
+      columns: [posterior_mean, posterior_var, effective_n, prior_mean, last_updated]
+    role_states:
+      key: [canonical_team_id, canonical_player_id, metric, as_of]
+      pit: true
+      columns: [posterior_mean, posterior_var, effective_n, prior_mean, last_updated]
+
+  modeling:
+    game_features:
+      key: [canonical_game_id, as_of]
+      pit: true
+    player_features:
+      key: [canonical_game_id, canonical_player_id, as_of]
+      pit: true
+    training_rows:
+      key: [row_id]
+      pit: true
+
+  simulation:
+    simulation_runs:
+      key: [run_id]
+      pit: false
+    simulation_player_results:
+      key: [run_id, draw_id, canonical_player_id]
+      pit: false
+      note: "the JOINT draw matrix; enables honest SGP pricing and correlation checks"
+
+  output:
+    predictions:
+      key: [prediction_id]
+      pit: false
+    settled_predictions:
+      key: [prediction_id]
+      pit: false
+
+  governance:
+    model_registry:
+      key: [model_version]
+      pit: false
+    data_manifests:
+      key: [manifest_id]
+      pit: false
