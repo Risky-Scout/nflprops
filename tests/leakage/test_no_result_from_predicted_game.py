@@ -1,26 +1,31 @@
 """IMPLEMENTATION_SPEC §66: target-game result cannot enter features."""
 
+from collections.abc import Callable
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
-from tests.leakage.test_all_leakage_rules import (
-    AS_OF,
-    clean_lineage,
-    game,
+
+from nflprops.backtest.leakage import (
+    HistoricalGameRef,
+    LeakageError,
+    PredictionLineage,
+    assert_no_leakage,
 )
 
-from nflprops.backtest.leakage import LeakageError, assert_no_leakage
 
-
-def test_target_game_result_is_rejected() -> None:
+def test_target_game_result_is_rejected(
+    as_of: datetime,
+    clean_lineage_factory: Callable[[], PredictionLineage],
+    game_factory: Callable[..., HistoricalGameRef],
+) -> None:
     lineage = replace(
-        clean_lineage(),
+        clean_lineage_factory(),
         historical_aggregation_games=(
-            game(
+            game_factory(
                 "target-game",
                 week=2,
-                result_available_at=AS_OF - timedelta(days=1),
+                result_available_at=as_of - timedelta(days=1),
             ),
         ),
     )

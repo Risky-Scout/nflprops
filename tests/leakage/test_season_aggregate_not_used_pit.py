@@ -1,26 +1,31 @@
 """IMPLEMENTATION_SPEC §66: season aggregates must be point-in-time."""
 
+from collections.abc import Callable
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
-from tests.leakage.test_all_leakage_rules import (
-    AS_OF,
-    clean_lineage,
-    game,
+
+from nflprops.backtest.leakage import (
+    HistoricalGameRef,
+    LeakageError,
+    PredictionLineage,
+    assert_no_leakage,
 )
 
-from nflprops.backtest.leakage import LeakageError, assert_no_leakage
 
-
-def test_future_result_in_season_aggregate_is_rejected() -> None:
+def test_future_result_in_season_aggregate_is_rejected(
+    as_of: datetime,
+    clean_lineage_factory: Callable[[], PredictionLineage],
+    game_factory: Callable[..., HistoricalGameRef],
+) -> None:
     lineage = replace(
-        clean_lineage(),
+        clean_lineage_factory(),
         season_aggregate_games=(
-            game(
+            game_factory(
                 "future-game",
                 week=3,
-                result_available_at=AS_OF + timedelta(days=7),
+                result_available_at=as_of + timedelta(days=7),
             ),
         ),
     )

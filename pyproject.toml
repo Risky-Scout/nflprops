@@ -21,7 +21,7 @@ classifiers = [
 # Deliberately small. SPEC §62: v1 does not require neural frameworks. Add a
 # dependency only when walk-forward testing proves it earns its place.
 dependencies = [
-  "numpy>=1.26",
+  "numpy>=1.26,<2.5",
   "scipy>=1.11",
   "polars>=0.20",
   "pyarrow>=15",
