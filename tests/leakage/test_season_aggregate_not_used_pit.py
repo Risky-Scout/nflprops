@@ -1,16 +1,29 @@
-"""ACCEPTANCE TEST — season_stats never a PIT feature
+"""IMPLEMENTATION_SPEC §66: season aggregates must be point-in-time."""
 
-PHASE: 4
-STATUS: not yet implemented. Skipped, NOT deleted: the acceptance criterion stays
-visible in the repository from day one. Remove the skip and write the test as part
-of Phase 4.
-"""
+from dataclasses import replace
+from datetime import timedelta
 
 import pytest
+from tests.leakage.test_all_leakage_rules import (
+    AS_OF,
+    clean_lineage,
+    game,
+)
 
-pytestmark = pytest.mark.skip(reason="PHASE 4 not yet implemented")
+from nflprops.backtest.leakage import LeakageError, assert_no_leakage
 
 
-def test_season_aggregate_not_used_pit():
-    """season_stats never a PIT feature"""
-    raise NotImplementedError("PHASE 4")
+def test_future_result_in_season_aggregate_is_rejected() -> None:
+    lineage = replace(
+        clean_lineage(),
+        season_aggregate_games=(
+            game(
+                "future-game",
+                week=3,
+                result_available_at=AS_OF + timedelta(days=7),
+            ),
+        ),
+    )
+
+    with pytest.raises(LeakageError):
+        assert_no_leakage(lineage)

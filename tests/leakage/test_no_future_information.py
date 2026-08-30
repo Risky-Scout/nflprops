@@ -1,16 +1,19 @@
-"""ACCEPTANCE TEST — available_at <= as_of everywhere
+"""IMPLEMENTATION_SPEC §66: feature.available_at <= prediction.as_of."""
 
-PHASE: 4
-STATUS: not yet implemented. Skipped, NOT deleted: the acceptance criterion stays
-visible in the repository from day one. Remove the skip and write the test as part
-of Phase 4.
-"""
+from dataclasses import replace
+from datetime import timedelta
 
 import pytest
+from tests.leakage.test_all_leakage_rules import AS_OF, clean_lineage
 
-pytestmark = pytest.mark.skip(reason="PHASE 4 not yet implemented")
+from nflprops.backtest.leakage import LeakageError, assert_no_leakage
 
 
-def test_no_future_information():
-    """available_at <= as_of everywhere"""
-    raise NotImplementedError("PHASE 4")
+def test_future_feature_is_rejected() -> None:
+    lineage = replace(
+        clean_lineage(),
+        feature_available_at=(AS_OF + timedelta(seconds=1),),
+    )
+
+    with pytest.raises(LeakageError):
+        assert_no_leakage(lineage)

@@ -1,16 +1,19 @@
-"""ACCEPTANCE TEST — state as_of never exceeds prediction as_of
+"""IMPLEMENTATION_SPEC §66: state timestamp <= prediction timestamp."""
 
-PHASE: 5
-STATUS: not yet implemented. Skipped, NOT deleted: the acceptance criterion stays
-visible in the repository from day one. Remove the skip and write the test as part
-of Phase 5.
-"""
+from dataclasses import replace
+from datetime import timedelta
 
 import pytest
+from tests.leakage.test_all_leakage_rules import AS_OF, clean_lineage
 
-pytestmark = pytest.mark.skip(reason="PHASE 5 not yet implemented")
+from nflprops.backtest.leakage import LeakageError, assert_no_leakage
 
 
-def test_state_timestamp_not_future():
-    """state as_of never exceeds prediction as_of"""
-    raise NotImplementedError("PHASE 5")
+def test_future_state_is_rejected() -> None:
+    lineage = replace(
+        clean_lineage(),
+        state_as_of=AS_OF + timedelta(seconds=1),
+    )
+
+    with pytest.raises(LeakageError):
+        assert_no_leakage(lineage)

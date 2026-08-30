@@ -1,16 +1,27 @@
-"""ACCEPTANCE TEST — PIT filter applied at the warehouse
+"""Warehouse/feature PIT filtering must exclude future rows."""
 
-PHASE: 2
-STATUS: not yet implemented. Skipped, NOT deleted: the acceptance criterion stays
-visible in the repository from day one. Remove the skip and write the test as part
-of Phase 2.
-"""
+from datetime import UTC, datetime, timedelta
 
-import pytest
+import polars as pl
 
-pytestmark = pytest.mark.skip(reason="PHASE 2 not yet implemented")
+from nflprops.features.asof import filter_pit
 
 
-def test_available_at_filter():
-    """PIT filter applied at the warehouse"""
-    raise NotImplementedError("PHASE 2")
+def test_available_at_filter_excludes_future_information() -> None:
+    as_of = datetime(2025, 9, 10, 12, tzinfo=UTC)
+
+    frame = pl.DataFrame(
+        {
+            "value": [1, 2, 3],
+            "available_at": [
+                as_of - timedelta(hours=1),
+                as_of,
+                as_of + timedelta(seconds=1),
+            ],
+        }
+    )
+
+    result = filter_pit(frame, as_of, strict=False)
+
+    assert result["value"].to_list() == [1, 2]
+    assert (result["available_at"] <= as_of).all()
