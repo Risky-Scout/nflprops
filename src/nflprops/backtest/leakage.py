@@ -32,7 +32,11 @@ class LeakageRule(StrEnum):
 
 class FundamentalSourceKind(StrEnum):
     NON_MARKET = "non_market"
-    MARKET_PRICE = "market_price"
+    GAME_MARKET_PRICE = "game_market_price"
+    PLAYER_PROP_MARKET_PRICE = "player_prop_market_price"
+
+    # Backward-compatible alias used by the original §66 tests.
+    MARKET_PRICE = "player_prop_market_price"
 
 
 @dataclass(frozen=True)
