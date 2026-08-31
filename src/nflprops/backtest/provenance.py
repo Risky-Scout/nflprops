@@ -285,13 +285,18 @@ def build_state_provenance_context(
         for game_id in sorted(state_game_ids)
     )
 
+    player_stats_max = _max_available_at(ps)
+    team_stats_max = _max_available_at(ts)
+    roster_max = _max_available_at(rr)
+    injuries_max = _max_available_at(ii)
+
     source_maxima = [
         value
         for value in (
-            _max_available_at(ps),
-            _max_available_at(ts),
-            _max_available_at(rr),
-            _max_available_at(ii),
+            player_stats_max,
+            team_stats_max,
+            roster_max,
+            injuries_max,
         )
         if value is not None
     ]
@@ -316,23 +321,23 @@ def build_state_provenance_context(
             "roster_rows": rr.height,
             "injury_rows": ii.height,
             "player_stats_max": (
-                _max_available_at(ps).isoformat()
-                if _max_available_at(ps) is not None
+                player_stats_max.isoformat()
+                if player_stats_max is not None
                 else None
             ),
             "team_stats_max": (
-                _max_available_at(ts).isoformat()
-                if _max_available_at(ts) is not None
+                team_stats_max.isoformat()
+                if team_stats_max is not None
                 else None
             ),
             "roster_max": (
-                _max_available_at(rr).isoformat()
-                if _max_available_at(rr) is not None
+                roster_max.isoformat()
+                if roster_max is not None
                 else None
             ),
             "injuries_max": (
-                _max_available_at(ii).isoformat()
-                if _max_available_at(ii) is not None
+                injuries_max.isoformat()
+                if injuries_max is not None
                 else None
             ),
             "state_game_ids": [
