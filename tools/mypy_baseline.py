@@ -32,6 +32,17 @@ ERROR_RE = re.compile(
 BASELINE_VERSION = 1
 
 
+def mypy_version() -> str:
+    process = subprocess.run(
+        [sys.executable, "-m", "mypy", "--version"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=True,
+    )
+    return process.stdout.strip()
+
+
 class Finding(NamedTuple):
     path: str
     code: str
@@ -91,6 +102,7 @@ def payload(findings: Counter[Finding]) -> dict[str, object]:
 
     return {
         "version": BASELINE_VERSION,
+        "mypy_version": mypy_version(),
         "mypy_target_python": "3.11",
         "total_findings": sum(findings.values()),
         "findings": rows,
@@ -103,6 +115,20 @@ def load_baseline(path: Path) -> Counter[Finding]:
     if data.get("version") != BASELINE_VERSION:
         raise ValueError(
             f"unsupported mypy baseline version: {data.get('version')!r}"
+        )
+
+    expected_mypy = mypy_version()
+    baseline_mypy = data.get("mypy_version")
+
+    if baseline_mypy != expected_mypy:
+        raise ValueError(
+            "mypy baseline tool version mismatch: "
+            f"{baseline_mypy!r} != {expected_mypy!r}"
+        )
+
+    if data.get("mypy_target_python") != "3.11":
+        raise ValueError(
+            "mypy baseline must target Python 3.11"
         )
 
     rows = data.get("findings")
