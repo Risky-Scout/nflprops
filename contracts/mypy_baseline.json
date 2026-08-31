@@ -1,0 +1,368 @@
+{
+  "findings": [
+    {
+      "code": "no-untyped-call",
+      "count": 3,
+      "message": "Call to untyped function \"clip_probability\" in typed context",
+      "path": "src/nflprops/backtest/metrics.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 1,
+      "message": "Function is missing a type annotation",
+      "path": "src/nflprops/backtest/metrics.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 4,
+      "message": "Function is missing a type annotation for one or more parameters",
+      "path": "src/nflprops/backtest/metrics.py"
+    },
+    {
+      "code": "no-untyped-call",
+      "count": 2,
+      "message": "Call to untyped function \"_clip\" in typed context",
+      "path": "src/nflprops/calibration/calibrators.py"
+    },
+    {
+      "code": "no-untyped-call",
+      "count": 1,
+      "message": "Call to untyped function \"_features\" in typed context",
+      "path": "src/nflprops/calibration/calibrators.py"
+    },
+    {
+      "code": "no-untyped-call",
+      "count": 1,
+      "message": "Call to untyped function \"transform\" in typed context",
+      "path": "src/nflprops/calibration/calibrators.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 3,
+      "message": "Function is missing a type annotation",
+      "path": "src/nflprops/calibration/calibrators.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 2,
+      "message": "Function is missing a type annotation for one or more parameters",
+      "path": "src/nflprops/calibration/calibrators.py"
+    },
+    {
+      "code": "unreachable",
+      "count": 1,
+      "message": "Statement is unreachable",
+      "path": "src/nflprops/calibration/calibrators.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"fit_max_outcome_available_at\" to \"_CurrentGroupFit\" has incompatible type \"int | float | Decimal | date | time | timedelta | str | bytes | ndarray[Any, Any] | list[Any] | None\"; expected \"datetime\"",
+      "path": "src/nflprops/calibration/oof.py"
+    },
+    {
+      "code": "no-untyped-call",
+      "count": 1,
+      "message": "Call to untyped function \"transform\" in typed context",
+      "path": "src/nflprops/calibration/oof.py"
+    },
+    {
+      "code": "no-any-return",
+      "count": 1,
+      "message": "Returning Any from function declared to return \"str\"",
+      "path": "src/nflprops/data/entity_resolution.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 1,
+      "message": "Function is missing a type annotation for one or more parameters",
+      "path": "src/nflprops/data/manifests.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument 1 to \"int\" has incompatible type \"int | float | Decimal | date | time | timedelta | str | bytes | ndarray[Any, Any] | list[Any] | None\"; expected \"str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc\"",
+      "path": "src/nflprops/data/quality.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 1,
+      "message": "Function is missing a return type annotation",
+      "path": "src/nflprops/data/raw_store.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 1,
+      "message": "Function is missing a type annotation for one or more parameters",
+      "path": "src/nflprops/data/raw_store.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 1,
+      "message": "Function is missing a type annotation for one or more parameters",
+      "path": "src/nflprops/data/snapshots.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"keep\" to \"unique\" of \"DataFrame\" has incompatible type \"str\"; expected \"Literal['first', 'last', 'any', 'none']\"",
+      "path": "src/nflprops/data/warehouse.py"
+    },
+    {
+      "code": "return-value",
+      "count": 1,
+      "message": "Incompatible return value type (got \"DataFrame | Series\", expected \"DataFrame\")",
+      "path": "src/nflprops/data/warehouse.py"
+    },
+    {
+      "code": "assignment",
+      "count": 1,
+      "message": "Incompatible types in assignment (expression has type \"Sequence[Play]\", variable has type \"list[Any]\")",
+      "path": "src/nflprops/pipelines/lean.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 2,
+      "message": "Function is missing a return type annotation",
+      "path": "src/nflprops/pipelines/lean.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 1,
+      "message": "Function is missing a type annotation for one or more parameters",
+      "path": "src/nflprops/pipelines/lean.py"
+    },
+    {
+      "code": "operator",
+      "count": 1,
+      "message": "No overload variant of \"__add__\" of \"list\" matches argument type \"timedelta\"",
+      "path": "src/nflprops/pipelines/lean.py"
+    },
+    {
+      "code": "operator",
+      "count": 1,
+      "message": "Unsupported operand types for + (\"Decimal\" and \"timedelta\")",
+      "path": "src/nflprops/pipelines/lean.py"
+    },
+    {
+      "code": "operator",
+      "count": 1,
+      "message": "Unsupported operand types for + (\"bytes\" and \"timedelta\")",
+      "path": "src/nflprops/pipelines/lean.py"
+    },
+    {
+      "code": "operator",
+      "count": 1,
+      "message": "Unsupported operand types for + (\"float\" and \"timedelta\")",
+      "path": "src/nflprops/pipelines/lean.py"
+    },
+    {
+      "code": "operator",
+      "count": 1,
+      "message": "Unsupported operand types for + (\"int\" and \"timedelta\")",
+      "path": "src/nflprops/pipelines/lean.py"
+    },
+    {
+      "code": "operator",
+      "count": 1,
+      "message": "Unsupported operand types for + (\"str\" and \"timedelta\")",
+      "path": "src/nflprops/pipelines/lean.py"
+    },
+    {
+      "code": "operator",
+      "count": 1,
+      "message": "Unsupported operand types for + (\"time\" and \"timedelta\")",
+      "path": "src/nflprops/pipelines/lean.py"
+    },
+    {
+      "code": "return-value",
+      "count": 1,
+      "message": "Incompatible return value type (got \"Any | date | timedelta\", expected \"datetime | None\")",
+      "path": "src/nflprops/pipelines/lean.py"
+    },
+    {
+      "code": "var-annotated",
+      "count": 1,
+      "message": "Need type annotation for \"ps_records\" (hint: \"ps_records: list[<type>] = ...\")",
+      "path": "src/nflprops/pipelines/lean.py"
+    },
+    {
+      "code": "var-annotated",
+      "count": 1,
+      "message": "Need type annotation for \"rows\" (hint: \"rows: list[<type>] = ...\")",
+      "path": "src/nflprops/pipelines/lean.py"
+    },
+    {
+      "code": "var-annotated",
+      "count": 1,
+      "message": "Need type annotation for \"ts_records\" (hint: \"ts_records: list[<type>] = ...\")",
+      "path": "src/nflprops/pipelines/lean.py"
+    },
+    {
+      "code": "assignment",
+      "count": 1,
+      "message": "Incompatible types in assignment (expression has type \"Any | None\", variable has type \"int\")",
+      "path": "src/nflprops/pipelines/pregame.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 4,
+      "message": "Function is missing a return type annotation",
+      "path": "src/nflprops/pipelines/pregame.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 4,
+      "message": "Function is missing a type annotation for one or more parameters",
+      "path": "src/nflprops/pipelines/pregame.py"
+    },
+    {
+      "code": "type-arg",
+      "count": 3,
+      "message": "Missing type arguments for generic type \"dict\"",
+      "path": "src/nflprops/pipelines/pregame.py"
+    },
+    {
+      "code": "type-arg",
+      "count": 2,
+      "message": "Missing type arguments for generic type \"dict\"",
+      "path": "src/nflprops/pipelines/settle.py"
+    },
+    {
+      "code": "no-any-return",
+      "count": 1,
+      "message": "Returning Any from function declared to return \"float\"",
+      "path": "src/nflprops/providers/bdl/client.py"
+    },
+    {
+      "code": "no-any-return",
+      "count": 1,
+      "message": "Returning Any from function declared to return \"Sequence[AdvancedPassing]\"",
+      "path": "src/nflprops/providers/bdl/provider.py"
+    },
+    {
+      "code": "no-any-return",
+      "count": 1,
+      "message": "Returning Any from function declared to return \"Sequence[AdvancedReceiving]\"",
+      "path": "src/nflprops/providers/bdl/provider.py"
+    },
+    {
+      "code": "no-any-return",
+      "count": 1,
+      "message": "Returning Any from function declared to return \"Sequence[AdvancedRushing]\"",
+      "path": "src/nflprops/providers/bdl/provider.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 1,
+      "message": "Function is missing a return type annotation",
+      "path": "src/nflprops/providers/bdl/provider.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 1,
+      "message": "Function is missing a type annotation for one or more parameters",
+      "path": "src/nflprops/providers/bdl/provider.py"
+    },
+    {
+      "code": "type-arg",
+      "count": 2,
+      "message": "Missing type arguments for generic type \"dict\"",
+      "path": "src/nflprops/providers/bdl/provider.py"
+    },
+    {
+      "code": "no-any-return",
+      "count": 1,
+      "message": "Returning Any from function declared to return \"ndarray[tuple[Any, ...], dtype[Any]]\"",
+      "path": "src/nflprops/simulation/allocations.py"
+    },
+    {
+      "code": "no-any-return",
+      "count": 1,
+      "message": "Returning Any from function declared to return \"ndarray[tuple[Any, ...], dtype[Any]]\"",
+      "path": "src/nflprops/simulation/game.py"
+    },
+    {
+      "code": "no-untyped-call",
+      "count": 4,
+      "message": "Call to untyped function \"_clip_prob\" in typed context",
+      "path": "src/nflprops/simulation/game.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 2,
+      "message": "Function is missing a return type annotation",
+      "path": "src/nflprops/simulation/game.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 1,
+      "message": "Function is missing a type annotation",
+      "path": "src/nflprops/simulation/game.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument 1 to \"check_qb_coherence\" has incompatible type \"PlayerDraw | None\"; expected \"PlayerDraw\"",
+      "path": "src/nflprops/simulation/invariants.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 1,
+      "message": "Function is missing a return type annotation",
+      "path": "src/nflprops/simulation/invariants.py"
+    },
+    {
+      "code": "no-any-return",
+      "count": 5,
+      "message": "Returning Any from function declared to return \"ndarray[tuple[Any, ...], dtype[Any]]\"",
+      "path": "src/nflprops/simulation/props.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 1,
+      "message": "Function is missing a return type annotation",
+      "path": "src/nflprops/simulation/props.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 1,
+      "message": "Function is missing a type annotation for one or more parameters",
+      "path": "src/nflprops/simulation/props.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 1,
+      "message": "Function is missing a type annotation for one or more parameters",
+      "path": "src/nflprops/state/empirical_bayes.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 2,
+      "message": "Argument 1 to \"float\" has incompatible type \"int | float | Decimal | date | time | timedelta | str | bytes | ndarray[Any, Any] | list[Any]\"; expected \"str | Buffer | SupportsFloat | SupportsIndex\"",
+      "path": "src/nflprops/state/player.py"
+    },
+    {
+      "code": "no-any-return",
+      "count": 1,
+      "message": "Returning Any from function declared to return \"ndarray[tuple[Any, ...], dtype[Any]]\"",
+      "path": "src/nflprops/state/player.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 1,
+      "message": "Function is missing a type annotation for one or more parameters",
+      "path": "src/nflprops/state/player.py"
+    },
+    {
+      "code": "type-arg",
+      "count": 1,
+      "message": "Missing type arguments for generic type \"list\"",
+      "path": "src/nflprops/state/player.py"
+    }
+  ],
+  "mypy_target_python": "3.11",
+  "mypy_version": "mypy 2.3.1 (compiled: yes)",
+  "total_findings": 89,
+  "version": 1
+}
