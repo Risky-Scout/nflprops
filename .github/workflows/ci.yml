@@ -33,9 +33,6 @@ jobs:
       - name: Lint
         run: ruff check src tests
 
-      - name: Type check
-        run: mypy
-
       - name: Test
         run: pytest -q
 
@@ -59,6 +56,24 @@ jobs:
           ! grep -rniE "(api[_-]?key|secret|token)\s*=\s*['\"][A-Za-z0-9_\-]{16,}" \
             src/ configs/ tools/ \
             || (echo "FAIL: possible hardcoded credential"; exit 1)
+
+  typecheck:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -e ".[dev]"
+
+      - name: Strict mypy non-regression gate
+        run: |
+          python tools/mypy_baseline.py \
+            check \
+            contracts/mypy_baseline.json
 
   provider-contract:
     # Phase 1 is not complete while the authoritative BDL spec is a placeholder.
