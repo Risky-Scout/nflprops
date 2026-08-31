@@ -7,6 +7,15 @@ from datetime import datetime
 
 import polars as pl
 
+from nflprops.backtest.provenance import (
+    PredictionProvenance,
+    StateProvenanceContext,
+    assert_state_history_safe,
+    audit_prediction_inputs,
+    build_state_provenance_context,
+    latest_entity_available_at,
+    latest_game_market_available_at,
+)
 from nflprops.data.warehouse import Warehouse
 from nflprops.market.consensus import game_market_consensus, latest_prop_quotes
 from nflprops.market.devig import proportional_two_sided
@@ -304,6 +313,119 @@ def _restrict_games(
     return games.filter(pl.col("canonical_game_id").cast(pl.String).is_in(wanted))
 
 
+
+def _assert_state_history_safe_for_games(
+    state_context: StateProvenanceContext,
+    games: pl.DataFrame,
+    *,
+    season: int,
+    week: int,
+) -> None:
+    """Reject contaminated state history before state building/simulation."""
+
+    if games.is_empty():
+        return
+
+    for game_id in games[
+        "canonical_game_id"
+    ].cast(pl.Utf8).to_list():
+        assert_state_history_safe(
+            state_context,
+            target_game_id=str(game_id),
+            target_season=season,
+            target_week=week,
+        )
+
+
+def _audit_and_attach_prediction_provenance(
+    priced_rows: list[dict[str, object]],
+    *,
+    quote: dict[str, object],
+    game: dict[str, object],
+    season: int,
+    week: int,
+    as_of: datetime,
+    state_context: StateProvenanceContext,
+    roster: pl.DataFrame,
+    injuries: pl.DataFrame,
+    game_market_available_at: datetime | None,
+    market_mode: str,
+) -> list[dict[str, object]]:
+    """Audit priced rows and append provenance without changing forecasts."""
+
+    game_id = str(game["canonical_game_id"])
+    player_id = str(quote["canonical_player_id"])
+    prop_type = str(quote["prop_type"])
+
+    roster_available_at = latest_entity_available_at(
+        roster,
+        as_of=as_of,
+        entity_column="canonical_player_id",
+        entity_id=player_id,
+    )
+
+    injury_available_at = latest_entity_available_at(
+        injuries,
+        as_of=as_of,
+        entity_column="canonical_player_id",
+        entity_id=player_id,
+    )
+
+    audited: list[dict[str, object]] = []
+
+    for priced_row in priced_rows:
+        provenance: PredictionProvenance = audit_prediction_inputs(
+            prediction_id=str(priced_row["prediction_id"]),
+            as_of=as_of,
+            season=season,
+            week=week,
+            game_id=game_id,
+            player_id=player_id,
+            prop_type=prop_type,
+            state_context=state_context,
+            game_available_at=game.get("available_at"),
+            quote_available_at=quote.get("available_at"),
+            roster_available_at=roster_available_at,
+            injury_available_at=injury_available_at,
+            game_market_available_at=game_market_available_at,
+            market_mode=market_mode,
+        )
+
+        audit_columns = provenance.as_columns()
+
+        audit_columns.update(
+            {
+                "canonical_game_id": game_id,
+                "canonical_player_id": player_id,
+                "game_available_at": game.get("available_at"),
+                "roster_available_at": roster_available_at,
+                "game_market_available_at": (
+                    game_market_available_at
+                ),
+                "state_source_max_available_at": (
+                    state_context.max_source_available_at
+                ),
+            }
+        )
+
+        collisions = (
+            set(priced_row)
+            & set(audit_columns)
+        )
+
+        if collisions:
+            raise ValueError(
+                "prediction provenance would overwrite existing "
+                "columns: "
+                + ", ".join(sorted(collisions))
+            )
+
+        enriched = dict(priced_row)
+        enriched.update(audit_columns)
+        audited.append(enriched)
+
+    return audited
+
 def predict_week(
     warehouse: Warehouse,
     *,
@@ -338,6 +460,24 @@ def predict_week(
     if current_games.is_empty():
         return pl.DataFrame()
 
+    state_context = build_state_provenance_context(
+        games=games,
+        player_stats=player_stats,
+        team_stats=team_stats,
+        players=players,
+        roster=roster,
+        injuries=injuries,
+        as_of=as_of,
+        model_version=model_version,
+    )
+
+    _assert_state_history_safe_for_games(
+        state_context,
+        current_games,
+        season=season,
+        week=week,
+    )
+
     # Historical backfill outcome timestamps are conservative estimates. We permit
     # them here because their availability is deliberately set after game end; the
     # as-of cutoff still applies. Live/current snapshots remain exact.
@@ -371,8 +511,23 @@ def predict_week(
             # state is not yet trustworthy enough to publish a prop forecast.
             continue
 
-        market = game_market_consensus(game_odds, game_id, as_of=as_of)
-        home_points, away_points = _implied_points(market.total, market.home_spread)
+        game_market_available_at = (
+            latest_game_market_available_at(
+                game_odds,
+                as_of=as_of,
+                game_id=game_id,
+            )
+        )
+
+        market = game_market_consensus(
+            game_odds,
+            game_id,
+            as_of=as_of,
+        )
+        home_points, away_points = _implied_points(
+            market.total,
+            market.home_spread,
+        )
         home_spread = market.home_spread or 0.0
 
         home_players = tuple(p for p in player_states.values() if p.team_id == home_id)
@@ -414,7 +569,28 @@ def predict_week(
             confidence_tier = prop_confidence_tier(str(quote["prop_type"]))
             if confidence_tier is None or confidence_tier > max_confidence_tier:
                 continue
-            prediction_rows.extend(_price_quote(result, quote))
+            priced_rows = _price_quote(
+                result,
+                quote,
+            )
+
+            prediction_rows.extend(
+                _audit_and_attach_prediction_provenance(
+                    priced_rows,
+                    quote=quote,
+                    game=game,
+                    season=season,
+                    week=week,
+                    as_of=as_of,
+                    state_context=state_context,
+                    roster=roster,
+                    injuries=injuries,
+                    game_market_available_at=(
+                        game_market_available_at
+                    ),
+                    market_mode=market_mode,
+                )
+            )
 
         if persist and retain_joint_draws > 0:
             keep = min(retain_joint_draws, result.n_draws)
