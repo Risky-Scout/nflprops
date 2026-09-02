@@ -242,6 +242,9 @@ def test_real_historical_predict_contract_is_used() -> None:
 
     assert rows.height == 1
     assert rows["prediction_id"][0] == "pred-1"
+    assert rows["season"][0] == 2025
+    assert rows["week"][0] == 1
+    assert rows["checkpoint_id"][0] == "2025-w1-g1"
     assert rows["canonical_game_id"][0] == "g1"
     assert rows["canonical_player_id"][0] == "p1"
     assert rows["p_raw"][0] == 0.61

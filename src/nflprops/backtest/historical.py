@@ -850,6 +850,17 @@ def execute_historical_fold(
                 scoreable,
                 calibrated,
             )
+            .with_columns(
+                pl.lit(
+                    checkpoint.season
+                ).alias("season"),
+                pl.lit(
+                    checkpoint.week
+                ).alias("week"),
+                pl.lit(
+                    checkpoint.checkpoint_id
+                ).alias("checkpoint_id"),
+            )
         )
 
         score_frames.append(
