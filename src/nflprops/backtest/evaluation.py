@@ -10,9 +10,11 @@ into a passing promotion condition.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 import numpy as np
 import polars as pl
+from numpy.typing import NDArray
 
 from nflprops.backtest.metrics import (
     MarketBenchmark,
@@ -275,7 +277,10 @@ def _interval_score(
         * (observed > upper)
     )
 
-    return width + below + above
+    return cast(
+        NDArray[np.float64],
+        width + below + above,
+    )
 
 
 def distributional_summary(
