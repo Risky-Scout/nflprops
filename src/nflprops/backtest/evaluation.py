@@ -59,6 +59,11 @@ class TradingSummary:
     roi: float | None
     max_drawdown_units: float | None
     mean_clv: float | None
+    mean_clv_cents: float | None = None
+    close_available_count: int = 0
+    close_missing_count: int = 0
+    clv_probability_count: int = 0
+    clv_cents_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -589,7 +594,10 @@ def trading_summary(
                 )
             )[1:]
 
-            drawdowns = peaks - cumulative
+            drawdowns = (
+                peaks
+                - cumulative
+            )
 
             max_drawdown = float(
                 drawdowns.max(
@@ -597,19 +605,101 @@ def trading_summary(
                 )
             )
 
-    mean_clv: float | None = None
+    close_available_count = 0
+    close_missing_count = 0
 
-    if "clv" in selected.columns:
+    clv_rows = selected
+
+    if "close_available" in selected.columns:
+        invalid_availability = (
+            selected.filter(
+                pl.col(
+                    "close_available"
+                ).is_null()
+            )
+        )
+
+        if not invalid_availability.is_empty():
+            raise ValueError(
+                "close_available must not be null"
+            )
+
+        close_available_count = (
+            selected.filter(
+                pl.col(
+                    "close_available"
+                )
+            ).height
+        )
+
+        close_missing_count = (
+            bet_count
+            - close_available_count
+        )
+
+        # §60: missing-at-close bets remain in availability statistics
+        # but are never allowed to contaminate CLV means.
+        clv_rows = selected.filter(
+            pl.col(
+                "close_available"
+            )
+        )
+
+    mean_clv: float | None = None
+    clv_probability_count = 0
+
+    probability_column: str | None = None
+
+    if (
+        "clv_probability"
+        in clv_rows.columns
+    ):
+        probability_column = (
+            "clv_probability"
+        )
+    elif "clv" in clv_rows.columns:
+        probability_column = "clv"
+
+    if probability_column is not None:
         values = np.asarray(
-            selected["clv"].to_numpy(),
+            clv_rows[
+                probability_column
+            ].to_numpy(),
             dtype=float,
         )
         finite = values[
             np.isfinite(values)
         ]
 
+        clv_probability_count = int(
+            finite.size
+        )
+
         if finite.size:
             mean_clv = float(
+                finite.mean()
+            )
+
+    mean_clv_cents: float | None = None
+    clv_cents_count = 0
+
+    if "clv_cents" in clv_rows.columns:
+        values = np.asarray(
+            clv_rows[
+                "clv_cents"
+            ].to_numpy(),
+            dtype=float,
+        )
+        finite = values[
+            np.isfinite(values)
+        ]
+
+        clv_cents_count = int(
+            finite.size
+        )
+
+        if finite.size:
+            mean_clv_cents = float(
                 finite.mean()
             )
 
@@ -620,6 +710,19 @@ def trading_summary(
         roi=roi,
         max_drawdown_units=max_drawdown,
         mean_clv=mean_clv,
+        mean_clv_cents=mean_clv_cents,
+        close_available_count=(
+            close_available_count
+        ),
+        close_missing_count=(
+            close_missing_count
+        ),
+        clv_probability_count=(
+            clv_probability_count
+        ),
+        clv_cents_count=(
+            clv_cents_count
+        ),
     )
 
 

@@ -246,3 +246,138 @@ def test_invalid_probability_fails_closed() -> None:
         match="p_final",
     ):
         evaluate_backtest(frame)
+
+def test_trading_clv_is_conditioned_on_close_availability() -> None:
+    frame = rows().with_columns(
+        pl.Series(
+            "bet_selected",
+            [
+                True,
+                True,
+                True,
+                True,
+            ],
+        ),
+        pl.Series(
+            "ev_per_unit",
+            [
+                0.10,
+                0.05,
+                0.08,
+                0.02,
+            ],
+        ),
+        pl.Series(
+            "realized_profit_per_unit",
+            [
+                0.90,
+                -1.0,
+                0.90,
+                -1.0,
+            ],
+        ),
+        pl.Series(
+            "close_available",
+            [
+                True,
+                False,
+                True,
+                False,
+            ],
+        ),
+        pl.Series(
+            "clv_probability",
+            [
+                0.02,
+                0.90,
+                0.01,
+                0.80,
+            ],
+        ),
+        pl.Series(
+            "clv_cents",
+            [
+                5.0,
+                500.0,
+                1.0,
+                400.0,
+            ],
+        ),
+    )
+
+    report = evaluate_backtest(
+        frame
+    )
+
+    trading = report.trading
+
+    assert trading.available is True
+    assert trading.bet_count == 4
+    assert (
+        trading.close_available_count
+        == 2
+    )
+    assert (
+        trading.close_missing_count
+        == 2
+    )
+    assert (
+        trading.clv_probability_count
+        == 2
+    )
+    assert (
+        trading.clv_cents_count
+        == 2
+    )
+    assert math.isclose(
+        trading.mean_clv
+        or 0.0,
+        0.015,
+    )
+    assert math.isclose(
+        trading.mean_clv_cents
+        or 0.0,
+        3.0,
+    )
+
+
+def test_missing_close_values_cannot_flatter_trading_clv() -> None:
+    frame = rows().with_columns(
+        pl.Series(
+            "bet_selected",
+            [
+                True,
+                True,
+                False,
+                False,
+            ],
+        ),
+        pl.Series(
+            "close_available",
+            [
+                True,
+                False,
+                False,
+                False,
+            ],
+        ),
+        pl.Series(
+            "clv_probability",
+            [
+                -0.01,
+                0.99,
+                None,
+                None,
+            ],
+        ),
+    )
+
+    report = evaluate_backtest(
+        frame
+    )
+
+    assert math.isclose(
+        report.trading.mean_clv
+        or 0.0,
+        -0.01,
+    )
