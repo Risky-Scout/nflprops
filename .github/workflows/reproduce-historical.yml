@@ -91,7 +91,10 @@ jobs:
 
       - name: Genuine historical A-B reproduction
         run: |
-          nflprops reproduce "$REPRO_RUN_ID"             --artifact-root reproducibility             | tee "$RUNNER_TEMP/reproduction.txt"
+          set -o pipefail
+          nflprops reproduce "$REPRO_RUN_ID" \
+            --artifact-root reproducibility \
+            | tee "$RUNNER_TEMP/reproduction.txt"
 
       - name: Upload reproducibility evidence
         if: always()

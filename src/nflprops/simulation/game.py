@@ -108,7 +108,14 @@ def _nb_draw(
 
 
 def _ensure_players(team: TeamSimulationInput) -> tuple[PlayerState, ...]:
-    active = [p for p in team.players if p.active]
+    # Allocation matrices consume RNG sequentially by player column.  Canonical
+    # ordering is therefore part of the reproducibility contract: upstream
+    # DataFrame/dict iteration order must never decide which player receives a
+    # particular deterministic random substream.
+    active = sorted(
+        (player for player in team.players if player.active),
+        key=lambda player: player.player_id,
+    )
     # Always carry an OTHER bucket so historical untracked shares do not get
     # silently inflated across listed players.
     active.append(
