@@ -1,0 +1,87 @@
+version: "2026.1.0"
+
+rules:
+  passing_attempts:
+    default:
+      rule_id: "official_stat:passing_attempts"
+      kind: field
+      fields: [passing_attempts]
+
+  passing_completions:
+    default:
+      rule_id: "official_stat:passing_completions"
+      kind: field
+      fields: [passing_completions]
+
+  passing_yards:
+    default:
+      rule_id: "official_stat:passing_yards"
+      kind: field
+      fields: [passing_yards]
+
+  interceptions:
+    default:
+      rule_id: "official_stat:passing_interceptions"
+      kind: field
+      fields: [passing_interceptions]
+
+  rushing_attempts:
+    default:
+      rule_id: "official_stat:rushing_attempts"
+      kind: field
+      fields: [rushing_attempts]
+
+  rushing_yards:
+    default:
+      rule_id: "official_stat:rushing_yards"
+      kind: field
+      fields: [rushing_yards]
+
+  receptions:
+    default:
+      rule_id: "official_stat:receptions"
+      kind: field
+      fields: [receptions]
+
+  receiving_yards:
+    default:
+      rule_id: "official_stat:receiving_yards"
+      kind: field
+      fields: [receiving_yards]
+
+  rushing_receiving_yards:
+    default:
+      rule_id: "sum:rushing_yards+receiving_yards"
+      kind: sum
+      fields: [rushing_yards, receiving_yards]
+      null_policy: zero_if_any_known
+
+  passing_tds:
+    default:
+      rule_id: "official_stat:passing_touchdowns"
+      kind: field
+      fields: [passing_touchdowns]
+
+  kicking_points:
+    default:
+      rule_id: "official_stat:total_points"
+      kind: field
+      fields: [total_points]
+
+  fg_made:
+    default:
+      rule_id: "official_stat:field_goals_made"
+      kind: field
+      fields: [field_goals_made]
+
+  longest_rush:
+    default:
+      rule_id: "official_stat:long_rushing"
+      kind: field
+      fields: [long_rushing]
+
+  longest_reception:
+    default:
+      rule_id: "official_stat:long_reception"
+      kind: field
+      fields: [long_reception]

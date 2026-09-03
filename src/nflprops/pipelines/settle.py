@@ -7,6 +7,11 @@ from datetime import UTC, datetime
 import polars as pl
 
 from nflprops.market.odds import american_to_decimal
+from nflprops.market.rules import (
+    SettlementRuleSet,
+    evaluate_actual_value,
+    load_settlement_rules,
+)
 
 _FULL_GAME_COLUMNS = {
     "passing_attempts": "passing_attempts",
@@ -25,27 +30,28 @@ _FULL_GAME_COLUMNS = {
 }
 
 
-def _actual_value(prop_type: str, row: dict) -> float | None:
-    if prop_type in _FULL_GAME_COLUMNS:
-        value = row.get(_FULL_GAME_COLUMNS[prop_type])
-        return None if value is None else float(value)
-    if prop_type == "rushing_receiving_yards":
-        a = row.get("rushing_yards")
-        b = row.get("receiving_yards")
-        if a is None and b is None:
-            return None
-        return float((a or 0) + (b or 0))
-    if prop_type == "anytime_td":
-        # The lean simulator currently prices offensive anytime TD only:
-        # rushing + receiving. Keep settlement definition identical to the modeled
-        # event until a versioned sportsbook-rule module and rare return/defensive
-        # TD component are implemented.
-        return float(
-            (row.get("rushing_touchdowns") or 0)
-            + (row.get("receiving_touchdowns") or 0)
-        )
-    # PBP-gated or not directly represented by structured player-game stats.
-    return None
+def _actual_value(
+    prop_type: str,
+    row: dict,
+    *,
+    vendor: str | None = None,
+    rules: SettlementRuleSet | None = None,
+) -> float | None:
+    active_rules = (
+        rules
+        if rules is not None
+        else load_settlement_rules()
+    )
+
+    rule = active_rules.rule_for(
+        prop_type,
+        vendor,
+    )
+
+    return evaluate_actual_value(
+        rule,
+        row,
+    )
 
 
 
@@ -191,57 +197,200 @@ def reconcile_settlement_stats(
 def settle_predictions(
     predictions: pl.DataFrame,
     player_stats: pl.DataFrame,
+    *,
+    rules: SettlementRuleSet | None = None,
 ) -> pl.DataFrame:
     if predictions.is_empty() or player_stats.is_empty():
         return pl.DataFrame()
 
-    stats_by_key = {
-        (str(r["canonical_game_id"]), str(r["canonical_player_id"])): r
-        for r in player_stats.iter_rows(named=True)
+    required_prediction_columns = {
+        "prediction_id",
+        "game_id",
+        "player_id",
+        "prop_type",
+        "vendor",
+        "side",
+        "american_odds",
     }
-    rows: list[dict] = []
-    settled_at = datetime.now(UTC)
 
-    for pred in predictions.iter_rows(named=True):
-        key = (str(pred["game_id"]), str(pred["player_id"]))
-        stat = stats_by_key.get(key)
+    missing_prediction_columns = sorted(
+        required_prediction_columns
+        - set(predictions.columns)
+    )
+
+    if missing_prediction_columns:
+        raise ValueError(
+            "settlement predictions missing required columns: "
+            + ", ".join(
+                missing_prediction_columns
+            )
+        )
+
+    active_rules = (
+        rules
+        if rules is not None
+        else load_settlement_rules()
+    )
+
+    requested_rules = (
+        predictions.select(
+            "prop_type",
+            "vendor",
+        )
+        .unique(
+            maintain_order=False
+        )
+        .sort(
+            [
+                "prop_type",
+                "vendor",
+            ]
+        )
+    )
+
+    for requested in requested_rules.iter_rows(
+        named=True
+    ):
+        active_rules.rule_for(
+            str(
+                requested[
+                    "prop_type"
+                ]
+            ),
+            str(
+                requested[
+                    "vendor"
+                ]
+            ),
+        )
+
+    stats_by_key = {
+        (
+            str(
+                row[
+                    "canonical_game_id"
+                ]
+            ),
+            str(
+                row[
+                    "canonical_player_id"
+                ]
+            ),
+        ): row
+        for row in player_stats.iter_rows(
+            named=True
+        )
+    }
+
+    rows: list[dict] = []
+    settled_at = datetime.now(
+        UTC
+    )
+
+    for pred in predictions.iter_rows(
+        named=True
+    ):
+        key = (
+            str(
+                pred[
+                    "game_id"
+                ]
+            ),
+            str(
+                pred[
+                    "player_id"
+                ]
+            ),
+        )
+
+        stat = stats_by_key.get(
+            key
+        )
+
         if stat is None:
             continue
-        actual = _actual_value(str(pred["prop_type"]), stat)
+
+        prop_type = str(
+            pred[
+                "prop_type"
+            ]
+        )
+        vendor = str(
+            pred[
+                "vendor"
+            ]
+        )
+
+        rule = active_rules.rule_for(
+            prop_type,
+            vendor,
+        )
+
+        actual = evaluate_actual_value(
+            rule,
+            stat,
+        )
+
         if actual is None:
             continue
 
-        side = str(pred["side"])
-        line = pred.get("line")
+        side = str(
+            pred[
+                "side"
+            ]
+        )
+        line = pred.get(
+            "line"
+        )
+
         if side == "HIT":
             won = actual >= 1
             pushed = False
         elif line is None:
             continue
-        elif actual == float(line):
+        elif actual == float(
+            line
+        ):
             won = False
             pushed = True
         elif side == "OVER":
-            won = actual > float(line)
+            won = actual > float(
+                line
+            )
             pushed = False
         elif side == "UNDER":
-            won = actual < float(line)
+            won = actual < float(
+                line
+            )
             pushed = False
         else:
             continue
 
-        odds = int(pred["american_odds"])
+        odds = int(
+            pred[
+                "american_odds"
+            ]
+        )
+
         if pushed:
             profit = 0.0
             binary = None
         elif won:
-            profit = american_to_decimal(odds) - 1.0
+            profit = (
+                american_to_decimal(
+                    odds
+                )
+                - 1.0
+            )
             binary = 1
         else:
             profit = -1.0
             binary = 0
 
-        row = dict(pred)
+        row = dict(
+            pred
+        )
+
         row.update(
             {
                 "actual_value": actual,
@@ -250,7 +399,23 @@ def settle_predictions(
                 "outcome_binary": binary,
                 "realized_profit_per_unit": profit,
                 "settled_at": settled_at,
+                "settlement_rules_version": (
+                    active_rules.version
+                ),
+                "settlement_rule_id": (
+                    rule.rule_id
+                ),
             }
         )
-        rows.append(row)
-    return pl.DataFrame(rows) if rows else pl.DataFrame()
+
+        rows.append(
+            row
+        )
+
+    return (
+        pl.DataFrame(
+            rows
+        )
+        if rows
+        else pl.DataFrame()
+    )

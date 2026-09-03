@@ -1,0 +1,11 @@
+version: "2026.1.0"
+
+rules:
+  anytime_td:
+    default:
+      rule_id: "offensive_td:rushing+receiving"
+      kind: sum
+      fields: [rushing_touchdowns, receiving_touchdowns]
+      null_policy: zero_if_any_known
+
+    vendors: {}
