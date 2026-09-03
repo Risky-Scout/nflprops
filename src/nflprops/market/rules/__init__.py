@@ -207,10 +207,7 @@ def _parse_rule(
         rule_id=rule_id,
         kind=kind,
         fields=parsed_fields,
-        null_policy=cast(
-            str,
-            null_policy,
-        ),
+        null_policy=null_policy,
     )
 
 
@@ -382,7 +379,12 @@ def evaluate_actual_value(
         return (
             None
             if value is None
-            else float(value)
+            else float(
+                cast(
+                    int | float,
+                    value,
+                )
+            )
         )
 
     if rule.kind != "sum":
