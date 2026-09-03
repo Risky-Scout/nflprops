@@ -1,0 +1,104 @@
+name: Historical Reproducibility
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      RELEASE_TAG: repro-data-1c823c1884eb
+      ARCHIVE_NAME: nflprops-canonical-1c823c1884eb.tar
+      ARCHIVE_SHA256: 9dac3e85dff58faf0272687ef150304c9ff78244c7702102cb78bfb9dc39ba00
+      DATA_MANIFEST_SHA256: 1c823c1884eb7d27e35b9e13d6607b7fb373c0d35baf1ad3e1ec751383f083af
+      REPRO_RUN_ID: repro-2025-w1-checkpoint-001
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project
+        run: pip install -e ".[dev]"
+
+      - name: Download immutable canonical snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/repro-data"
+          gh release download "$RELEASE_TAG"             --repo "$GITHUB_REPOSITORY"             --pattern "$ARCHIVE_NAME"             --pattern "data_manifest.json"             --dir "$RUNNER_TEMP/repro-data"
+
+      - name: Verify release hashes
+        run: |
+          python - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "repro-data"
+          archive = root / os.environ["ARCHIVE_NAME"]
+          manifest = root / "data_manifest.json"
+
+          def sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          archive_sha = sha256(archive)
+          manifest_sha = sha256(manifest)
+
+          print(f"ARCHIVE_SHA256={archive_sha}")
+          print(f"DATA_MANIFEST_SHA256={manifest_sha}")
+
+          if archive_sha != os.environ["ARCHIVE_SHA256"]:
+              raise SystemExit("archive SHA mismatch")
+
+          if manifest_sha != os.environ["DATA_MANIFEST_SHA256"]:
+              raise SystemExit("data manifest SHA mismatch")
+
+          print("RELEASE_HASH_VERIFICATION=PASS")
+          PY
+
+      - name: Restore canonical snapshot
+        run: |
+          mkdir -p data
+          tar -xf "$RUNNER_TEMP/repro-data/$ARCHIVE_NAME" -C data
+
+      - name: Verify extracted manifest identity
+        run: |
+          python - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+
+          path = Path("data/data_manifest.json")
+          digest = hashlib.sha256(path.read_bytes()).hexdigest()
+
+          print(f"EXTRACTED_DATA_MANIFEST_SHA256={digest}")
+
+          if digest != os.environ["DATA_MANIFEST_SHA256"]:
+              raise SystemExit("extracted data manifest SHA mismatch")
+          PY
+
+      - name: Genuine historical A-B reproduction
+        run: |
+          nflprops reproduce "$REPRO_RUN_ID"             --artifact-root reproducibility             | tee "$RUNNER_TEMP/reproduction.txt"
+
+      - name: Upload reproducibility evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: historical-repro-${{ github.run_id }}
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/reproduction.txt
+            reproducibility/repro-2025-w1-checkpoint-001/derived/probabilities.parquet
