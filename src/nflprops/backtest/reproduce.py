@@ -11,12 +11,26 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import shutil
+import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from datetime import datetime
+from functools import partial
+from pathlib import Path
 
 import polars as pl
 
-from nflprops.backtest.protocol import ExperimentManifest
+from nflprops.backtest.artifacts import (
+    ReproductionArtifact,
+    load_json_object,
+    sha256_file,
+)
+from nflprops.backtest.protocol import (
+    EvidenceClass,
+    ExperimentManifest,
+    WalkForwardFold,
+)
 
 PROBABILITY_COLUMNS = (
     "p_raw",
@@ -267,3 +281,327 @@ def reproduce_experiment(
         )
 
     return result
+
+def _load_experiment_manifest(
+    path: Path,
+) -> ExperimentManifest:
+    payload = load_json_object(
+        path
+    )
+
+    evidence_value = payload.get(
+        "evidence_class"
+    )
+    folds_value = payload.get(
+        "folds"
+    )
+
+    if not isinstance(
+        evidence_value,
+        str,
+    ):
+        raise ValueError(
+            "experiment evidence_class must be a string"
+        )
+
+    if not isinstance(
+        folds_value,
+        list,
+    ):
+        raise ValueError(
+            "experiment folds must be a list"
+        )
+
+    folds: list[
+        WalkForwardFold
+    ] = []
+
+    def _string_field(
+        fold_payload: dict[object, object],
+        name: str,
+    ) -> str:
+        value = fold_payload.get(name)
+
+        if not isinstance(value, str):
+            raise ValueError(
+                f"fold {name} must be a string"
+            )
+
+        return value
+
+    for raw in folds_value:
+        if not isinstance(raw, dict):
+            raise ValueError(
+                "experiment fold must be an object"
+            )
+
+        string_field = partial(
+            _string_field,
+            raw,
+        )
+
+        folds.append(
+            WalkForwardFold(
+                fold_id=string_field(
+                    "fold_id"
+                ),
+                train_start=(
+                    datetime.fromisoformat(
+                        string_field(
+                            "train_start"
+                        )
+                    )
+                ),
+                train_end=(
+                    datetime.fromisoformat(
+                        string_field(
+                            "train_end"
+                        )
+                    )
+                ),
+                selection_end=(
+                    datetime.fromisoformat(
+                        string_field(
+                            "selection_end"
+                        )
+                    )
+                ),
+                score_start=(
+                    datetime.fromisoformat(
+                        string_field(
+                            "score_start"
+                        )
+                    )
+                ),
+                score_end=(
+                    datetime.fromisoformat(
+                        string_field(
+                            "score_end"
+                        )
+                    )
+                ),
+            )
+        )
+
+    def top_string(
+        name: str,
+    ) -> str:
+        value = payload.get(name)
+
+        if not isinstance(value, str):
+            raise ValueError(
+                f"experiment {name} must be a string"
+            )
+
+        return value
+
+    return ExperimentManifest(
+        experiment_id=top_string(
+            "experiment_id"
+        ),
+        evidence_class=EvidenceClass(
+            evidence_value
+        ),
+        source_sha256=top_string(
+            "source_sha256"
+        ),
+        config_sha256=top_string(
+            "config_sha256"
+        ),
+        data_manifest_sha256=(
+            top_string(
+                "data_manifest_sha256"
+            )
+        ),
+        protocol_version=top_string(
+            "protocol_version"
+        ),
+        folds=tuple(folds),
+    )
+
+
+def _expand_build_command(
+    command: tuple[str, ...],
+    *,
+    run_dir: Path,
+    experiment_manifest: Path,
+) -> list[str]:
+    substitutions = {
+        "{run_dir}": str(
+            run_dir.resolve()
+        ),
+        "{experiment_manifest}": str(
+            experiment_manifest.resolve()
+        ),
+    }
+
+    return [
+        substitutions.get(
+            token,
+            token,
+        )
+        for token in command
+    ]
+
+
+def _safe_run_path(
+    run_dir: Path,
+    relative: str,
+) -> Path:
+    root = run_dir.resolve()
+    candidate = (
+        root / relative
+    ).resolve()
+
+    try:
+        candidate.relative_to(
+            root
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "artifact path escapes run directory"
+        ) from exc
+
+    return candidate
+
+
+def reproduce_run_directory(
+    run_dir: Path,
+    *,
+    repo_root: Path,
+) -> ReproductionResult:
+    """Execute a complete §67 reproduction artifact."""
+
+    run_dir = run_dir.resolve()
+    repo_root = repo_root.resolve()
+
+    artifact_path = (
+        run_dir
+        / "reproduction_manifest.json"
+    )
+
+    experiment_path = (
+        run_dir
+        / "experiment_manifest.json"
+    )
+
+    artifact = (
+        ReproductionArtifact.from_payload(
+            load_json_object(
+                artifact_path
+            )
+        )
+    )
+
+    experiment = (
+        _load_experiment_manifest(
+            experiment_path
+        )
+    )
+
+    if artifact.run_id != run_dir.name:
+        raise ValueError(
+            "artifact run_id does not match run directory"
+        )
+
+    if (
+        artifact.experiment_manifest_sha256
+        != experiment.sha256()
+    ):
+        raise ValueError(
+            "experiment manifest hash mismatch"
+        )
+
+    source_manifest = _safe_run_path(
+        run_dir,
+        artifact.source_manifest_path,
+    )
+    config_path = _safe_run_path(
+        run_dir,
+        artifact.config_path,
+    )
+    data_manifest = _safe_run_path(
+        run_dir,
+        artifact.data_manifest_path,
+    )
+
+    if (
+        sha256_file(source_manifest)
+        != experiment.source_sha256
+    ):
+        raise ValueError(
+            "source manifest hash mismatch"
+        )
+
+    if (
+        sha256_file(config_path)
+        != experiment.config_sha256
+    ):
+        raise ValueError(
+            "config hash mismatch"
+        )
+
+    if (
+        sha256_file(data_manifest)
+        != experiment.data_manifest_sha256
+    ):
+        raise ValueError(
+            "data manifest hash mismatch"
+        )
+
+    probability_output = _safe_run_path(
+        run_dir,
+        artifact.probability_output,
+    )
+
+    command = _expand_build_command(
+        artifact.build_command,
+        run_dir=run_dir,
+        experiment_manifest=(
+            experiment_path
+        ),
+    )
+
+    def build_once(
+        _: ExperimentManifest,
+    ) -> pl.DataFrame:
+        subprocess.run(
+            command,
+            cwd=repo_root,
+            check=True,
+        )
+
+        if not probability_output.exists():
+            raise FileNotFoundError(
+                "reproduction build did not create "
+                f"{probability_output}"
+            )
+
+        return pl.read_parquet(
+            probability_output
+        )
+
+    def reset_derived() -> None:
+        for relative in (
+            artifact.derived_paths
+        ):
+            target = _safe_run_path(
+                run_dir,
+                relative,
+            )
+
+            if target.is_dir():
+                shutil.rmtree(
+                    target
+                )
+            elif target.exists():
+                target.unlink()
+
+    return reproduce_experiment(
+        experiment,
+        build_once=build_once,
+        reset_derived=reset_derived,
+        probability_columns=(
+            artifact.probability_columns
+        ),
+    )

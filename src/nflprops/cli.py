@@ -377,9 +377,32 @@ def report(season: int, week: int) -> None:
 
 
 @app.command("reproduce")
-def reproduce(run_id: str) -> None:
+def reproduce(
+    run_id: str,
+    artifact_root: str = typer.Option(
+        "artifacts/validation",
+        help="Root containing immutable validation run directories.",
+    ),
+) -> None:
     """Rebuild from raw + manifest and assert byte-identical output. SPEC §67."""
-    raise NotImplementedError("PHASE 10")
+    from pathlib import Path
+
+    from nflprops.backtest.reproduce import (
+        reproduce_run_directory,
+    )
+
+    result = reproduce_run_directory(
+        Path(artifact_root) / run_id,
+        repo_root=Path.cwd(),
+    )
+
+    typer.echo(
+        "REPRODUCIBILITY=PASS "
+        f"run_id={run_id} "
+        f"rows={result.row_count} "
+        f"manifest_sha256={result.manifest_sha256} "
+        f"probability_sha256={result.first_probability_sha256}"
+    )
 
 
 @app.command("coverage")
