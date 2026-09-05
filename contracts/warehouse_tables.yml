@@ -207,9 +207,34 @@ tables:
     predictions:
       key: [prediction_id]
       pit: false
+      note: >
+        PHASE 5: run_id/checkpoint_name are additive, nullable columns
+        (null on any non-orchestration call site, e.g. ad-hoc backtests) --
+        see nflprops.orchestration.run_store and
+        prediction_runs (orchestration layer below) for the official
+        checkpoint run they trace back to.
     settled_predictions:
       key: [prediction_id]
       pit: false
+
+  orchestration:
+    prediction_runs:
+      key: [run_id]
+      pit: true
+      note: >
+        PHASE 5. Operational/audit lifecycle for official per-game pregame
+        checkpoints (T48H/T24H/T6H/T90M/T30M, plus MANUAL diagnostic runs).
+        Never stores prediction outputs itself (those remain in
+        predictions/simulation_player_results, immutable regardless of a
+        run's status). scheduled_as_of is the model knowledge-time cutoff --
+        never the wall-clock execution time. See
+        nflprops.orchestration.run_store and
+        docs/ORCHESTRATION_ARCHITECTURE.md.
+      columns: [run_id, season, week, game_id, checkpoint_name, scheduled_as_of,
+        kickoff_at, flow_started_at, flow_completed_at, status, model_version,
+        config_sha256, source_sha256, data_manifest_sha256, n_draws,
+        retained_joint_draws, publication_status, is_final_forecast,
+        fallback_from_checkpoint, failure_code, failure_detail, created_at]
 
   governance:
     model_registry:

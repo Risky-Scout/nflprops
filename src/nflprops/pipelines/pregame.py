@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from datetime import datetime
 
 import polars as pl
@@ -471,8 +472,27 @@ def predict_week(
     market_mode: str = "live",
     persist: bool = True,
     game_ids: set[str] | None = None,
+    official_run_id: str | None = None,
+    checkpoint_name: str | None = None,
+    state_context_callback: Callable[[StateProvenanceContext], None] | None = None,
 ) -> pl.DataFrame:
-    """Build states, simulate each game once, and price every available quote."""
+    """Build states, simulate each game once, and price every available quote.
+
+    `official_run_id`/`checkpoint_name` are additive, orchestration-supplied
+    provenance (PHASE 5, see `nflprops.orchestration.run_store`): when
+    given, every produced prediction row carries them so a sportsbook
+    prediction row can be traced back to the official checkpoint run that
+    produced it. `None` (the default, unchanged weekly/backtest call sites)
+    leaves both columns null -- this never changes prediction math.
+
+    `state_context_callback`, if given, is invoked once with the built
+    `StateProvenanceContext` as soon as it exists (PHASE 5 orchestration
+    uses `context.state_snapshot_id` as the checkpoint's data-manifest
+    fingerprint -- see `nflprops.orchestration.flows.checkpoints` -- without
+    this function needing to duplicate state-construction logic). Never
+    called if no PIT games are found for `as_of`/`game_ids`, since no state
+    is built in that case.
+    """
     games = warehouse.read("games")
     player_stats = warehouse.read("player_game_stats")
     team_stats = warehouse.read("team_game_stats")
@@ -503,6 +523,8 @@ def predict_week(
         as_of=as_of,
         model_version=model_version,
     )
+    if state_context_callback is not None:
+        state_context_callback(state_context)
 
     _assert_state_history_safe_for_games(
         state_context,
@@ -640,6 +662,11 @@ def predict_week(
             )
 
     predictions = pl.DataFrame(prediction_rows) if prediction_rows else pl.DataFrame()
+    if not predictions.is_empty():
+        predictions = predictions.with_columns(
+            pl.lit(official_run_id).alias("run_id"),
+            pl.lit(checkpoint_name).alias("checkpoint_name"),
+        )
     if persist and not predictions.is_empty():
         warehouse.append(
             "predictions",
@@ -648,3 +675,31 @@ def predict_week(
             sort_by=["as_of", "game_id", "player_id", "prop_type", "vendor", "side"],
         )
     return predictions
+
+
+def predict_game(
+    warehouse: Warehouse,
+    *,
+    season: int,
+    week: int,
+    game_id: str,
+    as_of: datetime,
+    **kwargs,
+) -> pl.DataFrame:
+    """Predict exactly one game (PHASE 5 §22).
+
+    A thin filter over `predict_week`: same state construction, same
+    simulation math, same market pricing, same invariants, same PIT
+    semantics -- `predict_week` already supports restricting to a set of
+    games via `game_ids`, so this adds only the minimal single-game
+    convenience wrapper orchestration needs. It is not a second prediction
+    pipeline.
+    """
+    return predict_week(
+        warehouse,
+        season=season,
+        week=week,
+        as_of=as_of,
+        game_ids={game_id},
+        **kwargs,
+    )

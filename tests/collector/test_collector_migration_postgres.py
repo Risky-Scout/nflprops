@@ -67,8 +67,11 @@ def test_migration_0002_downgrade_removes_collector_tables_only(postgres_dsn: st
         [sys.executable, "-m", "alembic", "upgrade", "head"],
         cwd=REPO_ROOT, env=env, check=True, capture_output=True, text=True,
     )
+    # Target 0001 explicitly (not relative "-1") so this test keeps checking
+    # exactly 0002's downgrade regardless of how many later migrations
+    # (e.g. PHASE 5's 0003_prediction_runs) now sit on top of head.
     subprocess.run(
-        [sys.executable, "-m", "alembic", "downgrade", "-1"],
+        [sys.executable, "-m", "alembic", "downgrade", "0001_create_simulation_artifacts"],
         cwd=REPO_ROOT, env=env, check=True, capture_output=True, text=True,
     )
 

@@ -31,6 +31,7 @@ pbp_app = typer.Typer(help="Play-by-play parsing and reconciliation.")
 features_app = typer.Typer(help="Point-in-time feature building.")
 state_app = typer.Typer(help="Empirical-Bayes state updates.")
 collect_app = typer.Typer(help="Continuous point-in-time collection (PHASE 4).")
+checkpoint_app = typer.Typer(help="Official pregame checkpoints (PHASE 5).")
 
 app.add_typer(provider_app, name="provider")
 app.add_typer(ingest_app, name="ingest")
@@ -39,6 +40,7 @@ app.add_typer(pbp_app, name="pbp")
 app.add_typer(features_app, name="features")
 app.add_typer(state_app, name="state")
 app.add_typer(collect_app, name="collect")
+app.add_typer(checkpoint_app, name="checkpoint")
 
 
 # --- provider ---------------------------------------------------------------
@@ -248,6 +250,216 @@ def collect_loop_cmd(
         client = getattr(source, "client", None)
         if client is not None:
             client.close()
+
+
+# --- official checkpoints (PHASE 5) -----------------------------------------
+@checkpoint_app.command("due")
+def checkpoint_due_cmd(
+    season: int,
+    week: int,
+    at: str = typer.Option(..., "--at", help="Explicit ISO timestamp to evaluate as 'now'."),
+    execute: bool = typer.Option(
+        False, "--execute", help="Actually claim and run due checkpoints instead of a dry inspection."
+    ),
+) -> None:
+    """Dry-inspect (default) official checkpoint due-ness for SEASON WEEK as of --at.
+
+    Never executes a prediction unless --execute is explicitly given.
+    """
+    from nflprops.config import load
+    from nflprops.orchestration.checkpoints import (
+        OFFICIAL_CHECKPOINTS,
+        CheckpointAction,
+        CheckpointOffsets,
+        CheckpointsRuntimeConfig,
+        OrchestrationConfig,
+        evaluate_checkpoint,
+    )
+    from nflprops.orchestration.checkpoints import (
+        scheduled_as_of as compute_scheduled_as_of,
+    )
+    from nflprops.orchestration.run_store import checkpoint_satisfied
+    from nflprops.pipelines.lean import open_warehouse
+    from nflprops.pipelines.pregame import _latest_games_asof
+
+    now = datetime.fromisoformat(at.replace("Z", "+00:00"))
+    if now.tzinfo is None:
+        raise typer.BadParameter("--at must include an explicit timezone")
+
+    cfg = load()
+    warehouse = open_warehouse(cfg)
+
+    if execute:
+        from nflprops.orchestration.flows.checkpoints import checkpoint_dispatch_flow
+
+        results = checkpoint_dispatch_flow(
+            warehouse=warehouse, config=cfg, season=season, week=week, now=now
+        )
+        if not results:
+            typer.echo("No due, unclaimed checkpoints.")
+            return
+        for record in results:
+            typer.echo(
+                f"run_id={record.run_id} game_id={record.game_id} "
+                f"checkpoint={record.checkpoint_name} status={record.status.value} "
+                f"publication_status={record.publication_status.value} "
+                f"failure_code={record.failure_code}"
+            )
+        return
+
+    offsets = CheckpointOffsets.from_config(cfg)
+    checkpoints_cfg = CheckpointsRuntimeConfig.from_config(cfg)
+    orchestration_cfg = OrchestrationConfig.from_config(cfg)
+
+    games = warehouse.read("games")
+    current_games = _latest_games_asof(games, as_of=now, season=season, week=week)
+    if current_games.is_empty():
+        typer.echo("No scheduled/live games found.")
+        return
+
+    for game in current_games.iter_rows(named=True):
+        game_id = str(game["canonical_game_id"])
+        kickoff_at = game["date"]
+        for checkpoint in OFFICIAL_CHECKPOINTS:
+            scheduled = compute_scheduled_as_of(
+                kickoff_at=kickoff_at, checkpoint=checkpoint, offsets=offsets
+            )
+            claimed = checkpoint_satisfied(
+                warehouse, game_id=game_id, checkpoint_name=checkpoint, kickoff_at=kickoff_at
+            )
+            action = evaluate_checkpoint(
+                scheduled_as_of_time=scheduled,
+                kickoff_at=kickoff_at,
+                now=now,
+                catch_up_before_kickoff=checkpoints_cfg.catch_up_before_kickoff,
+                dispatcher_tick_seconds=orchestration_cfg.dispatcher_tick_seconds,
+            )
+            due = action is CheckpointAction.RUN and not claimed
+            typer.echo(
+                f"game_id={game_id} kickoff_at={kickoff_at.isoformat()} "
+                f"checkpoint={checkpoint.value} scheduled_as_of={scheduled.isoformat()} "
+                f"due={due} claimed={claimed} action={action.value}"
+            )
+
+
+@checkpoint_app.command("run")
+def checkpoint_run_cmd(
+    game_id: str = typer.Option(..., "--game-id"),
+    as_of: str = typer.Option(..., "--as-of"),
+    season: int = typer.Option(..., help="Season the game belongs to."),
+    week: int = typer.Option(..., help="Week the game belongs to."),
+    draws: int = typer.Option(20000, min=1000),
+) -> None:
+    """Manually run a one-off diagnostic prediction for one game.
+
+    Always claimed under checkpoint_name=MANUAL (§38) -- a manual run must
+    never masquerade as an official T48H/T24H/T6H/T90M/T30M checkpoint;
+    only the checkpoint dispatcher ever claims those.
+    """
+    from nflprops.collection.service import source_sha256
+    from nflprops.config import config_sha256, load
+    from nflprops.orchestration.checkpoints import CheckpointName
+    from nflprops.orchestration.flows.checkpoints import _data_manifest_sha256
+    from nflprops.orchestration.run_store import (
+        PredictionRunRecord,
+        PredictionRunStatus,
+        PublicationStatus,
+        claim_checkpoint,
+        compute_run_id,
+        update_run_status,
+    )
+    from nflprops.pipelines.lean import open_warehouse
+    from nflprops.pipelines.pregame import predict_game
+
+    dt = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        raise typer.BadParameter("--as-of must include an explicit timezone")
+
+    cfg = load()
+    warehouse = open_warehouse(cfg)
+    model_version = str(cfg.get_path("model.version", "2026.1.0"))
+    cfg_sha = config_sha256(cfg)
+    src_sha = source_sha256()
+
+    run_id = compute_run_id(
+        game_id=game_id,
+        checkpoint_name=CheckpointName.MANUAL,
+        scheduled_as_of=dt,
+        kickoff_at=dt,
+        model_version=model_version,
+        config_sha256=cfg_sha,
+        source_sha256=src_sha,
+    )
+    manifest_sha = _data_manifest_sha256(warehouse, as_of=dt, model_version=model_version)
+    now = datetime.now(UTC)
+    record = PredictionRunRecord(
+        run_id=run_id,
+        season=season,
+        week=week,
+        game_id=game_id,
+        checkpoint_name=CheckpointName.MANUAL.value,
+        scheduled_as_of=dt,
+        kickoff_at=dt,
+        flow_started_at=now,
+        flow_completed_at=None,
+        status=PredictionRunStatus.SCHEDULED,
+        model_version=model_version,
+        config_sha256=cfg_sha,
+        source_sha256=src_sha,
+        data_manifest_sha256=manifest_sha,
+        n_draws=draws,
+        retained_joint_draws=0,
+        publication_status=PublicationStatus.NOT_PUBLISHED,
+        is_final_forecast=False,
+        fallback_from_checkpoint=None,
+        failure_code=None,
+        failure_detail=None,
+        created_at=now,
+    )
+    if not claim_checkpoint(warehouse, record):
+        typer.echo(f"a MANUAL run with this exact identity already exists: run_id={run_id}")
+        raise typer.Exit(1)
+
+    update_run_status(warehouse, run_id, status=PredictionRunStatus.RUNNING)
+    try:
+        predictions = predict_game(
+            warehouse,
+            season=season,
+            week=week,
+            game_id=game_id,
+            as_of=dt,
+            model_version=model_version,
+            n_draws=draws,
+            official_run_id=run_id,
+            checkpoint_name=CheckpointName.MANUAL.value,
+        )
+    except Exception as exc:
+        update_run_status(
+            warehouse,
+            run_id,
+            status=PredictionRunStatus.FAILED,
+            publication_status=PublicationStatus.NOT_PUBLISHED,
+            failure_code="PREDICTION_ERROR",
+            failure_detail=str(exc)[:500],
+            flow_completed_at=datetime.now(UTC),
+        )
+        typer.echo(f"MANUAL run failed: run_id={run_id} error={exc}")
+        raise typer.Exit(1) from exc
+
+    publication_status = (
+        PublicationStatus.MODEL_ONLY if predictions.is_empty() else PublicationStatus.PUBLISHED
+    )
+    update_run_status(
+        warehouse,
+        run_id,
+        status=PredictionRunStatus.SUCCESS,
+        publication_status=publication_status,
+        flow_completed_at=datetime.now(UTC),
+    )
+    typer.echo(
+        f"run_id={run_id} status=SUCCESS publication_status={publication_status.value} "
+        f"predictions={predictions.height}"
+    )
 
 
 # --- snapshots --------------------------------------------------------------
