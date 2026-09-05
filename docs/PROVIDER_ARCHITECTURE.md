@@ -138,7 +138,7 @@ never replaced by them.
   selection, confidence scoring, APIs/dashboards, or any simulator/model
   behavior change.
 - Reconcile `injury_snapshot_runs` (Phase 2) with a generalized
-  `collector_runs` table. **Future integration note:** when Phase 4 builds a
-  generalized `collector_runs` table, reconcile it with
-  `injury_snapshot_runs` so there is one authoritative collection-
-  availability source rather than two competing systems. Not done yet.
+  `collector_runs` table. **Done in Phase 4** — see
+  `docs/COLLECTION_ARCHITECTURE.md`: `collector_resource_runs` is now the
+  sole authoritative feed-availability source, and no production code path
+  writes new `injury_snapshot_runs` rows anymore.

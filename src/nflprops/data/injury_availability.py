@@ -13,11 +13,22 @@ injuries, odds, props), not just injuries, and is the single authoritative
 source for feed availability. ``injury_feed_available_at()`` below reads
 *that* generalized source, not this module's own table.
 
+**CLEANUP (post-PHASE 4): no production code path writes new
+``injury_snapshot_runs`` rows anymore.** ``LeanIngestor.ingest_week()`` used
+to write one via ``record_injury_collection_run`` on every run; that call
+site was removed once ``collector_resource_runs`` became authoritative, so
+old installations don't keep growing a table nothing reads for availability.
+
 ``record_injury_collection_run`` / ``INJURY_SNAPSHOT_RUNS_TABLE`` are kept
-only so the pre-existing one-shot ``LeanIngestor.ingest_week()`` path
-continues to behave exactly as before (blueprint §21: "do not break existing
-... behavior") -- new code must not write to or read from this table as an
-availability source. See ``docs/COLLECTION_ARCHITECTURE.md``.
+only for two things: (1) any pre-existing ``injury_snapshot_runs`` data an
+old installation already has, read-only, via
+``migrate_legacy_injury_runs()``; (2) test fixtures that need to simulate
+what such pre-existing legacy data looks like
+(``tests/collector/test_injury_legacy_migration.py``). Do not add a new
+production call site for this writer -- new code must use
+`nflprops.collection.service.collect_once`, which writes the generalized
+`collector_resource_runs` table directly. See
+``docs/COLLECTION_ARCHITECTURE.md``.
 """
 
 from __future__ import annotations
@@ -45,7 +56,9 @@ def record_injury_collection_run(
     week: int | None = None,
     collection_status: str = COLLECTION_STATUS_SUCCESS,
 ) -> None:
-    """LEGACY (PHASE 2, kept for `ingest_week()` backward compatibility only).
+    """LEGACY (PHASE 2). No production code path calls this anymore -- kept
+    only for legacy-data test/migration simulation
+    (``tests/collector/test_injury_legacy_migration.py``).
 
     Append one collection-attempt marker to ``injury_snapshot_runs``. New
     code must use `nflprops.collection.service.collect_once`, which writes

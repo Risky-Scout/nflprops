@@ -148,14 +148,18 @@ phase generalizes to every resource. Phase 4 reconciles them:
 - `nflprops.data.injury_availability.injury_feed_available_at()` is now a
   thin wrapper over `resource_feed_available_at(..., resource_type=INJURIES)`
   — it reads `collector_resource_runs`, not `injury_snapshot_runs`.
-- `LeanIngestor.ingest_week()` (the pre-existing one-shot ingestion path)
-  still writes `injury_snapshot_runs` unchanged, for backward compatibility
-  — but that output is no longer consulted by anything. New code (the
-  `collect_once` engine) writes `collector_resource_runs` directly and never
-  touches `injury_snapshot_runs` at all.
-- `injury_snapshot_runs` is kept as a legacy/deprecated artifact rather than
-  deleted, to avoid unnecessary migration risk (per the warehouse contract's
-  `deprecated: true` marker).
+- `LeanIngestor.ingest_week()` (the pre-existing one-shot ingestion path) no
+  longer writes `injury_snapshot_runs` at all — that call site was removed
+  once `collector_resource_runs` became authoritative, so old installations
+  stop growing a table nothing reads for availability. `collect_once` writes
+  `collector_resource_runs` directly and never touches `injury_snapshot_runs`.
+- `injury_snapshot_runs` is kept as a legacy/deprecated, **read-only**
+  artifact rather than deleted, to avoid unnecessary migration risk (per the
+  warehouse contract's `deprecated: true` marker) — its only remaining
+  purpose is `migrate_legacy_injury_runs()` reading whatever rows an old
+  installation already has. `record_injury_collection_run()` (the writer)
+  is retained only for legacy-data test/migration simulation, not called by
+  any production code path.
 
 **Future integration note (Phase 5+):** if a future phase builds a more
 general orchestration-level `collector_runs` concept of its own (e.g. inside

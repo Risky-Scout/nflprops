@@ -76,9 +76,11 @@ def test_ingest_week_runs_end_to_end_against_a_non_bdl_provider(tmp_path: Path) 
     assert odds.height == 3
     assert set(odds["vendor"].to_list()) == {"draftkings", "fanduel", "bet365"}
 
-    runs = warehouse.read("injury_snapshot_runs")
-    assert runs.height == 1
-    assert runs["row_count"][0] == 1
+    # Post-PHASE-4 cleanup: ingest_week() no longer writes the legacy
+    # injury_snapshot_runs marker table at all -- collector_resource_runs
+    # (written by nflprops.collection.service.collect_once, a separate
+    # pipeline) is the sole authoritative feed-availability source.
+    assert not warehouse.exists("injury_snapshot_runs")
 
 
 def test_ingest_week_multibook_props_survive_through_a_non_bdl_provider(

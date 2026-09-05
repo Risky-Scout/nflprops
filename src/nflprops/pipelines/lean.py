@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import polars as pl
@@ -24,7 +24,6 @@ from nflprops.data.availability import (
     reconstruct_game_result_availability,
     use_event_time_as_available,
 )
-from nflprops.data.injury_availability import record_injury_collection_run
 from nflprops.data.quality import enforce, validate_core
 from nflprops.data.raw_store import RawStore, make_raw_hook
 from nflprops.data.warehouse import Warehouse, records_to_frame
@@ -32,7 +31,6 @@ from nflprops.domain.protocols import FullProvider
 from nflprops.paths import runtime_data_root, runtime_resource
 from nflprops.providers import registry as provider_registry
 from nflprops.providers.bdl.client import BDLClient
-from nflprops.providers.bdl.mapper import PROVIDER as BDL_PROVIDER
 from nflprops.providers.bdl.provider import BDLProvider
 
 logger = logging.getLogger(__name__)
@@ -487,21 +485,13 @@ class LeanIngestor:
             )
 
         # Current injuries are league-wide and are core availability inputs.
-        # A successful fetch is recorded (in injury_snapshot_runs) even when it
-        # legitimately returns zero rows -- a healthy-slate collection is not
-        # the same fact as "the feed never ran," and injury_data_available
-        # downstream must be able to tell them apart. See
-        # nflprops.data.injury_availability.
-        injury_collected_at = datetime.now(UTC)
+        # PHASE 4 CLEANUP: this one-shot path no longer writes a collection
+        # marker at all -- injury_snapshot_runs is legacy/deprecated and
+        # collector_resource_runs (nflprops.collection.service.collect_once)
+        # is the sole authoritative feed-availability source going forward.
+        # See nflprops.data.injury_availability and
+        # docs/COLLECTION_ARCHITECTURE.md.
         injuries = self.provider.injuries()
-        record_injury_collection_run(
-            self.warehouse,
-            provider=BDL_PROVIDER,
-            available_at=injury_collected_at,
-            row_count=len(injuries),
-            season=season,
-            week=week,
-        )
         if injuries:
             self.warehouse.append_records(
                 "injury_snapshots",
