@@ -97,6 +97,24 @@ allow_all_supported = true
 blocked = []
 reference_book = "bet365"
 
+[collection]
+# PHASE 4: generalized continuous point-in-time collection. Retry/backoff
+# reuses [provider.bdl.retry] (BDLClient's existing retry loop) rather than a
+# second, competing retry configuration -- see nflprops.collection.service.
+enabled = true
+no_future_game_poll_seconds = 1800
+
+[collection.cadence]
+# Game-relative polling interval, keyed by time-to-kickoff of the nearest
+# unstarted game. Boundaries are upper-inclusive on the nearer edge; see
+# nflprops.collection.cadence.cadence_seconds for the exact rule.
+gt_48h_seconds = 1800
+h48_to_h24_seconds = 1200
+h24_to_h6_seconds = 600
+h6_to_m90_seconds = 300
+m90_to_m30_seconds = 120
+m30_to_kickoff_seconds = 60
+
 [market.collector]
 # SPEC §58 — BDL retains no live prop history. Deploy this before week 1.
 checkpoints = ["OPEN","T-48H","T-24H","T-12H","T-6H","T-3H","T-1H","T-30M","T-10M","CLOSE"]

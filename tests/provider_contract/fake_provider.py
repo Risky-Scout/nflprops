@@ -171,18 +171,26 @@ class FakeProvider:
         self._injuries.append(injury)
         return injury
 
-    def seed_game_odds(self, *, game_native_id: str, vendor: str, **kwargs: object) -> GameOdds:
+    def seed_game_odds(
+        self,
+        *,
+        game_native_id: str,
+        vendor: str,
+        collector_received_at: object | None = None,
+        **kwargs: object,
+    ) -> GameOdds:
         payload = {"game_native_id": game_native_id, "vendor": vendor, **kwargs}
+        received_at = collector_received_at or _now()
         odds = GameOdds(
             event_time=None,
-            available_at=_now(),
-            ingested_at=_now(),
+            available_at=received_at,
+            ingested_at=received_at,
             provider=self.name,
             provider_record_id=f"{game_native_id}:{vendor}",
             canonical_game_id=canonical_game_id(self.name, game_native_id),
             vendor=canonical_vendor(vendor),
             vendor_raw=vendor,
-            collector_received_at=_now(),
+            collector_received_at=received_at,
             raw_record_hash=_hash_record(payload),
             **kwargs,
         )
@@ -199,6 +207,7 @@ class FakeProvider:
         line_value: object,
         over_odds: int | None = None,
         under_odds: int | None = None,
+        collector_received_at: object | None = None,
     ) -> PlayerProp:
         payload = {
             "game_native_id": game_native_id,
@@ -207,10 +216,11 @@ class FakeProvider:
             "prop_type": prop_type,
             "line_value": str(line_value),
         }
+        received_at = collector_received_at or _now()
         prop = PlayerProp(
             event_time=None,
-            available_at=_now(),
-            ingested_at=_now(),
+            available_at=received_at,
+            ingested_at=received_at,
             provider=self.name,
             provider_record_id=f"{game_native_id}:{player_native_id}:{prop_type}:{vendor}",
             canonical_game_id=canonical_game_id(self.name, game_native_id),
@@ -222,7 +232,7 @@ class FakeProvider:
             market_type=MarketType.OVER_UNDER,
             over_odds=over_odds,
             under_odds=under_odds,
-            collector_received_at=_now(),
+            collector_received_at=received_at,
             raw_record_hash=_hash_record(payload),
         )
         self._player_props.append(prop)

@@ -61,14 +61,45 @@ tables:
     injury_snapshot_runs:
       key: [provider, available_at]
       pit: true
+      deprecated: true
       note: >
-        Collection-attempt log, independent of injury_snapshots row count.
-        A zero-row injury_snapshots result from a successful fetch is not the
-        same fact as "the feed never ran" -- injury_data_available is derived
-        from this table's presence at/before as_of, not from row counts. See
-        nflprops.data.injury_availability. Minimal by design; not the
-        full Phase 4 continuous collector.
+        LEGACY (PHASE 2) as of PHASE 4. Still written by LeanIngestor's
+        one-shot ingest_week() for backward compatibility, but
+        injury_data_available no longer reads it -- collector_resource_runs
+        (see the collector layer below) is now the single authoritative
+        feed-availability source. See nflprops.data.injury_availability.
       columns: [provider, snapshot_type, available_at, season, week, collection_status, row_count]
+
+  collector:
+    collector_runs:
+      key: [collector_run_id]
+      pit: true
+      note: >
+        PHASE 4. One row per overall collection cycle. NOT authoritative for
+        resource-level feed availability by itself -- a cycle can be PARTIAL
+        (some resources succeeded, some failed) or SUCCESS with a resource
+        that returned zero legitimate rows. See collector_resource_runs.
+      columns: [collector_run_id, provider, season, week, started_at, completed_at,
+        status, cadence_seconds, nearest_unstarted_kickoff, games_requested,
+        games_received, game_odds_rows, prop_rows, roster_rows, injury_rows,
+        retry_count, error_code, error_detail, source_sha256, config_sha256,
+        created_at]
+    collector_resource_runs:
+      key: [resource_run_id]
+      pit: true
+      note: >
+        PHASE 4. Authoritative source for resource-level feed availability
+        (games, rosters, injuries, game odds, player props). A successful
+        fetch that legitimately returns zero rows (e.g. a healthy-slate
+        injury check) is collection_status=SUCCESS with row_count=0 --
+        never conflated with "the feed was never checked". MARKET_NOT_POSTED
+        (market resources only) proves the feed was checked without
+        implying any quote exists. See
+        nflprops.collection.resource_availability.resource_feed_available_at.
+      columns: [resource_run_id, collector_run_id, provider, resource_type,
+        scope_type, scope_json, season, week, started_at, collector_received_at,
+        completed_at, collection_status, row_count, retry_count, error_code,
+        error_detail, raw_payload_sha256, created_at]
 
   outcomes:
     player_game_stats:

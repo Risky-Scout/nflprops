@@ -1,11 +1,13 @@
-"""Historical-availability correction: injury-feed availability must be
-tracked independently of `injury_snapshots` row count.
+"""Injury-feed availability, legacy layer (PHASE 2, kept for `ingest_week()`
+backward compatibility) vs. generalized layer (PHASE 4, authoritative).
 
-Covers both layers of the fix:
-- `nflprops.data.injury_availability` (the new collection-run log + the
-  `injury_feed_available_at` derivation).
-- `LeanIngestor.ingest_week` recording a run marker for every successful
-  `provider.injuries()` call, including zero-row calls.
+- `nflprops.data.injury_availability.injury_feed_available_at` is now a thin
+  wrapper over the generalized `collector_resource_runs` source (PHASE 4);
+  see `tests/collector/test_resource_availability.py` for the full behavior
+  of the underlying `resource_feed_available_at`.
+- `record_injury_collection_run` / `INJURY_SNAPSHOT_RUNS_TABLE` remain as
+  legacy writes only -- `LeanIngestor.ingest_week` still writes them
+  unchanged, but their output is no longer read by `injury_feed_available_at`.
 """
 
 from __future__ import annotations
@@ -27,8 +29,28 @@ from nflprops.pipelines.lean import LeanIngestor
 AS_OF = datetime(2026, 9, 5, tzinfo=UTC)
 
 
+def _resource_runs_frame(
+    *,
+    row_count: int = 1,
+    collector_received_at: datetime | None = None,
+    collection_status: str = COLLECTION_STATUS_SUCCESS,
+) -> pl.DataFrame:
+    """A generalized `collector_resource_runs` fixture for resource_type=INJURIES."""
+    return pl.DataFrame(
+        {
+            "provider": ["balldontlie"],
+            "resource_type": ["INJURIES"],
+            "collector_received_at": [collector_received_at or (AS_OF - timedelta(hours=1))],
+            "season": [2026],
+            "week": [1],
+            "collection_status": [collection_status],
+            "row_count": [row_count],
+        }
+    )
+
+
 # --------------------------------------------------------------------------
-# nflprops.data.injury_availability
+# nflprops.data.injury_availability.injury_feed_available_at (PHASE 4 wrapper)
 # --------------------------------------------------------------------------
 
 
@@ -37,68 +59,36 @@ def test_no_runs_at_all_is_unavailable() -> None:
 
 
 def test_successful_run_with_rows_is_available() -> None:
-    runs = pl.DataFrame(
-        {
-            "provider": ["balldontlie"],
-            "snapshot_type": ["injury"],
-            "available_at": [AS_OF - timedelta(hours=1)],
-            "season": [2026],
-            "week": [1],
-            "collection_status": [COLLECTION_STATUS_SUCCESS],
-            "row_count": [12],
-        }
-    )
+    runs = _resource_runs_frame(row_count=12)
     assert injury_feed_available_at(runs, as_of=AS_OF) is True
 
 
 def test_successful_run_with_zero_rows_is_still_available() -> None:
-    """The specific bug this correction fixes: a genuinely healthy-slate,
+    """The Phase-2-era bug this correction fixed: a genuinely healthy-slate,
     zero-row collection is still a successful collection."""
-    runs = pl.DataFrame(
-        {
-            "provider": ["balldontlie"],
-            "snapshot_type": ["injury"],
-            "available_at": [AS_OF - timedelta(hours=1)],
-            "season": [2026],
-            "week": [1],
-            "collection_status": [COLLECTION_STATUS_SUCCESS],
-            "row_count": [0],
-        }
-    )
+    runs = _resource_runs_frame(row_count=0)
     assert injury_feed_available_at(runs, as_of=AS_OF) is True
 
 
 def test_run_after_as_of_does_not_count() -> None:
-    runs = pl.DataFrame(
-        {
-            "provider": ["balldontlie"],
-            "snapshot_type": ["injury"],
-            "available_at": [AS_OF + timedelta(hours=1)],
-            "season": [2026],
-            "week": [1],
-            "collection_status": [COLLECTION_STATUS_SUCCESS],
-            "row_count": [0],
-        }
-    )
+    runs = _resource_runs_frame(collector_received_at=AS_OF + timedelta(hours=1))
     assert injury_feed_available_at(runs, as_of=AS_OF) is False
 
 
 def test_non_success_status_does_not_count() -> None:
-    runs = pl.DataFrame(
-        {
-            "provider": ["balldontlie"],
-            "snapshot_type": ["injury"],
-            "available_at": [AS_OF - timedelta(hours=1)],
-            "season": [2026],
-            "week": [1],
-            "collection_status": ["PROVIDER_ERROR"],
-            "row_count": [0],
-        }
-    )
+    runs = _resource_runs_frame(collection_status="PROVIDER_ERROR")
     assert injury_feed_available_at(runs, as_of=AS_OF) is False
 
 
+# --------------------------------------------------------------------------
+# Legacy writer -- record_injury_collection_run / injury_snapshot_runs
+# --------------------------------------------------------------------------
+
+
 def test_record_injury_collection_run_roundtrip(tmp_path: Path) -> None:
+    """The legacy writer/table still work exactly as before (regression) --
+    but its output is a different schema than collector_resource_runs and is
+    no longer read by injury_feed_available_at at all (PHASE 4)."""
     warehouse = Warehouse(tmp_path / "warehouse")
     record_injury_collection_run(
         warehouse,
@@ -116,12 +106,9 @@ def test_record_injury_collection_run_roundtrip(tmp_path: Path) -> None:
     assert stored["season"][0] == 2026
     assert stored["week"][0] == 1
 
-    assert injury_feed_available_at(stored, as_of=AS_OF) is True
-    assert injury_feed_available_at(stored, as_of=AS_OF - timedelta(days=1)) is False
-
 
 # --------------------------------------------------------------------------
-# LeanIngestor.ingest_week
+# LeanIngestor.ingest_week (regression: legacy write path unchanged)
 # --------------------------------------------------------------------------
 
 
@@ -177,8 +164,9 @@ def test_ingest_week_records_run_marker_even_with_zero_injuries(
     # collected" now that injury_snapshot_runs exists.
     assert not warehouse.exists("injury_snapshots")
 
-    now = datetime.now(UTC)
-    assert injury_feed_available_at(runs, as_of=now) is True
+    # NOTE: injury_feed_available_at is no longer checked against this
+    # legacy table (PHASE 4) -- see test_resource_availability.py for the
+    # equivalent zero-row-success proof against collector_resource_runs.
 
 
 def test_ingest_week_records_run_marker_with_nonzero_injuries(

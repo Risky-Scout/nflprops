@@ -30,6 +30,7 @@ snapshot_app = typer.Typer(help="Point-in-time snapshot collection.")
 pbp_app = typer.Typer(help="Play-by-play parsing and reconciliation.")
 features_app = typer.Typer(help="Point-in-time feature building.")
 state_app = typer.Typer(help="Empirical-Bayes state updates.")
+collect_app = typer.Typer(help="Continuous point-in-time collection (PHASE 4).")
 
 app.add_typer(provider_app, name="provider")
 app.add_typer(ingest_app, name="ingest")
@@ -37,6 +38,7 @@ app.add_typer(snapshot_app, name="snapshot")
 app.add_typer(pbp_app, name="pbp")
 app.add_typer(features_app, name="features")
 app.add_typer(state_app, name="state")
+app.add_typer(collect_app, name="collect")
 
 
 # --- provider ---------------------------------------------------------------
@@ -167,6 +169,85 @@ def ingest_week(season: int, week: int) -> None:
     finally:
         source.client.close()
     typer.echo(f"Season {season} week {week} refreshed.")
+
+
+# --- collection (PHASE 4) ----------------------------------------------------
+@collect_app.command("once")
+def collect_once_cmd(
+    season: int,
+    week: int,
+    provider: str = "bdl",
+) -> None:
+    """Run exactly one collection cycle: schedule, rosters, injuries, odds, props."""
+    from nflprops.collection.service import collect_once
+    from nflprops.config import load
+    from nflprops.pipelines.lean import LeanIngestor  # noqa: F401 -- registers "bdl"
+    from nflprops.providers.registry import get_provider
+
+    cfg = load()
+    try:
+        source, warehouse = get_provider(provider, cfg)
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    try:
+        result = collect_once(
+            provider=source,
+            season=season,
+            week=week,
+            warehouse=warehouse,
+            config=cfg,
+            now=datetime.now(UTC),
+        )
+    finally:
+        client = getattr(source, "client", None)
+        if client is not None:
+            client.close()
+    typer.echo(
+        f"collector_run_id={result.collector_run_id} status={result.status.value} "
+        f"cadence_seconds={result.cadence_seconds} "
+        f"games={result.games_received} odds_rows={result.game_odds_rows} "
+        f"prop_rows={result.prop_rows} roster_rows={result.roster_rows} "
+        f"injury_rows={result.injury_rows}"
+    )
+
+
+@collect_app.command("loop")
+def collect_loop_cmd(
+    season: int,
+    week: int,
+    provider: str = "bdl",
+) -> None:
+    """Run collection cycles continuously (foreground) until interrupted."""
+    from nflprops.collection.loop import run_collection_loop
+    from nflprops.config import load
+    from nflprops.pipelines.lean import LeanIngestor  # noqa: F401 -- registers "bdl"
+    from nflprops.providers.registry import get_provider
+
+    cfg = load()
+    try:
+        source, warehouse = get_provider(provider, cfg)
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    def _report(result: object) -> None:
+        typer.echo(
+            f"collector_run_id={result.collector_run_id} status={result.status.value} "
+            f"cadence_seconds={result.cadence_seconds}"
+        )
+
+    try:
+        run_collection_loop(
+            provider=source,
+            season=season,
+            week=week,
+            warehouse=warehouse,
+            config=cfg,
+            on_cycle=_report,
+        )
+    finally:
+        client = getattr(source, "client", None)
+        if client is not None:
+            client.close()
 
 
 # --- snapshots --------------------------------------------------------------

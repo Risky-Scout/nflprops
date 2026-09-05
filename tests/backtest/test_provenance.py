@@ -84,14 +84,14 @@ def injury_runs_frame(
     available_at: datetime | None = None,
     collection_status: str = "SUCCESS",
 ) -> pl.DataFrame:
-    """A single `injury_snapshot_runs` collection-attempt record — the
-    authoritative source for injury-feed availability, independent of
-    `injuries_frame()`'s row count."""
+    """A single generalized `collector_resource_runs` record (PHASE 4) for
+    resource_type=INJURIES — the authoritative source for injury-feed
+    availability, independent of `injuries_frame()`'s row count."""
     return pl.DataFrame(
         {
             "provider": ["balldontlie"],
-            "snapshot_type": ["injury"],
-            "available_at": [available_at or (AS_OF - timedelta(hours=6))],
+            "resource_type": ["INJURIES"],
+            "collector_received_at": [available_at or (AS_OF - timedelta(hours=6))],
             "season": [2025],
             "week": [2],
             "collection_status": [collection_status],

@@ -154,7 +154,7 @@ class StateProvenanceContext:
     roster_rows: int
     injury_rows: int
     # Whether a successful injury collection ran at or before state_as_of —
-    # from nflprops.data.injury_availability's injury_snapshot_runs log, NOT
+    # from the generalized collector_resource_runs log (PHASE 4), NOT
     # from injury_rows. A zero-row injury_snapshots result can be a
     # genuinely successful, healthy-slate collection; injury_rows alone
     # cannot tell that apart from the feed never having run at all (e.g.
@@ -206,10 +206,11 @@ def build_state_provenance_context(
 ) -> StateProvenanceContext:
     """Describe and fingerprint the exact PIT state-input universe.
 
-    ``injury_runs`` is the ``injury_snapshot_runs`` collection-attempt log
-    (see ``nflprops.data.injury_availability``) — the authoritative source
-    for whether the injury feed was available at ``as_of``, independent of
-    how many rows any given collection returned.
+    ``injury_runs`` is the generalized ``collector_resource_runs`` log
+    (PHASE 4; see ``nflprops.collection``) — the authoritative source for
+    whether the injury feed was available at ``as_of``, independent of how
+    many rows any given collection returned. (Legacy: prior to PHASE 4 this
+    was the injury-specific ``injury_snapshot_runs`` table.)
     """
 
     _require_aware(as_of, "as_of")

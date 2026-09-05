@@ -479,7 +479,9 @@ def predict_week(
     players = warehouse.read("players")
     roster = warehouse.read("roster_snapshots")
     injuries = warehouse.read("injury_snapshots")
-    injury_runs = warehouse.read("injury_snapshot_runs")
+    # PHASE 4: collector_resource_runs is the authoritative injury-feed
+    # availability source; injury_snapshot_runs is legacy after this phase.
+    injury_runs = warehouse.read("collector_resource_runs")
     game_odds, prop_quotes = _market_frames_for_mode(
         warehouse,
         market_mode=market_mode,
