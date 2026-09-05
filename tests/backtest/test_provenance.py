@@ -64,6 +64,20 @@ def empty_snapshot() -> pl.DataFrame:
     return pl.DataFrame()
 
 
+def injuries_frame() -> pl.DataFrame:
+    """A non-empty, valid PIT injury snapshot for a DIFFERENT player than the
+    one usually predicted in this file's tests ("player-1") — proving
+    `injury_data_available` reflects whether the feed had ANY coverage at
+    this as_of, not whether the specific target player had a row."""
+    return pl.DataFrame(
+        {
+            "canonical_player_id": ["some-other-player"],
+            "status": ["Questionable"],
+            "available_at": [AS_OF - timedelta(hours=6)],
+        }
+    )
+
+
 def clean_context():
     return build_state_provenance_context(
         games=games_frame(),
@@ -196,6 +210,59 @@ def test_real_prediction_provenance_is_point_in_time() -> None:
         columns["feature_max_available_at"]
         <= AS_OF
     )
+
+
+def test_case_b_injury_data_available_is_false_when_no_snapshot_exists() -> None:
+    """Historical-availability audit, CASE B: `clean_context()` here uses an
+    entirely empty injuries frame (as every 2022-2025 historical as_of
+    genuinely does, per the live BDL injury-history audit) — the state
+    context must record that the feed was absent, not merely silent."""
+    context = clean_context()
+    assert context.injury_rows == 0
+    assert context.injury_data_available is False
+
+
+def test_case_a_injury_data_available_is_true_when_snapshot_exists() -> None:
+    """CASE A: a valid, non-empty PIT injury snapshot exists for this as_of —
+    even though it doesn't mention the specific player being predicted here
+    ("player-1" is absent from `injuries_frame()`, which only lists
+    "some-other-player"). The feed's mere presence is what flips this flag,
+    exactly the distinction the historical-availability audit required."""
+    context = build_state_provenance_context(
+        games=games_frame(),
+        player_stats=stats_frame(),
+        team_stats=stats_frame(),
+        players=players_frame(),
+        roster=empty_snapshot(),
+        injuries=injuries_frame(),
+        as_of=AS_OF,
+        model_version="test-model",
+    )
+    assert context.injury_rows == 1
+    assert context.injury_data_available is True
+
+    provenance = audit_prediction_inputs(
+        prediction_id="prediction-1",
+        as_of=AS_OF,
+        season=2025,
+        week=2,
+        game_id="target-game",
+        player_id="player-1",
+        prop_type="receiving_yards",
+        state_context=context,
+        game_available_at=(AS_OF - timedelta(days=5)),
+        quote_available_at=(AS_OF - timedelta(minutes=10)),
+        roster_available_at=None,
+        # player-1 itself has no injury row -> no per-player timestamp...
+        injury_available_at=None,
+        game_market_available_at=None,
+        market_mode="opening",
+    )
+    columns = provenance.as_columns()
+    # ...but the snapshot existed, so this is a verified "healthy/no
+    # designation" read, not an unavailable-data read.
+    assert columns["injury_available_at"] is None
+    assert columns["injury_data_available"] is True
 
 
 def test_future_prop_quote_fails_closed() -> None:

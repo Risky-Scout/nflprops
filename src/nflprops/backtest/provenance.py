@@ -153,6 +153,24 @@ class StateProvenanceContext:
     roster_rows: int
     injury_rows: int
 
+    @property
+    def injury_data_available(self) -> bool:
+        """Whether ANY point-in-time injury snapshot row existed as of
+        ``state_as_of`` — i.e. whether the injury feed itself had coverage at
+        this point in time, not whether any specific player had a row in it.
+
+        This is the Case A / Case B distinction: a player absent from a
+        non-empty injury snapshot ("no designation") is a completely
+        different fact from there being no injury snapshot at all for this
+        as_of (historical eras before injury collection existed). Both
+        currently leave a player's simulated ``active`` state at its
+        configured default (``features.injury.missing_row_means``) — that
+        default must never be mistaken for a verified read. This flag is the
+        machine-readable record of which case actually occurred, derived
+        from ``injury_rows`` alone so it can never drift out of sync with it.
+        """
+        return self.injury_rows > 0
+
 
 @dataclass(frozen=True)
 class PredictionProvenance:
@@ -161,6 +179,7 @@ class PredictionProvenance:
     state_as_of: datetime
     feature_max_available_at: datetime
     injury_available_at: datetime | None
+    injury_data_available: bool
     lineage_version: str = LINEAGE_VERSION
     lineage_checked: bool = True
 
@@ -173,6 +192,7 @@ class PredictionProvenance:
                 self.feature_max_available_at
             ),
             "injury_available_at": self.injury_available_at,
+            "injury_data_available": self.injury_data_available,
             "lineage_version": self.lineage_version,
             "lineage_checked": self.lineage_checked,
         }
@@ -581,4 +601,7 @@ def audit_prediction_inputs(
         state_as_of=state_context.state_as_of,
         feature_max_available_at=feature_max,
         injury_available_at=injury_available_at,
+        injury_data_available=(
+            state_context.injury_data_available
+        ),
     )

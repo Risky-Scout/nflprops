@@ -16,6 +16,7 @@ BACKTEST_ROW_CONTRACT = (
     "quote_available_at",
     "quote_time_source",
     "quote_age_seconds",
+    "injury_data_available",
     "canonical_game_id",
     "canonical_player_id",
     "prop_type",

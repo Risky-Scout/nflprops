@@ -178,6 +178,9 @@ def prediction(
             "quote_age_seconds": [
                 3600.0
             ],
+            "injury_data_available": [
+                False
+            ],
             "game_id": ["g1"],
             "player_id": [player_id],
             "prop_type": [
@@ -262,6 +265,10 @@ def test_real_historical_predict_contract_is_used() -> None:
     assert (
         rows["quote_age_seconds"][0]
         == 3600.0
+    )
+    assert (
+        rows["injury_data_available"][0]
+        is False
     )
     assert rows["season"][0] == 2025
     assert rows["week"][0] == 1

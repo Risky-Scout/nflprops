@@ -636,6 +636,7 @@ def _canonical_backtest_rows(
         "quote_available_at",
         "quote_time_source",
         "quote_age_seconds",
+        "injury_data_available",
         pl.col(
             "game_id"
         ).alias("canonical_game_id"),

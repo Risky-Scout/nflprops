@@ -21,6 +21,7 @@ AS_OF = datetime(2025, 9, 10, 12, tzinfo=UTC)
 def clean_context(
     *,
     state_games: tuple[StateGameMeta, ...] = (),
+    injury_rows: int = 1,
 ) -> StateProvenanceContext:
     return StateProvenanceContext(
         state_snapshot_id="state-snapshot",
@@ -32,7 +33,7 @@ def clean_context(
         player_stats_rows=10,
         team_stats_rows=2,
         roster_rows=1,
-        injury_rows=1,
+        injury_rows=injury_rows,
     )
 
 
@@ -116,6 +117,53 @@ def test_provenance_attachment_preserves_original_values() -> None:
     assert row["quote_available_at"] <= AS_OF
     assert row["game_market_available_at"] <= AS_OF
     assert row["injury_available_at"] <= AS_OF
+    assert row["injury_data_available"] is True
+
+
+def test_case_b_no_injury_snapshot_at_all_records_data_unavailable() -> None:
+    """CASE B (historical-availability audit): when the state's injury PIT
+    frame had zero rows for this as_of at all — not merely zero rows for this
+    player — the persisted provenance must say so explicitly rather than
+    silently agreeing with Case A's "no designation" reading."""
+    quote_available_at = AS_OF - timedelta(minutes=10)
+
+    priced_rows = [
+        {
+            "prediction_id": "prediction-historical",
+            "p_model_raw": 0.50,
+        }
+    ]
+
+    game = {
+        "canonical_game_id": "target-game",
+        "available_at": AS_OF - timedelta(days=5),
+    }
+
+    quote = {
+        "canonical_game_id": "target-game",
+        "canonical_player_id": "player-1",
+        "prop_type": "receiving_yards",
+        "available_at": quote_available_at,
+    }
+
+    enriched = _audit_and_attach_prediction_provenance(
+        priced_rows,
+        quote=quote,
+        game=game,
+        season=2023,
+        week=2,
+        as_of=AS_OF,
+        state_context=clean_context(injury_rows=0),
+        roster=pl.DataFrame(),
+        injuries=pl.DataFrame(),
+        game_market_available_at=None,
+        market_mode="opening",
+    )
+
+    assert len(enriched) == 1
+    row = enriched[0]
+    assert row["injury_available_at"] is None
+    assert row["injury_data_available"] is False
 
 
 def test_future_quote_fails_before_persistence() -> None:
