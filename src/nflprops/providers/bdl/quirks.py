@@ -129,30 +129,69 @@ def normalize_position_group(value: str | None) -> str:
     return "OTHER"
 
 
-def normalize_injury_status(raw: str | None) -> InjuryStatusCanonical:
-    """Map provider status strings into conservative canonical categories.
+# PHASE 2: every live BDL roster/injury-status abbreviation currently observed
+# (see docs/PRODUCTION_BASELINE_AUDIT.md and the 2026 production blueprint §2)
+# plus the common English long-forms already accepted before this phase.
+# Normalization key: lowercased, with '-'/'_' collapsed to a single space, so
+# "NFI-A", "nfi_a" and "NFI A" all match one alias entry.
+_INJURY_STATUS_ALIASES: dict[str, InjuryStatusCanonical] = {
+    "active": InjuryStatusCanonical.ACTIVE,
+    "healthy": InjuryStatusCanonical.ACTIVE,
+    "probable": InjuryStatusCanonical.PROBABLE,
+    "questionable": InjuryStatusCanonical.QUESTIONABLE,
+    "q": InjuryStatusCanonical.QUESTIONABLE,
+    "doubtful": InjuryStatusCanonical.DOUBTFUL,
+    "d": InjuryStatusCanonical.DOUBTFUL,
+    "out": InjuryStatusCanonical.OUT,
+    "o": InjuryStatusCanonical.OUT,
+    "inactive": InjuryStatusCanonical.INACTIVE,
+    "injured reserve": InjuryStatusCanonical.IR,
+    "ir": InjuryStatusCanonical.IR,
+    "reserve dnr": InjuryStatusCanonical.RESERVE,
+    "physically unable to perform": InjuryStatusCanonical.PUP,
+    "pup": InjuryStatusCanonical.PUP,
+    "pup p": InjuryStatusCanonical.PUP,
+    "pup r": InjuryStatusCanonical.PUP,
+    "non football injury": InjuryStatusCanonical.NFI,
+    "nfi": InjuryStatusCanonical.NFI,
+    "nfi a": InjuryStatusCanonical.NFI,
+    "nfi r": InjuryStatusCanonical.NFI,
+    "suspended": InjuryStatusCanonical.SUSPENDED,
+    "susp": InjuryStatusCanonical.SUSPENDED,
+    "reserve sus": InjuryStatusCanonical.SUSPENDED,
+}
 
-    Unknown strings are logged and map to UNKNOWN, never ACTIVE.
+
+def _normalization_key(raw: str) -> str:
+    return raw.strip().lower().replace("-", " ").replace("_", " ")
+
+
+def normalize_injury_status(raw: str | None) -> InjuryStatusCanonical:
+    """Map a raw BDL roster/injury-status string to a conservative canonical
+    category (PHASE 2, blueprint §2).
+
+    A status this function has never seen before is preserved as-is by the
+    caller (`RosterEntry.injury_status_raw` / `Injury.status_raw`) and
+    canonicalizes to `UNKNOWN_PROVIDER_STATUS` here — never to ACTIVE or any
+    other healthy/available interpretation. A structured warning is emitted so
+    the raw string, canonical result, and provider are all recoverable from
+    logs without re-deriving them. Later data-quality/publication phases turn
+    a materially relevant `UNKNOWN_PROVIDER_STATUS` into a DATA_HOLD; this
+    function only has to make that category unambiguous and never silently
+    skipped.
     """
     if raw is None or not str(raw).strip():
-        return InjuryStatusCanonical.UNKNOWN
-    text = str(raw).strip().lower().replace("-", " ").replace("_", " ")
-    aliases = {
-        "active": InjuryStatusCanonical.ACTIVE,
-        "healthy": InjuryStatusCanonical.ACTIVE,
-        "probable": InjuryStatusCanonical.PROBABLE,
-        "questionable": InjuryStatusCanonical.QUESTIONABLE,
-        "q": InjuryStatusCanonical.QUESTIONABLE,
-        "doubtful": InjuryStatusCanonical.DOUBTFUL,
-        "out": InjuryStatusCanonical.OUT,
-        "o": InjuryStatusCanonical.OUT,
-        "injured reserve": InjuryStatusCanonical.IR,
-        "ir": InjuryStatusCanonical.IR,
-        "physically unable to perform": InjuryStatusCanonical.PUP,
-        "pup": InjuryStatusCanonical.PUP,
-        "suspended": InjuryStatusCanonical.SUSPENDED,
-    }
-    if text in aliases:
-        return aliases[text]
-    _LOG.warning("unrecognized BDL injury status: %r", raw)
-    return InjuryStatusCanonical.UNKNOWN
+        return InjuryStatusCanonical.UNKNOWN_PROVIDER_STATUS
+    text = _normalization_key(str(raw))
+    if text in _INJURY_STATUS_ALIASES:
+        return _INJURY_STATUS_ALIASES[text]
+    _LOG.warning(
+        "unrecognized BDL injury status: %r -> UNKNOWN_PROVIDER_STATUS",
+        raw,
+        extra={
+            "raw_status": raw,
+            "canonical_status": InjuryStatusCanonical.UNKNOWN_PROVIDER_STATUS.value,
+            "provider": "balldontlie",
+        },
+    )
+    return InjuryStatusCanonical.UNKNOWN_PROVIDER_STATUS

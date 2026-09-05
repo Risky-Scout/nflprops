@@ -102,7 +102,7 @@ class RosterEntry(PITMixin):
     depth: int | None = None
     player_name: str | None = None
     injury_status_raw: str | None = None
-    injury_status: InjuryStatusCanonical = InjuryStatusCanonical.UNKNOWN
+    injury_status: InjuryStatusCanonical = InjuryStatusCanonical.UNKNOWN_PROVIDER_STATUS
     raw_record_hash: str
 
 
@@ -463,7 +463,7 @@ class Injury(PITMixin):
 
     canonical_player_id: str
     status_raw: str | None = None
-    status: InjuryStatusCanonical = InjuryStatusCanonical.UNKNOWN
+    status: InjuryStatusCanonical = InjuryStatusCanonical.UNKNOWN_PROVIDER_STATUS
     comment: str | None = None
     date: datetime | None = None
     raw_record_hash: str

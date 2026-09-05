@@ -153,17 +153,28 @@ class PBPQuality(str, Enum):  # noqa: UP042
 
 
 class InjuryStatusCanonical(str, Enum):  # noqa: UP042
-    """Normalized internal categories. Raw provider strings are ALSO retained."""
+    """Normalized internal roster/injury-status categories (PHASE 2).
+
+    Raw provider strings are ALSO retained (`RosterEntry.injury_status_raw`,
+    `Injury.status_raw`) — never discarded, even when several raw strings
+    collapse into the same canonical category. A provider status this module
+    has never seen before must never resolve to ACTIVE/healthy; it maps to
+    UNKNOWN_PROVIDER_STATUS instead, which downstream data-quality/publication
+    logic can turn into a hold. See `nflprops.providers.bdl.quirks.normalize_injury_status`.
+    """
 
     ACTIVE = "active"
     PROBABLE = "probable"
     QUESTIONABLE = "questionable"
     DOUBTFUL = "doubtful"
     OUT = "out"
+    INACTIVE = "inactive"
     IR = "ir"
+    RESERVE = "reserve"
     PUP = "pup"
+    NFI = "nfi"
     SUSPENDED = "suspended"
-    UNKNOWN = "unknown"
+    UNKNOWN_PROVIDER_STATUS = "unknown_provider_status"
 
 
 class DevigMethod(str, Enum):  # noqa: UP042
