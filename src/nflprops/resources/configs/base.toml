@@ -89,6 +89,14 @@ max_confidence_tier = 2            # Tier 3 remains research-only until PBP labe
 consensus_method = "logit_median"
 truth_source_vendors = []        # empty: BDL has no sharp book. SPEC §6.
 
+[market.sportsbooks]
+# PHASE 3: provider-agnostic sportsbook policy. reference_book is display/
+# comparison-only -- its absence must never fail ingestion or prediction.
+# blocked names are canonicalized (case-insensitive) before matching.
+allow_all_supported = true
+blocked = []
+reference_book = "bet365"
+
 [market.collector]
 # SPEC §58 — BDL retains no live prop history. Deploy this before week 1.
 checkpoints = ["OPEN","T-48H","T-24H","T-12H","T-6H","T-3H","T-1H","T-30M","T-10M","CLOSE"]

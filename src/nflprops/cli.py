@@ -102,13 +102,15 @@ def provider_drift(provider: str) -> None:
 @ingest_app.command("bootstrap")
 def ingest_bootstrap(provider: str = "bdl") -> None:
     """Fetch reference teams/players into the lean local warehouse."""
-    if provider != "bdl":
-        raise typer.BadParameter("only bdl is currently implemented")
     from nflprops.config import load
-    from nflprops.pipelines.lean import LeanIngestor, build_bdl_provider
+    from nflprops.pipelines.lean import LeanIngestor
+    from nflprops.providers.registry import get_provider
 
     cfg = load(provider=provider)
-    source, warehouse = build_bdl_provider(cfg)
+    try:
+        source, warehouse = get_provider(provider, cfg)
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     try:
         LeanIngestor(
             source,
@@ -127,10 +129,11 @@ def ingest_season(
 ) -> None:
     """Backfill one season into canonical Parquet/DuckDB tables."""
     from nflprops.config import load
-    from nflprops.pipelines.lean import LeanIngestor, build_bdl_provider
+    from nflprops.pipelines.lean import LeanIngestor
+    from nflprops.providers.registry import get_provider
 
     cfg = load()
-    source, warehouse = build_bdl_provider(cfg)
+    source, warehouse = get_provider("bdl", cfg)
     try:
         LeanIngestor(
             source,
@@ -150,10 +153,11 @@ def ingest_season(
 def ingest_week(season: int, week: int) -> None:
     """Refresh the current week: games, odds, injuries, rosters, player props."""
     from nflprops.config import load
-    from nflprops.pipelines.lean import LeanIngestor, build_bdl_provider
+    from nflprops.pipelines.lean import LeanIngestor
+    from nflprops.providers.registry import get_provider
 
     cfg = load()
-    source, warehouse = build_bdl_provider(cfg)
+    source, warehouse = get_provider("bdl", cfg)
     try:
         LeanIngestor(
             source,
