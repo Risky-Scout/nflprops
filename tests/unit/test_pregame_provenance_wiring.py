@@ -203,3 +203,41 @@ def test_prediction_audit_precedes_persistence() -> None:
     )
 
     assert audit < persistence
+
+def test_live_future_collector_receipt_fails_provenance_even_if_provider_time_is_old() -> None:
+    priced_rows = [
+        {
+            "prediction_id": "prediction-live",
+            "p_model_raw": 0.50,
+        }
+    ]
+
+    game = {
+        "canonical_game_id": "target-game",
+        "available_at": AS_OF - timedelta(days=5),
+    }
+
+    quote = {
+        "canonical_game_id": "target-game",
+        "canonical_player_id": "player-1",
+        "prop_type": "receiving_yards",
+        "available_at": AS_OF - timedelta(minutes=30),
+        "provider_updated_at": AS_OF - timedelta(minutes=30),
+        "collector_received_at": AS_OF + timedelta(seconds=1),
+    }
+
+    with pytest.raises(LeakageError):
+        _audit_and_attach_prediction_provenance(
+            priced_rows,
+            quote=quote,
+            game=game,
+            season=2025,
+            week=2,
+            as_of=AS_OF,
+            state_context=clean_context(),
+            roster=pl.DataFrame(),
+            injuries=pl.DataFrame(),
+            game_market_available_at=None,
+            market_mode="live",
+        )
+

@@ -14,7 +14,6 @@ from nflprops.backtest.provenance import (
     audit_prediction_inputs,
     build_state_provenance_context,
     latest_entity_available_at,
-    latest_game_market_available_at,
 )
 from nflprops.data.warehouse import Warehouse
 from nflprops.market.consensus import game_market_consensus, latest_prop_quotes
@@ -26,6 +25,11 @@ from nflprops.market.odds import (
 )
 from nflprops.market.odds import (
     edge as probability_edge,
+)
+from nflprops.market.timing import (
+    latest_game_market_knowledge_time,
+    quote_knowledge_time,
+    quote_time_source,
 )
 from nflprops.simulation.game import (
     GameSimulationInput,
@@ -177,7 +181,12 @@ def _implied_points(total: float | None, home_spread: float | None):
     )
 
 
-def _price_quote(result, quote: dict) -> list[dict]:
+def _price_quote(
+    result,
+    quote: dict,
+    *,
+    market_mode: str,
+) -> list[dict]:
     player_id = str(quote["canonical_player_id"])
     prop_type = str(quote["prop_type"])
     confidence_tier = prop_confidence_tier(prop_type)
@@ -187,6 +196,16 @@ def _price_quote(result, quote: dict) -> list[dict]:
     line = float(quote["line_value"]) if quote.get("line_value") is not None else None
     dist = summarize_prop(result, player_id, prop_type, line=line)
 
+    quote_at = quote_knowledge_time(
+        quote,
+        market_mode=market_mode,
+    )
+
+    if quote_at > result.as_of:
+        raise ValueError(
+            "selected quote is not yet knowable at prediction as_of"
+        )
+
     base = {
         "game_id": str(quote["canonical_game_id"]),
         "player_id": player_id,
@@ -195,7 +214,14 @@ def _price_quote(result, quote: dict) -> list[dict]:
         "vendor": str(quote["vendor"]),
         "line": line,
         "market_type": str(quote["market_type"]),
-        "quote_available_at": quote.get("available_at"),
+        "quote_available_at": quote_at,
+        "quote_time_source": quote_time_source(market_mode),
+        "quote_age_seconds": (
+            result.as_of - quote_at
+        ).total_seconds(),
+        "quote_provider_updated_at": quote.get("provider_updated_at"),
+        "quote_opened_at": quote.get("opened_at"),
+        "quote_collector_received_at": quote.get("collector_received_at"),
         "model_mean": dist.mean,
         "model_median": dist.median,
         "p05": dist.p05,
@@ -384,7 +410,10 @@ def _audit_and_attach_prediction_provenance(
             prop_type=prop_type,
             state_context=state_context,
             game_available_at=game.get("available_at"),
-            quote_available_at=quote.get("available_at"),
+            quote_available_at=quote_knowledge_time(
+                quote,
+                market_mode=market_mode,
+            ),
             roster_available_at=roster_available_at,
             injury_available_at=injury_available_at,
             game_market_available_at=game_market_available_at,
@@ -512,10 +541,11 @@ def predict_week(
             continue
 
         game_market_available_at = (
-            latest_game_market_available_at(
+            latest_game_market_knowledge_time(
                 game_odds,
                 as_of=as_of,
                 game_id=game_id,
+                market_mode=market_mode,
             )
         )
 
@@ -572,6 +602,7 @@ def predict_week(
             priced_rows = _price_quote(
                 result,
                 quote,
+                market_mode=market_mode,
             )
 
             prediction_rows.extend(

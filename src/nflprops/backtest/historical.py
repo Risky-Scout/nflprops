@@ -633,6 +633,9 @@ def _canonical_backtest_rows(
     canonical = joined.select(
         "prediction_id",
         "as_of",
+        "quote_available_at",
+        "quote_time_source",
+        "quote_age_seconds",
         pl.col(
             "game_id"
         ).alias("canonical_game_id"),
