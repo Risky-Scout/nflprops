@@ -48,6 +48,16 @@ dev = [
   "mypy==2.3.1",
   "types-PyYAML",
 ]
+# Production storage backend (PHASE 1: managed PostgreSQL + S3-compatible object
+# storage). The local DuckDB/Parquet warehouse remains dependency-free; these are
+# only imported when NFLPROPS_STORAGE_BACKEND=postgres or an object-store client
+# is constructed.
+storage = [
+  "sqlalchemy>=2.0",
+  "psycopg[binary]>=3.1",
+  "alembic>=1.13",
+  "boto3>=1.34",
+]
 
 [project.scripts]
 nflprops = "nflprops.cli:app"
@@ -64,6 +74,7 @@ markers = [
   "leakage: point-in-time correctness detectors",
   "determinism: byte-level reproducibility",
   "slow: long-running",
+  "docker: requires a local Docker daemon (PostgreSQL/MinIO integration tests)",
 ]
 
 [tool.ruff]
