@@ -78,7 +78,29 @@ def injuries_frame() -> pl.DataFrame:
     )
 
 
-def clean_context():
+def injury_runs_frame(
+    *,
+    row_count: int = 1,
+    available_at: datetime | None = None,
+    collection_status: str = "SUCCESS",
+) -> pl.DataFrame:
+    """A single `injury_snapshot_runs` collection-attempt record — the
+    authoritative source for injury-feed availability, independent of
+    `injuries_frame()`'s row count."""
+    return pl.DataFrame(
+        {
+            "provider": ["balldontlie"],
+            "snapshot_type": ["injury"],
+            "available_at": [available_at or (AS_OF - timedelta(hours=6))],
+            "season": [2025],
+            "week": [2],
+            "collection_status": [collection_status],
+            "row_count": [row_count],
+        }
+    )
+
+
+def clean_context(*, injury_runs: pl.DataFrame | None = None):
     return build_state_provenance_context(
         games=games_frame(),
         player_stats=stats_frame(),
@@ -86,6 +108,9 @@ def clean_context():
         players=players_frame(),
         roster=empty_snapshot(),
         injuries=empty_snapshot(),
+        injury_runs=(
+            injury_runs if injury_runs is not None else empty_snapshot()
+        ),
         as_of=AS_OF,
         model_version="test-model",
     )
@@ -107,6 +132,7 @@ def test_target_game_result_in_state_history_fails() -> None:
         players=players_frame(),
         roster=empty_snapshot(),
         injuries=empty_snapshot(),
+        injury_runs=empty_snapshot(),
         as_of=AS_OF,
         model_version="test-model",
     )
@@ -128,6 +154,7 @@ def test_future_week_in_state_history_fails() -> None:
         players=players_frame(),
         roster=empty_snapshot(),
         injuries=empty_snapshot(),
+        injury_runs=empty_snapshot(),
         as_of=AS_OF,
         model_version="test-model",
     )
@@ -212,22 +239,25 @@ def test_real_prediction_provenance_is_point_in_time() -> None:
     )
 
 
-def test_case_b_injury_data_available_is_false_when_no_snapshot_exists() -> None:
-    """Historical-availability audit, CASE B: `clean_context()` here uses an
-    entirely empty injuries frame (as every 2022-2025 historical as_of
-    genuinely does, per the live BDL injury-history audit) — the state
-    context must record that the feed was absent, not merely silent."""
+def test_case_c_injury_data_available_is_false_when_no_collection_ran() -> None:
+    """CASE C: no successful PIT injury collection at all — `clean_context()`
+    here uses an entirely empty `injury_snapshot_runs` frame, exactly as
+    every 2022-2025 historical as_of genuinely does (confirmed by the
+    separate read-only live-BDL injury-history audit: no historical
+    collector ever ran for those eras). The state context must record that
+    the feed itself was unreachable, not merely that no rows happened to
+    match."""
     context = clean_context()
     assert context.injury_rows == 0
     assert context.injury_data_available is False
 
 
-def test_case_a_injury_data_available_is_true_when_snapshot_exists() -> None:
-    """CASE A: a valid, non-empty PIT injury snapshot exists for this as_of —
-    even though it doesn't mention the specific player being predicted here
-    ("player-1" is absent from `injuries_frame()`, which only lists
-    "some-other-player"). The feed's mere presence is what flips this flag,
-    exactly the distinction the historical-availability audit required."""
+def test_case_a_injury_data_available_is_true_with_relevant_rows() -> None:
+    """CASE A: a successful collection ran AND relevant injury rows exist for
+    this as_of — even though the snapshot doesn't mention the specific player
+    being predicted here ("player-1" is absent from `injuries_frame()`, which
+    only lists "some-other-player"). The feed's mere presence is what flips
+    this flag, not whether it happens to mention this exact player."""
     context = build_state_provenance_context(
         games=games_frame(),
         player_stats=stats_frame(),
@@ -235,6 +265,7 @@ def test_case_a_injury_data_available_is_true_when_snapshot_exists() -> None:
         players=players_frame(),
         roster=empty_snapshot(),
         injuries=injuries_frame(),
+        injury_runs=injury_runs_frame(row_count=1),
         as_of=AS_OF,
         model_version="test-model",
     )
@@ -263,6 +294,69 @@ def test_case_a_injury_data_available_is_true_when_snapshot_exists() -> None:
     # designation" read, not an unavailable-data read.
     assert columns["injury_available_at"] is None
     assert columns["injury_data_available"] is True
+
+
+def test_case_b_injury_data_available_is_true_with_zero_relevant_rows() -> None:
+    """CASE B, the specific bug this correction fixes: a successful injury
+    collection ran at/before this as_of but legitimately found ZERO relevant
+    rows (a healthy-slate result) -- `injury_rows > 0` was previously (and
+    wrongly) the authoritative test, which would have marked this as
+    unavailable identical to CASE C. The `injury_snapshot_runs` collection
+    log is what actually proves the feed ran, independent of row count."""
+    context = build_state_provenance_context(
+        games=games_frame(),
+        player_stats=stats_frame(),
+        team_stats=stats_frame(),
+        players=players_frame(),
+        roster=empty_snapshot(),
+        injuries=empty_snapshot(),
+        injury_runs=injury_runs_frame(row_count=0),
+        as_of=AS_OF,
+        model_version="test-model",
+    )
+    assert context.injury_rows == 0
+    assert context.injury_data_available is True
+
+
+def test_injury_collection_run_after_as_of_does_not_count() -> None:
+    """A collection run that happened AFTER as_of must not retroactively mark
+    a historical as_of's injury data as available -- that would be leakage
+    from the future into a point-in-time read."""
+    context = build_state_provenance_context(
+        games=games_frame(),
+        player_stats=stats_frame(),
+        team_stats=stats_frame(),
+        players=players_frame(),
+        roster=empty_snapshot(),
+        injuries=empty_snapshot(),
+        injury_runs=injury_runs_frame(
+            row_count=0,
+            available_at=AS_OF + timedelta(hours=1),
+        ),
+        as_of=AS_OF,
+        model_version="test-model",
+    )
+    assert context.injury_data_available is False
+
+
+def test_failed_collection_status_does_not_count_as_available() -> None:
+    """A recorded run whose collection_status was not SUCCESS must not count
+    as proof the feed was available."""
+    context = build_state_provenance_context(
+        games=games_frame(),
+        player_stats=stats_frame(),
+        team_stats=stats_frame(),
+        players=players_frame(),
+        roster=empty_snapshot(),
+        injuries=empty_snapshot(),
+        injury_runs=injury_runs_frame(
+            row_count=0,
+            collection_status="PROVIDER_ERROR",
+        ),
+        as_of=AS_OF,
+        model_version="test-model",
+    )
+    assert context.injury_data_available is False
 
 
 def test_future_prop_quote_fails_closed() -> None:

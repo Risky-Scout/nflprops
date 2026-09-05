@@ -58,6 +58,17 @@ tables:
       key: [canonical_player_id, available_at]
       pit: true
       rule: "append-only; Saturday never overwrites Monday"
+    injury_snapshot_runs:
+      key: [provider, available_at]
+      pit: true
+      note: >
+        Collection-attempt log, independent of injury_snapshots row count.
+        A zero-row injury_snapshots result from a successful fetch is not the
+        same fact as "the feed never ran" -- injury_data_available is derived
+        from this table's presence at/before as_of, not from row counts. See
+        nflprops.data.injury_availability. Minimal by design; not the
+        full Phase 4 continuous collector.
+      columns: [provider, snapshot_type, available_at, season, week, collection_status, row_count]
 
   outcomes:
     player_game_stats:

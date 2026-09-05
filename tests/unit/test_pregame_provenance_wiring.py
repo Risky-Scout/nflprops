@@ -22,6 +22,7 @@ def clean_context(
     *,
     state_games: tuple[StateGameMeta, ...] = (),
     injury_rows: int = 1,
+    injury_data_available: bool = True,
 ) -> StateProvenanceContext:
     return StateProvenanceContext(
         state_snapshot_id="state-snapshot",
@@ -34,6 +35,7 @@ def clean_context(
         team_stats_rows=2,
         roster_rows=1,
         injury_rows=injury_rows,
+        injury_data_available=injury_data_available,
     )
 
 
@@ -120,11 +122,12 @@ def test_provenance_attachment_preserves_original_values() -> None:
     assert row["injury_data_available"] is True
 
 
-def test_case_b_no_injury_snapshot_at_all_records_data_unavailable() -> None:
-    """CASE B (historical-availability audit): when the state's injury PIT
-    frame had zero rows for this as_of at all — not merely zero rows for this
-    player — the persisted provenance must say so explicitly rather than
-    silently agreeing with Case A's "no designation" reading."""
+def test_case_c_no_injury_collection_at_all_records_data_unavailable() -> None:
+    """CASE C (historical-availability audit): when no injury collection ever
+    ran for this as_of at all (every 2022-2025 historical prediction, per the
+    live BDL injury-history audit) — the persisted provenance must say so
+    explicitly rather than silently agreeing with Case A's "no designation"
+    reading."""
     quote_available_at = AS_OF - timedelta(minutes=10)
 
     priced_rows = [
@@ -153,7 +156,9 @@ def test_case_b_no_injury_snapshot_at_all_records_data_unavailable() -> None:
         season=2023,
         week=2,
         as_of=AS_OF,
-        state_context=clean_context(injury_rows=0),
+        state_context=clean_context(
+            injury_rows=0, injury_data_available=False
+        ),
         roster=pl.DataFrame(),
         injuries=pl.DataFrame(),
         game_market_available_at=None,
@@ -164,6 +169,54 @@ def test_case_b_no_injury_snapshot_at_all_records_data_unavailable() -> None:
     row = enriched[0]
     assert row["injury_available_at"] is None
     assert row["injury_data_available"] is False
+
+
+def test_case_b_zero_relevant_rows_from_successful_collection_still_available() -> None:
+    """CASE B, the bug this correction fixes: a successful injury collection
+    ran (injury_rows == 0 is possible from a genuinely healthy-slate result)
+    but `injury_data_available` must still be True — it is derived from the
+    injury_snapshot_runs collection log, not from injury_rows."""
+    quote_available_at = AS_OF - timedelta(minutes=10)
+
+    priced_rows = [
+        {
+            "prediction_id": "prediction-live-healthy-slate",
+            "p_model_raw": 0.50,
+        }
+    ]
+
+    game = {
+        "canonical_game_id": "target-game",
+        "available_at": AS_OF - timedelta(days=5),
+    }
+
+    quote = {
+        "canonical_game_id": "target-game",
+        "canonical_player_id": "player-1",
+        "prop_type": "receiving_yards",
+        "available_at": quote_available_at,
+    }
+
+    enriched = _audit_and_attach_prediction_provenance(
+        priced_rows,
+        quote=quote,
+        game=game,
+        season=2026,
+        week=2,
+        as_of=AS_OF,
+        state_context=clean_context(
+            injury_rows=0, injury_data_available=True
+        ),
+        roster=pl.DataFrame(),
+        injuries=pl.DataFrame(),
+        game_market_available_at=None,
+        market_mode="opening",
+    )
+
+    assert len(enriched) == 1
+    row = enriched[0]
+    assert row["injury_available_at"] is None
+    assert row["injury_data_available"] is True
 
 
 def test_future_quote_fails_before_persistence() -> None:

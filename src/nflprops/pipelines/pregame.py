@@ -479,6 +479,7 @@ def predict_week(
     players = warehouse.read("players")
     roster = warehouse.read("roster_snapshots")
     injuries = warehouse.read("injury_snapshots")
+    injury_runs = warehouse.read("injury_snapshot_runs")
     game_odds, prop_quotes = _market_frames_for_mode(
         warehouse,
         market_mode=market_mode,
@@ -496,6 +497,7 @@ def predict_week(
         players=players,
         roster=roster,
         injuries=injuries,
+        injury_runs=injury_runs,
         as_of=as_of,
         model_version=model_version,
     )

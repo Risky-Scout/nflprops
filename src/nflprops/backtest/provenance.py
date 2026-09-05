@@ -26,6 +26,7 @@ from nflprops.backtest.leakage import (
     PredictionLineage,
     assert_no_leakage,
 )
+from nflprops.data.injury_availability import injury_feed_available_at
 from nflprops.features.asof import filter_pit
 
 LINEAGE_VERSION = "2026.1"
@@ -152,24 +153,17 @@ class StateProvenanceContext:
     team_stats_rows: int
     roster_rows: int
     injury_rows: int
-
-    @property
-    def injury_data_available(self) -> bool:
-        """Whether ANY point-in-time injury snapshot row existed as of
-        ``state_as_of`` — i.e. whether the injury feed itself had coverage at
-        this point in time, not whether any specific player had a row in it.
-
-        This is the Case A / Case B distinction: a player absent from a
-        non-empty injury snapshot ("no designation") is a completely
-        different fact from there being no injury snapshot at all for this
-        as_of (historical eras before injury collection existed). Both
-        currently leave a player's simulated ``active`` state at its
-        configured default (``features.injury.missing_row_means``) — that
-        default must never be mistaken for a verified read. This flag is the
-        machine-readable record of which case actually occurred, derived
-        from ``injury_rows`` alone so it can never drift out of sync with it.
-        """
-        return self.injury_rows > 0
+    # Whether a successful injury collection ran at or before state_as_of —
+    # from nflprops.data.injury_availability's injury_snapshot_runs log, NOT
+    # from injury_rows. A zero-row injury_snapshots result can be a
+    # genuinely successful, healthy-slate collection; injury_rows alone
+    # cannot tell that apart from the feed never having run at all (e.g.
+    # every 2022-2025 historical as_of). Both cases currently leave a
+    # player's simulated `active` state at its configured default
+    # (features.injury.missing_row_means) -- that default must never be
+    # mistaken for a verified read. This flag is the machine-readable record
+    # of which case actually occurred.
+    injury_data_available: bool
 
 
 @dataclass(frozen=True)
@@ -206,10 +200,17 @@ def build_state_provenance_context(
     players: pl.DataFrame,
     roster: pl.DataFrame,
     injuries: pl.DataFrame,
+    injury_runs: pl.DataFrame,
     as_of: datetime,
     model_version: str,
 ) -> StateProvenanceContext:
-    """Describe and fingerprint the exact PIT state-input universe."""
+    """Describe and fingerprint the exact PIT state-input universe.
+
+    ``injury_runs`` is the ``injury_snapshot_runs`` collection-attempt log
+    (see ``nflprops.data.injury_availability``) — the authoritative source
+    for whether the injury feed was available at ``as_of``, independent of
+    how many rows any given collection returned.
+    """
 
     _require_aware(as_of, "as_of")
 
@@ -218,6 +219,7 @@ def build_state_provenance_context(
     rr = _pit(roster, as_of)
     ii = _pit(injuries, as_of)
     gg = _pit(games, as_of)
+    injury_data_available = injury_feed_available_at(injury_runs, as_of=as_of)
 
     state_game_ids: set[str] = set()
 
@@ -377,6 +379,7 @@ def build_state_provenance_context(
         team_stats_rows=ts.height,
         roster_rows=rr.height,
         injury_rows=ii.height,
+        injury_data_available=injury_data_available,
     )
 
 
