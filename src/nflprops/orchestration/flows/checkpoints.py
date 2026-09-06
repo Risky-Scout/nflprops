@@ -22,14 +22,10 @@ import polars as pl
 from prefect import flow, task
 
 from nflprops.backtest.leakage import LeakageError as BacktestLeakageError
-from nflprops.backtest.provenance import (
-    StateProvenanceContext,
-    build_state_provenance_context,
-)
+from nflprops.backtest.provenance import StateProvenanceContext
 from nflprops.collection.service import source_sha256
 from nflprops.config import Config, config_sha256
 from nflprops.data.warehouse import Warehouse
-from nflprops.domain.hashing import hash_payload
 from nflprops.errors import LeakageError as CoreLeakageError
 from nflprops.orchestration.checkpoints import (
     OFFICIAL_CHECKPOINTS,
@@ -43,6 +39,7 @@ from nflprops.orchestration.checkpoints import (
 from nflprops.orchestration.checkpoints import (
     scheduled_as_of as compute_scheduled_as_of,
 )
+from nflprops.orchestration.manifest import compute_data_manifest_sha256
 from nflprops.orchestration.run_store import (
     FAILURE_CHECKPOINT_MISSED,
     PredictionRunRecord,
@@ -88,33 +85,6 @@ class CheckpointRunContext:
     simulation_config: SimulationConfig | None = None
     player_state_config: PlayerStateConfig | None = None
     team_state_config: TeamStateConfig | None = None
-
-
-def _data_manifest_sha256(
-    warehouse: Warehouse, *, as_of: datetime, model_version: str
-) -> str:
-    """PIT data-manifest fingerprint for a checkpoint (§19): reuses the
-    existing `build_state_provenance_context` PIT-lineage machinery rather
-    than inventing a second one. Its granularity is as_of-level (every
-    source row visible warehouse-wide at `as_of`), matching how
-    `predict_week`/`predict_game` already build state -- not narrowly
-    scoped to one game's rows. §19 explicitly permits preserving this
-    granularity rather than redesigning it in Phase 5. Computable
-    independently of whether the target game is ultimately found, so it can
-    be fixed once at claim time and never needs to change afterward.
-    """
-    context: StateProvenanceContext = build_state_provenance_context(
-        games=warehouse.read("games"),
-        player_stats=warehouse.read("player_game_stats"),
-        team_stats=warehouse.read("team_game_stats"),
-        players=warehouse.read("players"),
-        roster=warehouse.read("roster_snapshots"),
-        injuries=warehouse.read("injury_snapshots"),
-        injury_runs=warehouse.read("collector_resource_runs"),
-        as_of=as_of,
-        model_version=model_version,
-    )
-    return hash_payload({"state_snapshot_id": context.state_snapshot_id})
 
 
 def _classify_exception(exc: BaseException) -> tuple[str, str]:
@@ -314,8 +284,8 @@ def checkpoint_dispatch_flow(
                 config_sha256=cfg_sha,
                 source_sha256=src_sha,
             )
-            manifest_sha = _data_manifest_sha256(
-                warehouse, as_of=scheduled, model_version=resolved_model_version
+            manifest_sha = compute_data_manifest_sha256(
+                warehouse, game_id=game_id, scheduled_as_of=scheduled, market_mode=market_mode
             )
 
             if action is CheckpointAction.MISSED:

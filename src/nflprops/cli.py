@@ -359,7 +359,7 @@ def checkpoint_run_cmd(
     from nflprops.collection.service import source_sha256
     from nflprops.config import config_sha256, load
     from nflprops.orchestration.checkpoints import CheckpointName
-    from nflprops.orchestration.flows.checkpoints import _data_manifest_sha256
+    from nflprops.orchestration.manifest import compute_data_manifest_sha256
     from nflprops.orchestration.run_store import (
         PredictionRunRecord,
         PredictionRunStatus,
@@ -390,7 +390,7 @@ def checkpoint_run_cmd(
         config_sha256=cfg_sha,
         source_sha256=src_sha,
     )
-    manifest_sha = _data_manifest_sha256(warehouse, as_of=dt, model_version=model_version)
+    manifest_sha = compute_data_manifest_sha256(warehouse, game_id=game_id, scheduled_as_of=dt)
     now = datetime.now(UTC)
     record = PredictionRunRecord(
         run_id=run_id,

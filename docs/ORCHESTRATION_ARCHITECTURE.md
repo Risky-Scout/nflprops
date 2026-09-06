@@ -64,6 +64,16 @@ startup (`CheckpointOffsets.validate`): all offsets must be `> 0`, all
 names unique, and `T48H > T24H > T6H > T90M > T30M`. Invalid production
 configuration fails closed — it never silently corrects itself.
 
+**Distinct from `[market.collector].checkpoints`**: that config key
+(`"OPEN","T-48H",...,"CLOSE"`) is a set of market-snapshot labels for the
+still-unimplemented Phase-9 market snapshot collector
+(`nflprops/market/snapshots.py`, a skeleton) — not official model
+checkpoint identities. No code reads `[market.collector]` today, and no
+Phase-5 official-checkpoint code path (`orchestration.checkpoints`,
+`orchestration.run_store`, `orchestration.flows.*`, the checkpoint CLI
+commands) reads it either. Official model checkpoint orchestration reads
+only `[checkpoints]`/`[checkpoints.offset_seconds]`.
+
 ### The scheduled_as_of rule (non-negotiable)
 
 For kickoff `K` and offset `O`:
@@ -169,8 +179,22 @@ transition, including re-entering a terminal state. Identity fields
 `claim_checkpoint(backend, record)` is the sole mechanism that decides
 whether a checkpoint may be executed:
 
-- **PostgreSQL**: a single `INSERT ... ON CONFLICT (run_id) DO NOTHING`,
-  atomic under concurrent transactions by construction.
+- **PostgreSQL**: a single `INSERT ... ON CONFLICT DO NOTHING`, atomic
+  under concurrent transactions by construction. No conflict target is
+  named: `prediction_runs` carries two unique constraints that are
+  logically equivalent for an identical record (the `run_id` primary key,
+  and `uq_prediction_runs_identity` — `run_id` is a deterministic hash of
+  exactly that identity tuple). An earlier revision named only
+  `(run_id)` as the arbiter, which left a genuine race under true
+  concurrent inserts of the identical row: one transaction could raise a
+  real `IntegrityError` on `uq_prediction_runs_identity` instead of being
+  silently absorbed. A real concurrency test (`ThreadPoolExecutor` +
+  `threading.Barrier`, separate connections, 2 and 8 competing workers,
+  against ephemeral PostgreSQL — see
+  `tests/orchestration/test_migration_postgres.py`) reproduced this and
+  confirmed the fix: a bare `ON CONFLICT DO NOTHING` suppresses a
+  violation of *any* unique/exclusion constraint on the table. Still a
+  pure PostgreSQL-native primitive — no application-level locking.
 - **Local (`Warehouse`)**: a deterministic check-then-insert, sufficient
   for single-process tests — not claimed to be production-safe under real
   multi-process concurrency (only PostgreSQL is required to be).
@@ -195,19 +219,50 @@ always stores `is_final_forecast=false`.
 
 ## Data manifest fingerprint
 
-`data_manifest_sha256` reuses the pre-existing PIT-lineage machinery
-(`nflprops.backtest.provenance.build_state_provenance_context`'s
-`state_snapshot_id`, itself already used inside `predict_week`) rather
-than inventing a second one — wrapped through the existing
-`nflprops.domain.hashing.hash_payload` SHA-256 utility for a genuine
-digest. **Granularity note**: this reflects everything visible
-warehouse-wide at `as_of` (games, player/team stats, rosters, injuries) —
-the same granularity `predict_week`/`predict_game` already build state
-from — not narrowly scoped to one game's rows. This is deliberately
-preserved rather than redesigned in Phase 5. It is computed once, before a
-checkpoint is claimed, from `scheduled_as_of` alone (independent of
-whether the target game is ultimately found), so it can be fixed forever
-at claim time.
+`data_manifest_sha256` (`nflprops.orchestration.manifest`) is a real,
+content-level fingerprint of the actual selected PIT input dataset for one
+`(game_id, scheduled_as_of)` checkpoint — not row counts/max-timestamps
+alone, and not a re-hash of `StateProvenanceContext.state_snapshot_id`
+(an earlier Phase-5 revision did exactly that; a read-only audit
+established it didn't cover market data or injury-feed-availability
+provenance, and this module replaced it).
+
+`build_checkpoint_manifest(warehouse, game_id=..., scheduled_as_of=...)`
+selects, for records eligible at `available_at <= scheduled_as_of` (or
+`collector_received_at <= scheduled_as_of` for `collector_resource_runs`,
+which has no `available_at` column) using the exact same
+`nflprops.features.asof.filter_pit(frame, as_of, strict=False)` primitive
+`predict_week`/`build_team_states`/`build_player_states` already use
+internally:
+
+- the target game's own selected schedule/state row
+- historical player-game and team-game stats, scoped to the two teams
+  actually playing in `game_id` (not every team in the warehouse)
+- roster rows for those two teams
+- injury rows for the players those scoped roster/stat rows reference
+- `collector_resource_runs` rows for the INJURIES resource type, plus the
+  derived `injury_feed_available` boolean itself (via the existing
+  `injury_feed_available_at`) — both are part of the hashed payload, not
+  just the boolean's downstream row count
+- game-odds and player-prop-quote rows for `game_id`
+- reference `players` rows for the players referenced above
+
+Each component records `row_count`, a `content_sha256` over every selected
+row's full column content (sorted by stable canonical keys first — row
+order in the source table, which depends on append history rather than
+content, never affects the hash), and `min`/`max` timestamps where
+applicable. The top-level `data_manifest_sha256` is
+`nflprops.domain.hashing.hash_payload` (sorted-key JSON, SHA-256, never
+Python's built-in `hash()`) over the full canonicalized component dict.
+
+This is a pure function of `(warehouse content, game_id, scheduled_as_of)`
+with no `now`/wall-clock dependency at all, so it is computed once before
+a checkpoint is claimed and is catch-up-safe by construction: an on-time
+run and a late-recovering worker computing the identical
+`(game_id, scheduled_as_of)` against unchanged warehouse content always
+produce the identical manifest. `config_sha256` (resolved config) and
+`source_sha256` (code fingerprint) remain separate, independent
+`prediction_runs` columns — this module represents data only.
 
 ## Retry policy: transient vs. deterministic (`orchestration.tasks`)
 

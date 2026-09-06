@@ -10,6 +10,8 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -105,74 +107,130 @@ def test_migration_0003_downgrade_removes_prediction_runs_only(postgres_dsn: str
         )
 
 
-def test_concurrent_claim_via_postgres_on_conflict_do_nothing(postgres_dsn: str) -> None:
+def _build_claim_record(*, game_id: str, checkpoint):
+    from nflprops.orchestration.run_store import (
+        PredictionRunRecord,
+        PredictionRunStatus,
+        PublicationStatus,
+        compute_run_id,
+    )
+
+    kickoff = datetime(2026, 9, 13, 20, 0, 0, tzinfo=UTC)
+    scheduled = kickoff - timedelta(hours=6)
+    run_id = compute_run_id(
+        game_id=game_id,
+        checkpoint_name=checkpoint,
+        scheduled_as_of=scheduled,
+        kickoff_at=kickoff,
+        model_version="2026.1.0",
+        config_sha256="cfg-sha",
+        source_sha256="src-sha",
+    )
+    return PredictionRunRecord(
+        run_id=run_id,
+        season=2026,
+        week=2,
+        game_id=game_id,
+        checkpoint_name=checkpoint.value,
+        scheduled_as_of=scheduled,
+        kickoff_at=kickoff,
+        flow_started_at=scheduled,
+        flow_completed_at=None,
+        status=PredictionRunStatus.SCHEDULED,
+        model_version="2026.1.0",
+        config_sha256="cfg-sha",
+        source_sha256="src-sha",
+        data_manifest_sha256="manifest-sha",
+        n_draws=20_000,
+        retained_joint_draws=0,
+        publication_status=PublicationStatus.NOT_PUBLISHED,
+        is_final_forecast=False,
+        fallback_from_checkpoint=None,
+        failure_code=None,
+        failure_detail=None,
+        created_at=scheduled,
+    )
+
+
+def _run_concurrent_claim(
+    postgres_dsn: str, *, game_id: str, n_workers: int
+) -> tuple[list[bool], int]:
+    """`n_workers` threads, each with the engine's own checked-out
+    connection (SQLAlchemy `Engine` is thread-safe; `Connection` objects
+    are not shared across threads here -- each `claim_checkpoint` call
+    opens its own via `engine.begin()`), all released simultaneously by a
+    `threading.Barrier` so they race to claim the exact same deterministic
+    `run_id` at effectively the same time. No application-level locking is
+    used anywhere in this path -- PostgreSQL's `ON CONFLICT DO NOTHING`
+    is the sole concurrency primitive under test.
+    """
+    from nflprops.data.storage.postgres import PostgresStorageBackend
+    from nflprops.orchestration.checkpoints import CheckpointName
+    from nflprops.orchestration.run_store import claim_checkpoint, runs_for_game
+
+    backend = PostgresStorageBackend(postgres_dsn)
+    try:
+        record = _build_claim_record(game_id=game_id, checkpoint=CheckpointName.T6H)
+        barrier = threading.Barrier(n_workers)
+        results: list[bool] = []
+        results_lock = threading.Lock()
+
+        def worker() -> None:
+            barrier.wait(timeout=30)
+            claimed = claim_checkpoint(backend, record)
+            with results_lock:
+                results.append(claimed)
+
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = [pool.submit(worker) for _ in range(n_workers)]
+            for future in futures:
+                future.result(timeout=60)
+
+        row_count = runs_for_game(backend, game_id=game_id).height
+        return results, row_count
+    finally:
+        backend.dispose()
+
+
+def test_true_concurrent_claim_two_competing_workers(postgres_dsn: str) -> None:
+    """§15: two genuinely competing threads, each with its own PostgreSQL
+    connection/transaction, synchronized via `threading.Barrier` to attempt
+    `claim_checkpoint(...)` for the identical deterministic `run_id` at
+    effectively the same instant -- not two sequential calls in one thread.
+    """
     env = {**os.environ, "DATABASE_URL": postgres_dsn}
     subprocess.run(
         [sys.executable, "-m", "alembic", "upgrade", "head"],
         cwd=REPO_ROOT, env=env, check=True, capture_output=True, text=True,
     )
 
-    from nflprops.data.storage.postgres import PostgresStorageBackend
-    from nflprops.orchestration.checkpoints import CheckpointName
-    from nflprops.orchestration.run_store import (
-        PredictionRunRecord,
-        PredictionRunStatus,
-        PublicationStatus,
-        claim_checkpoint,
-        compute_run_id,
-        runs_for_game,
+    results, row_count = _run_concurrent_claim(
+        postgres_dsn, game_id="pg-concurrent-2worker", n_workers=2
     )
 
-    backend = PostgresStorageBackend(postgres_dsn)
-    try:
-        kickoff = datetime(2026, 9, 13, 20, 0, 0, tzinfo=UTC)
-        scheduled = kickoff - timedelta(hours=6)
-        run_id = compute_run_id(
-            game_id="pg-concurrent-g1",
-            checkpoint_name=CheckpointName.T6H,
-            scheduled_as_of=scheduled,
-            kickoff_at=kickoff,
-            model_version="2026.1.0",
-            config_sha256="cfg-sha",
-            source_sha256="src-sha",
-        )
-        record = PredictionRunRecord(
-            run_id=run_id,
-            season=2026,
-            week=2,
-            game_id="pg-concurrent-g1",
-            checkpoint_name=CheckpointName.T6H.value,
-            scheduled_as_of=scheduled,
-            kickoff_at=kickoff,
-            flow_started_at=scheduled,
-            flow_completed_at=None,
-            status=PredictionRunStatus.SCHEDULED,
-            model_version="2026.1.0",
-            config_sha256="cfg-sha",
-            source_sha256="src-sha",
-            data_manifest_sha256="manifest-sha",
-            n_draws=20_000,
-            retained_joint_draws=0,
-            publication_status=PublicationStatus.NOT_PUBLISHED,
-            is_final_forecast=False,
-            fallback_from_checkpoint=None,
-            failure_code=None,
-            failure_detail=None,
-            created_at=scheduled,
-        )
+    successful = sum(1 for r in results if r)
+    rejected = sum(1 for r in results if not r)
+    assert successful == 1
+    assert rejected == 1
+    assert row_count == 1
 
-        # Two dispatchers racing to claim the identical run_id: the
-        # ON CONFLICT (run_id) DO NOTHING insert is atomic at the SQL
-        # statement level, so exactly one of these two calls performs the
-        # claim regardless of interleaving -- true multi-process concurrency
-        # is not required to demonstrate this, since the guarantee is a
-        # property of the single INSERT statement, not of test timing.
-        first = claim_checkpoint(backend, record)
-        second = claim_checkpoint(backend, record)
-        assert first is True
-        assert second is False
 
-        rows = runs_for_game(backend, game_id="pg-concurrent-g1")
-        assert rows.height == 1
-    finally:
-        backend.dispose()
+def test_true_concurrent_claim_eight_competing_workers(postgres_dsn: str) -> None:
+    """Stress case: 8 threads racing to claim the same run_id concurrently
+    -- exactly 1 succeeds, exactly 1 row ever exists, regardless of how
+    many competitors there were."""
+    env = {**os.environ, "DATABASE_URL": postgres_dsn}
+    subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        cwd=REPO_ROOT, env=env, check=True, capture_output=True, text=True,
+    )
+
+    results, row_count = _run_concurrent_claim(
+        postgres_dsn, game_id="pg-concurrent-8worker", n_workers=8
+    )
+
+    successful = sum(1 for r in results if r)
+    rejected = sum(1 for r in results if not r)
+    assert successful == 1
+    assert rejected == 7
+    assert row_count == 1

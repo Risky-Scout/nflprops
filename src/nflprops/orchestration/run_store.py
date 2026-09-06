@@ -244,10 +244,26 @@ def _claim_postgres(backend: StorageBackend, record: PredictionRunRecord) -> boo
     row = record.as_row()
     columns_sql = ", ".join(_INSERT_COLUMNS)
     params_sql = ", ".join(f":{c}" for c in _INSERT_COLUMNS)
+    # No conflict target: `prediction_runs` has TWO unique constraints that
+    # are logically equivalent for an identical record (the `run_id`
+    # primary key, and `uq_prediction_runs_identity` -- run_id is a
+    # deterministic hash of exactly that identity tuple, see
+    # compute_run_id). Naming only `(run_id)` as the arbiter, as an
+    # earlier version of this function did, left a genuine race: under
+    # true concurrent inserts of the identical row, one transaction can
+    # raise a real IntegrityError on `uq_prediction_runs_identity` instead
+    # of being silently absorbed, because ON CONFLICT (run_id) only
+    # suppresses conflicts on that one named constraint. A bare
+    # `ON CONFLICT DO NOTHING` (no target) suppresses a violation of
+    # *any* unique/exclusion constraint on the table -- confirmed by a
+    # real concurrent test (8 threads, `threading.Barrier`-synchronized,
+    # separate connections) against ephemeral PostgreSQL. Still a pure
+    # PostgreSQL-native concurrency primitive; no application-level
+    # locking is introduced.
     stmt = sa.text(
         f"INSERT INTO {PREDICTION_RUNS_TABLE} ({columns_sql}) "
         f"VALUES ({params_sql}) "
-        "ON CONFLICT (run_id) DO NOTHING "
+        "ON CONFLICT DO NOTHING "
         "RETURNING run_id"
     )
     with backend.engine.begin() as conn:
