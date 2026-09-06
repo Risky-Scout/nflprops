@@ -1,46 +1,42 @@
-"""Pregame prediction pipeline for the lean production baseline."""
+"""Pregame prediction pipeline for the lean production baseline.
+
+PHASE 6: the coherent per-game football simulation is decoupled from
+current-sportsbook-market pricing (see docs/SIMULATION_PRICING_ARCHITECTURE.md).
+`simulate_game_for_prediction()` builds state and runs `simulate_game()`
+exactly once per game -- it never sees a player-prop quote.
+`nflprops.market.current_pricing.price_current_markets()` maps every
+currently supported quote to that already-computed result. `predict_week()`
+orchestrates the two layers; its external behavior is unchanged.
+"""
 
 from __future__ import annotations
 
-import hashlib
+import dataclasses
 from collections.abc import Callable
 from datetime import datetime
 
 import polars as pl
 
 from nflprops.backtest.provenance import (
-    PredictionProvenance,
     StateProvenanceContext,
     assert_state_history_safe,
-    audit_prediction_inputs,
     build_state_provenance_context,
-    latest_entity_available_at,
 )
 from nflprops.data.warehouse import Warehouse
+from nflprops.domain.hashing import hash_payload
 from nflprops.market.consensus import game_market_consensus, latest_prop_quotes
-from nflprops.market.devig import proportional_two_sided
-from nflprops.market.odds import (
-    american_to_decimal,
-    expected_value,
-    implied_to_american,
-)
-from nflprops.market.odds import (
-    edge as probability_edge,
-)
-from nflprops.market.timing import (
-    latest_game_market_knowledge_time,
-    quote_knowledge_time,
-    quote_time_source,
-)
+from nflprops.market.current_pricing import prediction_id, price_current_markets
+from nflprops.market.timing import latest_game_market_knowledge_time
 from nflprops.simulation.game import (
     GameSimulationInput,
+    GameSimulationResult,
     SimulationConfig,
     TeamSimulationInput,
     simulate_game,
 )
-from nflprops.simulation.props import prop_confidence_tier, summarize_prop
-from nflprops.state.player import PlayerStateConfig, build_player_states
-from nflprops.state.team import TeamStateConfig, build_team_states
+from nflprops.simulation.results import validate_draw_alignment
+from nflprops.state.player import PlayerState, PlayerStateConfig, build_player_states
+from nflprops.state.team import TeamState, TeamStateConfig, build_team_states
 
 _CONFIG_MISSING = object()
 
@@ -105,11 +101,6 @@ def state_configs_from_app_config(cfg) -> tuple[PlayerStateConfig, TeamStateConf
         half_life_days=float(g("team_half_life_days")),
     )
     return player, team
-
-
-def _prediction_id(*parts: object) -> str:
-    blob = "|".join(str(x) for x in parts).encode()
-    return hashlib.blake2b(blob, digest_size=16).hexdigest()
 
 
 def _market_frames_for_mode(
@@ -182,148 +173,6 @@ def _implied_points(total: float | None, home_spread: float | None):
     )
 
 
-def _price_quote(
-    result,
-    quote: dict,
-    *,
-    market_mode: str,
-) -> list[dict]:
-    player_id = str(quote["canonical_player_id"])
-    prop_type = str(quote["prop_type"])
-    confidence_tier = prop_confidence_tier(prop_type)
-    if confidence_tier is None:
-        return []
-
-    line = float(quote["line_value"]) if quote.get("line_value") is not None else None
-    dist = summarize_prop(result, player_id, prop_type, line=line)
-
-    quote_at = quote_knowledge_time(
-        quote,
-        market_mode=market_mode,
-    )
-
-    if quote_at > result.as_of:
-        raise ValueError(
-            "selected quote is not yet knowable at prediction as_of"
-        )
-
-    base = {
-        "game_id": str(quote["canonical_game_id"]),
-        "player_id": player_id,
-        "prop_type": prop_type,
-        "confidence_tier": confidence_tier,
-        "vendor": str(quote["vendor"]),
-        "line": line,
-        "market_type": str(quote["market_type"]),
-        "quote_available_at": quote_at,
-        "quote_time_source": quote_time_source(market_mode),
-        "quote_age_seconds": (
-            result.as_of - quote_at
-        ).total_seconds(),
-        "quote_provider_updated_at": quote.get("provider_updated_at"),
-        "quote_opened_at": quote.get("opened_at"),
-        "quote_collector_received_at": quote.get("collector_received_at"),
-        "model_mean": dist.mean,
-        "model_median": dist.median,
-        "p05": dist.p05,
-        "p10": dist.p10,
-        "p25": dist.p25,
-        "p50": dist.p50,
-        "p75": dist.p75,
-        "p90": dist.p90,
-        "p95": dist.p95,
-        "n_draws": dist.n_draws,
-        "model_version": result.model_version,
-        "as_of": result.as_of,
-        # Deliberately blank until an OOF calibrator is fitted. Never label raw
-        # simulator probabilities "calibrated".
-        "p_model_calibrated": None,
-    }
-
-    market_type = str(quote["market_type"])
-    rows: list[dict] = []
-    if market_type == "over_under":
-        over_odds = quote.get("over_odds")
-        under_odds = quote.get("under_odds")
-        if over_odds is None or under_odds is None:
-            return []
-        fair = proportional_two_sided(int(over_odds), int(under_odds))
-        for side, p_model, p_push, odds, p_market in (
-            ("OVER", dist.p_over, dist.p_push, int(over_odds), fair.p_over),
-            ("UNDER", dist.p_under, dist.p_push, int(under_odds), fair.p_under),
-        ):
-            if p_model is None:
-                continue
-            decimal_odds = american_to_decimal(odds)
-            row = dict(base)
-            row.update(
-                {
-                    "side": side,
-                    "american_odds": odds,
-                    "p_model_raw": float(p_model),
-                    "p_push": float(p_push or 0.0),
-                    "p_market_fair": float(p_market),
-                    "edge": probability_edge(float(p_model), float(p_market)),
-                    "ev_per_unit": expected_value(
-                        float(p_model),
-                        decimal_odds,
-                        float(p_push or 0.0),
-                    ),
-                    "model_fair_american": (
-                        implied_to_american(float(p_model))
-                        if 0 < float(p_model) < 1
-                        else None
-                    ),
-                    "devig_method": fair.method.value,
-                    "devig_confidence": fair.confidence.value,
-                }
-            )
-            row["prediction_id"] = _prediction_id(
-                row["game_id"],
-                player_id,
-                prop_type,
-                row["vendor"],
-                side,
-                line,
-                result.as_of.isoformat(),
-                result.model_version,
-            )
-            rows.append(row)
-    else:
-        odds = quote.get("milestone_odds")
-        if odds is None or dist.p_hit is None:
-            return []
-        p = float(dist.p_hit)
-        row = dict(base)
-        row.update(
-            {
-                "side": "HIT",
-                "american_odds": int(odds),
-                "p_model_raw": p,
-                "p_push": 0.0,
-                # One-sided BDL milestone quote cannot be fully devigged alone.
-                "p_market_fair": None,
-                "edge": None,
-                "ev_per_unit": expected_value(p, american_to_decimal(int(odds)), 0.0),
-                "model_fair_american": (implied_to_american(p) if 0 < p < 1 else None),
-                "devig_method": None,
-                "devig_confidence": "one_sided_unbenchmarked",
-            }
-        )
-        row["prediction_id"] = _prediction_id(
-            row["game_id"],
-            player_id,
-            prop_type,
-            row["vendor"],
-            "HIT",
-            line,
-            result.as_of.isoformat(),
-            result.model_version,
-        )
-        rows.append(row)
-    return rows
-
-
 def _restrict_games(
     games: pl.DataFrame,
     game_ids: set[str] | None,
@@ -364,97 +213,135 @@ def _assert_state_history_safe_for_games(
         )
 
 
-def _audit_and_attach_prediction_provenance(
-    priced_rows: list[dict[str, object]],
+@dataclasses.dataclass(frozen=True)
+class PreparedGameSimulation:
+    """One coherent `GameSimulationResult` bundled with the minimal
+    prediction-run context `price_current_markets` needs alongside it
+    (PHASE 6). Not a second simulation-result type -- `result` is the
+    single canonical `nflprops.simulation.game.GameSimulationResult`,
+    reused unmodified; `game`/`game_market_available_at` are prediction-run
+    provenance, not simulation content.
+
+    `simulation_input_sha256` fingerprints exactly the football-simulation
+    inputs (`GameSimulationInput`'s full content: game_id, team/opponent
+    state, player state, market-derived implied points/spread, as_of,
+    model_version) -- it never includes player-prop lines/prices/vendors,
+    since `GameSimulationInput` never carries them. Two calls with
+    identical state/config/as_of produce the identical fingerprint
+    regardless of what quotes exist (§18).
+    """
+
+    game: dict[str, object]
+    result: GameSimulationResult
+    game_market_available_at: datetime | None
+    simulation_input_sha256: str
+
+
+def simulate_game_for_prediction(
     *,
-    quote: dict[str, object],
     game: dict[str, object],
-    season: int,
-    week: int,
+    team_states: dict[str, TeamState],
+    player_states: dict[str, PlayerState],
+    game_odds: pl.DataFrame,
     as_of: datetime,
-    state_context: StateProvenanceContext,
-    roster: pl.DataFrame,
-    injuries: pl.DataFrame,
-    game_market_available_at: datetime | None,
+    model_version: str,
     market_mode: str,
-) -> list[dict[str, object]]:
-    """Audit priced rows and append provenance without changing forecasts."""
+    simulation_config: SimulationConfig | None,
+    n_draws: int,
+) -> PreparedGameSimulation | None:
+    """Build one coherent `GameSimulationResult` for `game` (PHASE 6 §4).
 
+    Knows nothing about individual sportsbook player-prop quotes -- no
+    quote/vendor/line/price parameter exists on this function, and none is
+    read from anywhere inside it. `game_odds` is the pre-existing,
+    legitimate GAME-LEVEL market input (spread/total consensus, already
+    fed into `GameSimulationInput.implied_points`/`team_spread` before
+    Phase 6); it is architecturally and conceptually distinct from
+    per-player prop quotes and is preserved exactly (§16).
+
+    Returns `None` when either team's structural state isn't yet
+    trustworthy (the pre-existing expansion/new-provider skip behavior,
+    unchanged) -- the caller must treat that exactly as `predict_week`
+    always has (skip the game, produce no rows for it).
+    """
     game_id = str(game["canonical_game_id"])
-    player_id = str(quote["canonical_player_id"])
-    prop_type = str(quote["prop_type"])
+    home_id = str(game["home_canonical_team_id"])
+    away_id = str(game["visitor_canonical_team_id"])
+    if home_id not in team_states or away_id not in team_states:
+        # Expansion/new-provider edge case: no team history means the structural
+        # state is not yet trustworthy enough to publish a prop forecast.
+        return None
 
-    roster_available_at = latest_entity_available_at(
-        roster,
+    game_market_available_at = latest_game_market_knowledge_time(
+        game_odds,
         as_of=as_of,
-        entity_column="canonical_player_id",
-        entity_id=player_id,
+        game_id=game_id,
+        market_mode=market_mode,
     )
 
-    injury_available_at = latest_entity_available_at(
-        injuries,
+    market = game_market_consensus(
+        game_odds,
+        game_id,
         as_of=as_of,
-        entity_column="canonical_player_id",
-        entity_id=player_id,
+    )
+    home_points, away_points = _implied_points(
+        market.total,
+        market.home_spread,
+    )
+    home_spread = market.home_spread or 0.0
+
+    home_players = tuple(p for p in player_states.values() if p.team_id == home_id)
+    away_players = tuple(p for p in player_states.values() if p.team_id == away_id)
+
+    sim_input = GameSimulationInput(
+        game_id=game_id,
+        home=TeamSimulationInput(
+            team_id=home_id,
+            state=team_states[home_id],
+            opponent_state=team_states[away_id],
+            players=home_players,
+            implied_points=home_points,
+            team_spread=home_spread,
+        ),
+        away=TeamSimulationInput(
+            team_id=away_id,
+            state=team_states[away_id],
+            opponent_state=team_states[home_id],
+            players=away_players,
+            implied_points=away_points,
+            team_spread=-home_spread,
+        ),
+        model_version=model_version,
+        as_of=as_of,
+    )
+    cfg = simulation_config or SimulationConfig(n_draws=n_draws)
+    if cfg.n_draws != n_draws:
+        cfg = SimulationConfig(**{**cfg.__dict__, "n_draws": n_draws})
+
+    result = simulate_game(sim_input, cfg)
+    validate_draw_alignment(result)
+
+    # `player_states.values()` iteration order is not itself part of the
+    # reproducibility contract -- `simulate_game._ensure_players` already
+    # re-sorts by `player_id` internally for exactly this reason (see its
+    # docstring). The fingerprint must apply the same canonical ordering,
+    # or it would vary run-to-run for byte-identical underlying state
+    # despite the actual simulation being fully order-invariant.
+    input_payload = dataclasses.asdict(sim_input)
+    input_payload["as_of"] = as_of.isoformat()
+    for side in ("home", "away"):
+        input_payload[side]["players"] = sorted(
+            input_payload[side]["players"], key=lambda p: p["player_id"]
+        )
+    simulation_input_sha256 = hash_payload(input_payload)
+
+    return PreparedGameSimulation(
+        game=game,
+        result=result,
+        game_market_available_at=game_market_available_at,
+        simulation_input_sha256=simulation_input_sha256,
     )
 
-    audited: list[dict[str, object]] = []
-
-    for priced_row in priced_rows:
-        provenance: PredictionProvenance = audit_prediction_inputs(
-            prediction_id=str(priced_row["prediction_id"]),
-            as_of=as_of,
-            season=season,
-            week=week,
-            game_id=game_id,
-            player_id=player_id,
-            prop_type=prop_type,
-            state_context=state_context,
-            game_available_at=game.get("available_at"),
-            quote_available_at=quote_knowledge_time(
-                quote,
-                market_mode=market_mode,
-            ),
-            roster_available_at=roster_available_at,
-            injury_available_at=injury_available_at,
-            game_market_available_at=game_market_available_at,
-            market_mode=market_mode,
-        )
-
-        audit_columns = provenance.as_columns()
-
-        audit_columns.update(
-            {
-                "canonical_game_id": game_id,
-                "canonical_player_id": player_id,
-                "game_available_at": game.get("available_at"),
-                "roster_available_at": roster_available_at,
-                "game_market_available_at": (
-                    game_market_available_at
-                ),
-                "state_source_max_available_at": (
-                    state_context.max_source_available_at
-                ),
-            }
-        )
-
-        collisions = (
-            set(priced_row)
-            & set(audit_columns)
-        )
-
-        if collisions:
-            raise ValueError(
-                "prediction provenance would overwrite existing "
-                "columns: "
-                + ", ".join(sorted(collisions))
-            )
-
-        enriched = dict(priced_row)
-        enriched.update(audit_columns)
-        audited.append(enriched)
-
-    return audited
 
 def predict_week(
     warehouse: Warehouse,
@@ -558,101 +445,51 @@ def predict_week(
     prediction_rows: list[dict] = []
 
     for game in current_games.iter_rows(named=True):
-        game_id = str(game["canonical_game_id"])
-        home_id = str(game["home_canonical_team_id"])
-        away_id = str(game["visitor_canonical_team_id"])
-        if home_id not in team_states or away_id not in team_states:
-            # Expansion/new-provider edge case: no team history means the structural
-            # state is not yet trustworthy enough to publish a prop forecast.
-            continue
-
-        game_market_available_at = (
-            latest_game_market_knowledge_time(
-                game_odds,
-                as_of=as_of,
-                game_id=game_id,
-                market_mode=market_mode,
-            )
-        )
-
-        market = game_market_consensus(
-            game_odds,
-            game_id,
+        # PHASE 6: exactly one coherent football simulation per game, built
+        # with zero knowledge of player-prop quotes. `prepared` stays
+        # available even for a game with zero posted quotes -- pricing
+        # never gates whether the simulation itself happens.
+        prepared = simulate_game_for_prediction(
+            game=game,
+            team_states=team_states,
+            player_states=player_states,
+            game_odds=game_odds,
             as_of=as_of,
-        )
-        home_points, away_points = _implied_points(
-            market.total,
-            market.home_spread,
-        )
-        home_spread = market.home_spread or 0.0
-
-        home_players = tuple(p for p in player_states.values() if p.team_id == home_id)
-        away_players = tuple(p for p in player_states.values() if p.team_id == away_id)
-
-        sim_input = GameSimulationInput(
-            game_id=game_id,
-            home=TeamSimulationInput(
-                team_id=home_id,
-                state=team_states[home_id],
-                opponent_state=team_states[away_id],
-                players=home_players,
-                implied_points=home_points,
-                team_spread=home_spread,
-            ),
-            away=TeamSimulationInput(
-                team_id=away_id,
-                state=team_states[away_id],
-                opponent_state=team_states[home_id],
-                players=away_players,
-                implied_points=away_points,
-                team_spread=-home_spread,
-            ),
             model_version=model_version,
-            as_of=as_of,
+            market_mode=market_mode,
+            simulation_config=simulation_config,
+            n_draws=n_draws,
         )
-        cfg = simulation_config or SimulationConfig(n_draws=n_draws)
-        if cfg.n_draws != n_draws:
-            cfg = SimulationConfig(**{**cfg.__dict__, "n_draws": n_draws})
-        result = simulate_game(sim_input, cfg)
+        if prepared is None:
+            continue
+        result = prepared.result
+        game_id = result.game_id
 
-        quotes = latest_quotes.filter(pl.col("canonical_game_id") == game_id)
-        simulated_ids = set(result.player_draws["player_id"].unique().to_list())
-        for quote in quotes.iter_rows(named=True):
-            if str(quote["canonical_player_id"]) not in simulated_ids:
-                continue
-            # Tier 3 markets remain derivable for research but are gated from the
-            # default publication path until PBP labels/reconciliation are HIGH.
-            confidence_tier = prop_confidence_tier(str(quote["prop_type"]))
-            if confidence_tier is None or confidence_tier > max_confidence_tier:
-                continue
-            priced_rows = _price_quote(
+        # PHASE 6: pricing is a pure downstream read of `result` -- it never
+        # calls simulate_game_for_prediction/simulate_game, never creates an
+        # RNG, never resamples. Every currently supported quote for this
+        # game prices from these exact same draws.
+        prediction_rows.extend(
+            price_current_markets(
+                prepared.game,
                 result,
-                quote,
+                latest_quotes,
+                season=season,
+                week=week,
+                as_of=as_of,
+                state_context=state_context,
+                roster=roster,
+                injuries=injuries,
+                game_market_available_at=prepared.game_market_available_at,
                 market_mode=market_mode,
+                max_confidence_tier=max_confidence_tier,
             )
-
-            prediction_rows.extend(
-                _audit_and_attach_prediction_provenance(
-                    priced_rows,
-                    quote=quote,
-                    game=game,
-                    season=season,
-                    week=week,
-                    as_of=as_of,
-                    state_context=state_context,
-                    roster=roster,
-                    injuries=injuries,
-                    game_market_available_at=(
-                        game_market_available_at
-                    ),
-                    market_mode=market_mode,
-                )
-            )
+        )
 
         if persist and retain_joint_draws > 0:
             keep = min(retain_joint_draws, result.n_draws)
             joint = result.real_player_draws().filter(pl.col("draw_id") < keep)
-            run_id = _prediction_id(game_id, as_of.isoformat(), model_version)
+            run_id = prediction_id(game_id, as_of.isoformat(), model_version)
             joint = joint.with_columns(pl.lit(run_id).alias("run_id"))
             warehouse.append(
                 "simulation_player_results",

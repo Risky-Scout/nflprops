@@ -9,10 +9,14 @@ from nflprops.backtest.provenance import (
     StateGameMeta,
     StateProvenanceContext,
 )
+from nflprops.market.current_pricing import (
+    _audit_and_attach_prediction_provenance,
+    price_current_markets,
+)
 from nflprops.pipelines.pregame import (
     _assert_state_history_safe_for_games,
-    _audit_and_attach_prediction_provenance,
     predict_week,
+    simulate_game_for_prediction,
 )
 
 AS_OF = datetime(2025, 9, 10, 12, tzinfo=UTC)
@@ -282,28 +286,44 @@ def test_target_game_in_state_history_fails_closed() -> None:
 
 
 def test_state_history_guard_precedes_state_build_and_simulation() -> None:
-    source = inspect.getsource(predict_week)
+    """PHASE 6: `simulate_game(` no longer appears directly inside
+    `predict_week` -- it moved into `simulate_game_for_prediction`
+    (see docs/SIMULATION_PRICING_ARCHITECTURE.md). The original invariant
+    (history guard -> state build -> simulation) still holds, just split
+    across two call boundaries: within `predict_week`, the guard precedes
+    state build precedes the call into `simulate_game_for_prediction`;
+    within `simulate_game_for_prediction` itself, the coherent simulation
+    call is still present."""
+    week_source = inspect.getsource(predict_week)
 
-    history_guard = source.index(
-        "_assert_state_history_safe_for_games("
-    )
-    state_build = source.index("build_team_states(")
-    simulation = source.index("simulate_game(")
+    history_guard = week_source.index("_assert_state_history_safe_for_games(")
+    state_build = week_source.index("build_team_states(")
+    simulation_call = week_source.index("simulate_game_for_prediction(")
 
-    assert history_guard < state_build < simulation
+    assert history_guard < state_build < simulation_call
+
+    boundary_source = inspect.getsource(simulate_game_for_prediction)
+    assert "simulate_game(" in boundary_source
 
 
 def test_prediction_audit_precedes_persistence() -> None:
-    source = inspect.getsource(predict_week)
+    """PHASE 6: `_audit_and_attach_prediction_provenance(` no longer
+    appears directly inside `predict_week` -- it moved into
+    `price_current_markets` (`nflprops.market.current_pricing`), the
+    pricing boundary `predict_week` now calls. Within `predict_week`, the
+    pricing call still precedes persistence; within `price_current_markets`
+    itself, the audit/provenance attachment is still present."""
+    week_source = inspect.getsource(predict_week)
 
-    audit = source.index(
-        "_audit_and_attach_prediction_provenance("
-    )
-    persistence = source.index(
+    pricing_call = week_source.index("price_current_markets(")
+    persistence = week_source.index(
         'warehouse.append(\n            "predictions"'
     )
 
-    assert audit < persistence
+    assert pricing_call < persistence
+
+    pricing_source = inspect.getsource(price_current_markets)
+    assert "_audit_and_attach_prediction_provenance(" in pricing_source
 
 def test_live_future_collector_receipt_fails_provenance_even_if_provider_time_is_old() -> None:
     priced_rows = [
