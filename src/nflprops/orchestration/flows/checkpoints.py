@@ -1,5 +1,5 @@
 """Prefect flows for official game-relative pregame checkpoints
-(PHASE 5, §28-§32).
+(PHASE 5, §28-§32; PHASE 7D projection integration).
 
 `checkpoint_dispatch_flow` finds every due-and-unclaimed official
 checkpoint across the scheduled games in (season, week), atomically claims
@@ -7,18 +7,24 @@ each one, and runs one isolated `game_checkpoint_flow` per claim -- one
 game's failure never aborts another's, and a checkpoint already claimed
 (by this or a concurrent dispatcher) is never executed twice.
 
-Neither flow reimplements prediction math: `game_checkpoint_flow` calls
-the pre-existing `nflprops.pipelines.pregame.predict_game` (itself a thin
-wrapper over `predict_week`) with `as_of=scheduled_as_of` -- never `now`.
+Neither flow reimplements prediction math. `game_checkpoint_flow` calls
+`nflprops.pipelines.pregame.compute_game_prediction` with
+`as_of=scheduled_as_of` (never `now`) to obtain the ONE coherent
+`GameSimulationResult` for the game/checkpoint, then -- from that single
+simulation -- builds, validates, and immutably persists the
+sportsbook-independent `player_game_projections` product (PHASE 7B/7C)
+*before* it prices and persists current sportsbook markets from the exact
+same result. Exactly one football simulation per game/checkpoint; the
+projection artifact is never conditioned on pricing success (PHASE 7D
+§3/§7/§11).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-import polars as pl
 from prefect import flow, task
 
 from nflprops.backtest.leakage import LeakageError as BacktestLeakageError
@@ -40,6 +46,7 @@ from nflprops.orchestration.checkpoints import (
     scheduled_as_of as compute_scheduled_as_of,
 )
 from nflprops.orchestration.manifest import compute_data_manifest_sha256
+from nflprops.orchestration.projection_store import persist_player_game_projections
 from nflprops.orchestration.run_store import (
     FAILURE_CHECKPOINT_MISSED,
     PredictionRunRecord,
@@ -55,7 +62,13 @@ from nflprops.orchestration.tasks import (
     TRANSIENT_RETRY_DELAY_SECONDS,
     retry_condition_fn,
 )
-from nflprops.pipelines.pregame import _latest_games_asof, predict_game
+from nflprops.pipelines.pregame import (
+    _latest_games_asof,
+    compute_game_prediction,
+    persist_current_pricing,
+)
+from nflprops.projections import build_player_game_projections, eligible_player_states
+from nflprops.projections.stats import REGISTRY_SIZE
 
 if TYPE_CHECKING:
     from nflprops.simulation.game import SimulationConfig
@@ -95,21 +108,61 @@ def _classify_exception(exc: BaseException) -> tuple[str, str]:
     return "PREDICTION_ERROR", str(exc)[:500]
 
 
+@dataclass(frozen=True)
+class _CheckpointExecution:
+    """Outcome of one official checkpoint's model execution (PHASE 7D).
+
+    `game_modeled` is False when no coherent simulation was produced (no
+    PIT-visible game, or a team whose structural state is not yet
+    trustworthy) -- the pre-Phase-7D empty-but-valid outcome. Otherwise the
+    `player_game_projections` product was built, validated as exactly
+    `eligible_players * 30` rows, and immutably persisted BEFORE the
+    pricing fields below were set. `pricing_failed` distinguishes a genuine
+    downstream pricing exception (run -> PARTIAL, projections preserved)
+    from an ordinary zero-quote result (`priced_row_count == 0`, run ->
+    MODEL_ONLY)."""
+
+    game_modeled: bool
+    eligible_players: int
+    projection_rows_persisted: int
+    priced_row_count: int
+    pricing_failed: bool
+    pricing_failure_code: str | None
+    pricing_failure_detail: str | None
+
+
 @task(
     name="run-game-checkpoint",
     retries=TRANSIENT_RETRIES,
     retry_delay_seconds=TRANSIENT_RETRY_DELAY_SECONDS,
     retry_condition_fn=retry_condition_fn,
 )
-def _run_game_checkpoint_task(ctx: CheckpointRunContext, *, on_state_context) -> pl.DataFrame:
-    """One attempt at the official prediction itself. A Prefect retry of
-    this task (transient failures only, per §31/§32) calls `predict_game`
-    again with the exact same `ctx` -- same `run_id`, same
-    `scheduled_as_of` -- so it can never create a second official
-    identity (§16); persistence is idempotent via `predictions`' existing
-    `prediction_id` natural key.
+def _run_game_checkpoint_task(
+    ctx: CheckpointRunContext, *, on_state_context
+) -> _CheckpointExecution:
+    """One attempt at the official model execution for a claimed checkpoint.
+
+    A Prefect retry of this task (transient failures only, per §31/§32)
+    re-invokes it with the exact same `ctx` -- same `run_id`, same
+    `scheduled_as_of` -- so it can never create a second official identity
+    (§16). Every persistence step is idempotent: `player_game_projections`
+    by identical-scientific-output no-op (PHASE 7C), `predictions` /
+    `simulation_player_results` by their existing natural keys.
+
+    Order (PHASE 7D §3/§7/§10/§11/§22/§23):
+
+    1. `compute_game_prediction` -> the ONE coherent `GameSimulationResult`
+       (as of `scheduled_as_of`), plus the pre-simulation player states.
+    2. From that single result: build the 30-stat projection product,
+       assert it is exactly `E * 30` rows, and immutably persist it. Any
+       failure here propagates (deterministic -> non-retryable -> the flow
+       maps it to FAILED); pricing is never reached.
+    3. Only then: price current sportsbook markets from the SAME result and
+       persist them. A genuine exception here is caught and returned as
+       `pricing_failed` (the flow maps it to PARTIAL) -- the already-
+       persisted projection artifact is never rolled back.
     """
-    return predict_game(
+    computation = compute_game_prediction(
         ctx.warehouse,
         season=ctx.season,
         week=ctx.week,
@@ -117,16 +170,80 @@ def _run_game_checkpoint_task(ctx: CheckpointRunContext, *, on_state_context) ->
         as_of=ctx.scheduled_as_of,
         model_version=ctx.model_version,
         n_draws=ctx.n_draws,
-        retain_joint_draws=ctx.retain_joint_draws,
         simulation_config=ctx.simulation_config,
         player_state_config=ctx.player_state_config,
         team_state_config=ctx.team_state_config,
         max_confidence_tier=ctx.max_confidence_tier,
         market_mode=ctx.market_mode,
-        persist=True,
-        official_run_id=ctx.run_id,
-        checkpoint_name=ctx.checkpoint.value,
         state_context_callback=on_state_context,
+    )
+    if computation is None:
+        return _CheckpointExecution(
+            game_modeled=False,
+            eligible_players=0,
+            projection_rows_persisted=0,
+            priced_row_count=0,
+            pricing_failed=False,
+            pricing_failure_code=None,
+            pricing_failure_detail=None,
+        )
+
+    simulation = computation.simulation
+    eligible = eligible_player_states(simulation, computation.player_states)
+    projections = build_player_game_projections(
+        simulation, player_states=computation.player_states
+    )
+    expected_rows = len(eligible) * REGISTRY_SIZE
+    if projections.height != expected_rows:
+        # §22: a supposedly successful build that is not exactly E*30 must
+        # fail before pricing -- never silently publish an incomplete
+        # player projection product.
+        raise AssertionError(
+            f"official checkpoint projection build produced {projections.height} "
+            f"rows; expected E*30 = {expected_rows} (E={len(eligible)} eligible "
+            "players). Refusing to price or publish an incomplete projection product."
+        )
+
+    persist_player_game_projections(
+        ctx.warehouse,
+        projections,
+        run_id=ctx.run_id,
+        season=ctx.season,
+        week=ctx.week,
+        created_at=datetime.now(UTC),
+    )
+
+    try:
+        priced = computation.price_markets()
+        persist_current_pricing(
+            ctx.warehouse,
+            computation,
+            priced,
+            official_run_id=ctx.run_id,
+            checkpoint_name=ctx.checkpoint.value,
+            retain_joint_draws=ctx.retain_joint_draws,
+            model_version=ctx.model_version,
+        )
+    except Exception as exc:
+        code, detail = _classify_exception(exc)
+        return _CheckpointExecution(
+            game_modeled=True,
+            eligible_players=len(eligible),
+            projection_rows_persisted=projections.height,
+            priced_row_count=0,
+            pricing_failed=True,
+            pricing_failure_code=code,
+            pricing_failure_detail=detail,
+        )
+
+    return _CheckpointExecution(
+        game_modeled=True,
+        eligible_players=len(eligible),
+        projection_rows_persisted=projections.height,
+        priced_row_count=len(priced),
+        pricing_failed=False,
+        pricing_failure_code=None,
+        pricing_failure_detail=None,
     )
 
 
@@ -139,13 +256,29 @@ def _run_game_checkpoint_task(ctx: CheckpointRunContext, *, on_state_context) ->
 # directly, in-process, by them.
 @flow(name="game-checkpoint", validate_parameters=False)
 def game_checkpoint_flow(ctx: CheckpointRunContext, *, now: datetime) -> PredictionRunRecord:
-    """§29/§30: run exactly one already-claimed official checkpoint.
+    """§29/§30 + PHASE 7D §7-§12: run exactly one already-claimed official
+    checkpoint.
 
-    Never raises: every outcome -- success, empty-but-valid, PIT/invariant
-    failure, unexpected error, or "no such game as of this cutoff" -- is
-    turned into a terminal `prediction_runs` status/publication_status/
-    failure_code combination (§8/§9) and returned. This is what makes
-    per-game isolation (§30) possible in the dispatcher's loop.
+    Never raises: every outcome is turned into a terminal `prediction_runs`
+    status/publication_status/failure_code combination and returned, which
+    is what makes per-game isolation (§30) possible in the dispatcher loop.
+
+    Terminal mapping:
+
+    * unexpected/deterministic error before projections are persisted
+      (simulation, projection build/validation/provenance/persistence) ->
+      FAILED / NOT_PUBLISHED. There is no Phase-5 data-gate machinery in
+      this flow that remaps such a failure to DATA_HOLD, so FAILED is the
+      default (§10).
+    * no PIT-visible game at all -> FAILED / GAME_NOT_FOUND (unchanged).
+    * state built but neither team trustworthy enough to simulate ->
+      SUCCESS / MODEL_ONLY, exactly as before Phase 7D (no artifact).
+    * projections persisted, then a genuine pricing exception ->
+      PARTIAL / NOT_PUBLISHED; the projection artifact is preserved (§11).
+    * projections persisted, pricing produced zero rows normally ->
+      SUCCESS / MODEL_ONLY (§8/§12).
+    * projections persisted, pricing produced rows -> SUCCESS / PUBLISHED
+      (unchanged publication semantics, §9).
     """
     update_run_status(ctx.warehouse, ctx.run_id, status=PredictionRunStatus.RUNNING)
 
@@ -155,7 +288,7 @@ def game_checkpoint_flow(ctx: CheckpointRunContext, *, now: datetime) -> Predict
         captured["state_snapshot_id"] = state_context.state_snapshot_id
 
     try:
-        predictions = _run_game_checkpoint_task(ctx, on_state_context=_capture)
+        execution = _run_game_checkpoint_task(ctx, on_state_context=_capture)
     except Exception as exc:
         failure_code, failure_detail = _classify_exception(exc)
         return update_run_status(
@@ -169,8 +302,8 @@ def game_checkpoint_flow(ctx: CheckpointRunContext, *, now: datetime) -> Predict
         )
 
     if not captured:
-        # predict_game found no PIT-visible game for (game_id, scheduled_as_of)
-        # -- state was never built, so the callback never fired (§22 finding H).
+        # No PIT-visible game for (game_id, scheduled_as_of): state was
+        # never built, so the callback never fired (§22 finding H).
         return update_run_status(
             ctx.warehouse,
             ctx.run_id,
@@ -184,8 +317,37 @@ def game_checkpoint_flow(ctx: CheckpointRunContext, *, now: datetime) -> Predict
             flow_completed_at=now,
         )
 
+    if not execution.game_modeled:
+        # State built, but neither team's structural state is trustworthy
+        # enough to simulate (expansion / brand-new provider). Exactly the
+        # pre-Phase-7D empty-but-valid outcome: SUCCESS / MODEL_ONLY, with
+        # no projection or pricing artifact.
+        return update_run_status(
+            ctx.warehouse,
+            ctx.run_id,
+            status=PredictionRunStatus.SUCCESS,
+            publication_status=PublicationStatus.MODEL_ONLY,
+            flow_completed_at=now,
+        )
+
+    if execution.pricing_failed:
+        # §11/§12: projections were built, validated as E*30, and immutably
+        # persisted; current-market pricing then raised. The projection
+        # artifact stays; the run is PARTIAL / NOT_PUBLISHED.
+        return update_run_status(
+            ctx.warehouse,
+            ctx.run_id,
+            status=PredictionRunStatus.PARTIAL,
+            publication_status=PublicationStatus.NOT_PUBLISHED,
+            failure_code=execution.pricing_failure_code,
+            failure_detail=execution.pricing_failure_detail,
+            flow_completed_at=now,
+        )
+
     publication_status = (
-        PublicationStatus.MODEL_ONLY if predictions.is_empty() else PublicationStatus.PUBLISHED
+        PublicationStatus.MODEL_ONLY
+        if execution.priced_row_count == 0
+        else PublicationStatus.PUBLISHED
     )
     return update_run_status(
         ctx.warehouse,

@@ -121,7 +121,9 @@ def test_post_kickoff_discovery_is_checkpoint_missed_without_executing_predictio
         called["n"] += 1
         raise AssertionError("must never be called for a post-kickoff checkpoint")
 
-    monkeypatch.setattr(checkpoints_flow, "predict_game", _spy)
+    # PHASE 7D: the flow now enters the model path via `compute_game_prediction`
+    # (which yields the single shared GameSimulationResult), not `predict_game`.
+    monkeypatch.setattr(checkpoints_flow, "compute_game_prediction", _spy)
 
     now = datetime(2026, 9, 13, 20, 1, 0, tzinfo=UTC)  # T30M never claimed, kickoff has passed
     results = checkpoint_dispatch_flow(
@@ -165,16 +167,19 @@ def test_game_level_isolation_one_failure_does_not_abort_others(
         ),
     )
 
-    real_predict_game = checkpoints_flow.predict_game
+    real_compute_game_prediction = checkpoints_flow.compute_game_prediction
 
     def _flaky(warehouse, *, season, week, game_id, as_of, **kwargs):
         if game_id == "gB":
             raise AssertionError("INV001 failed")
-        return real_predict_game(
+        return real_compute_game_prediction(
             warehouse, season=season, week=week, game_id=game_id, as_of=as_of, **kwargs
         )
 
-    monkeypatch.setattr(checkpoints_flow, "predict_game", _flaky)
+    # PHASE 7D: isolate a failure at the single-simulation compute boundary
+    # the flow now uses; gA / gC must still each reach their own terminal
+    # SUCCESS independently.
+    monkeypatch.setattr(checkpoints_flow, "compute_game_prediction", _flaky)
 
     now = kickoff - timedelta(minutes=90)  # T90M due for all three
     results = checkpoint_dispatch_flow(

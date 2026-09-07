@@ -15,6 +15,8 @@ from nflprops.market.current_pricing import (
 )
 from nflprops.pipelines.pregame import (
     _assert_state_history_safe_for_games,
+    _persist_prediction_rows,
+    _prepare_prediction_inputs,
     predict_week,
     simulate_game_for_prediction,
 )
@@ -286,41 +288,52 @@ def test_target_game_in_state_history_fails_closed() -> None:
 
 
 def test_state_history_guard_precedes_state_build_and_simulation() -> None:
-    """PHASE 6: `simulate_game(` no longer appears directly inside
-    `predict_week` -- it moved into `simulate_game_for_prediction`
-    (see docs/SIMULATION_PRICING_ARCHITECTURE.md). The original invariant
-    (history guard -> state build -> simulation) still holds, just split
-    across two call boundaries: within `predict_week`, the guard precedes
-    state build precedes the call into `simulate_game_for_prediction`;
-    within `simulate_game_for_prediction` itself, the coherent simulation
-    call is still present."""
+    """PHASE 6/7D: the invariant (history guard -> state build ->
+    simulation) still holds, now split across three call boundaries.
+
+    * PHASE 7D: the point-in-time input prologue -- including the history
+      guard and `build_team_states(` -- moved out of `predict_week` into
+      `_prepare_prediction_inputs`, so the official checkpoint path can
+      reuse the identical inputs without a second pipeline. Within
+      `_prepare_prediction_inputs`, the guard still precedes state build.
+    * Within `predict_week`, `_prepare_prediction_inputs(` precedes the
+      call into `simulate_game_for_prediction(`.
+    * Within `simulate_game_for_prediction` (PHASE 6), the coherent
+      `simulate_game(` call is still present.
+    """
+    inputs_source = inspect.getsource(_prepare_prediction_inputs)
+    history_guard = inputs_source.index("_assert_state_history_safe_for_games(")
+    state_build = inputs_source.index("build_team_states(")
+    assert history_guard < state_build
+
     week_source = inspect.getsource(predict_week)
-
-    history_guard = week_source.index("_assert_state_history_safe_for_games(")
-    state_build = week_source.index("build_team_states(")
+    prepare_inputs = week_source.index("_prepare_prediction_inputs(")
     simulation_call = week_source.index("simulate_game_for_prediction(")
-
-    assert history_guard < state_build < simulation_call
+    assert prepare_inputs < simulation_call
 
     boundary_source = inspect.getsource(simulate_game_for_prediction)
     assert "simulate_game(" in boundary_source
 
 
 def test_prediction_audit_precedes_persistence() -> None:
-    """PHASE 6: `_audit_and_attach_prediction_provenance(` no longer
-    appears directly inside `predict_week` -- it moved into
-    `price_current_markets` (`nflprops.market.current_pricing`), the
-    pricing boundary `predict_week` now calls. Within `predict_week`, the
-    pricing call still precedes persistence; within `price_current_markets`
-    itself, the audit/provenance attachment is still present."""
+    """PHASE 6/7D: within `predict_week`, the pricing call
+    (`price_current_markets(`) still precedes prediction persistence.
+
+    * PHASE 7D: the `predictions` append moved out of `predict_week` into
+      `_persist_prediction_rows`; `predict_week` calls
+      `_persist_prediction_rows(` after `price_current_markets(`, and that
+      helper is the sole place the `predictions` table is appended.
+    * PHASE 6: `_audit_and_attach_prediction_provenance(` still lives
+      inside `price_current_markets` (`nflprops.market.current_pricing`).
+    """
     week_source = inspect.getsource(predict_week)
-
     pricing_call = week_source.index("price_current_markets(")
-    persistence = week_source.index(
-        'warehouse.append(\n            "predictions"'
-    )
-
+    persistence = week_source.index("_persist_prediction_rows(")
     assert pricing_call < persistence
+
+    persist_source = inspect.getsource(_persist_prediction_rows)
+    assert 'warehouse.append(' in persist_source
+    assert '"predictions"' in persist_source
 
     pricing_source = inspect.getsource(price_current_markets)
     assert "_audit_and_attach_prediction_provenance(" in pricing_source

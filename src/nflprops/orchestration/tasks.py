@@ -21,12 +21,21 @@ from __future__ import annotations
 
 from nflprops.backtest.leakage import LeakageError as BacktestLeakageError
 from nflprops.errors import LeakageError as CoreLeakageError
+from nflprops.errors import ProjectionError
 
 # Exception types that represent a deterministic, input/model-derived
 # failure -- retrying changes nothing. Never retry these.
+#
+# `ProjectionError` (PHASE 7B/7C/7D: a malformed projection frame, a
+# non-finite summary statistic, a missing coherent draw vector, ...) is
+# deterministic in exactly the same way -- and the Phase-7C
+# `ProjectionSchemaError` / `ProjectionRunMissingError` /
+# `ProjectionProvenanceError` / `ProjectionConflictError` are already
+# covered here as `ValueError` subclasses.
 NON_RETRYABLE_EXCEPTIONS: tuple[type[BaseException], ...] = (
     BacktestLeakageError,
     CoreLeakageError,
+    ProjectionError,
     AssertionError,
     ValueError,
     KeyError,

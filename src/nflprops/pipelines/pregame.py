@@ -343,42 +343,44 @@ def simulate_game_for_prediction(
     )
 
 
-def predict_week(
+@dataclasses.dataclass(frozen=True)
+class _PreparedPredictionInputs:
+    """Every point-in-time input `predict_week`'s per-game loop consumes,
+    read from the warehouse exactly once. Extracted verbatim from
+    `predict_week`'s prologue so the official Phase-7D checkpoint path can
+    build the identical inputs for one game without duplicating the logic
+    or running a second pipeline."""
+
+    current_games: pl.DataFrame
+    team_states: dict[str, TeamState]
+    player_states: dict[str, PlayerState]
+    state_context: StateProvenanceContext
+    latest_quotes: pl.DataFrame
+    game_odds: pl.DataFrame
+    roster: pl.DataFrame
+    injuries: pl.DataFrame
+
+
+def _prepare_prediction_inputs(
     warehouse: Warehouse,
     *,
     season: int,
     week: int,
     as_of: datetime,
-    model_version: str = "2026.1.0",
-    n_draws: int = 20_000,
-    retain_joint_draws: int = 0,
-    simulation_config: SimulationConfig | None = None,
-    player_state_config: PlayerStateConfig | None = None,
-    team_state_config: TeamStateConfig | None = None,
-    max_confidence_tier: int = 2,
-    market_mode: str = "live",
-    persist: bool = True,
-    game_ids: set[str] | None = None,
-    official_run_id: str | None = None,
-    checkpoint_name: str | None = None,
-    state_context_callback: Callable[[StateProvenanceContext], None] | None = None,
-) -> pl.DataFrame:
-    """Build states, simulate each game once, and price every available quote.
+    model_version: str,
+    market_mode: str,
+    player_state_config: PlayerStateConfig | None,
+    team_state_config: TeamStateConfig | None,
+    game_ids: set[str] | None,
+    state_context_callback: Callable[[StateProvenanceContext], None] | None,
+) -> _PreparedPredictionInputs | None:
+    """Read the warehouse once and build the PIT-visible target games, the
+    learned team/player states, the state-provenance context, and the
+    latest prop quotes.
 
-    `official_run_id`/`checkpoint_name` are additive, orchestration-supplied
-    provenance (PHASE 5, see `nflprops.orchestration.run_store`): when
-    given, every produced prediction row carries them so a sportsbook
-    prediction row can be traced back to the official checkpoint run that
-    produced it. `None` (the default, unchanged weekly/backtest call sites)
-    leaves both columns null -- this never changes prediction math.
-
-    `state_context_callback`, if given, is invoked once with the built
-    `StateProvenanceContext` as soon as it exists (PHASE 5 orchestration
-    uses `context.state_snapshot_id` as the checkpoint's data-manifest
-    fingerprint -- see `nflprops.orchestration.flows.checkpoints` -- without
-    this function needing to duplicate state-construction logic). Never
-    called if no PIT games are found for `as_of`/`game_ids`, since no state
-    is built in that case.
+    Returns ``None`` -- with no state built and `state_context_callback`
+    never fired -- when no PIT-visible scheduled game matches, exactly the
+    early-out `predict_week` has always had.
     """
     games = warehouse.read("games")
     player_stats = warehouse.read("player_game_stats")
@@ -397,7 +399,7 @@ def predict_week(
     current_games = _latest_games_asof(games, as_of=as_of, season=season, week=week)
     current_games = _restrict_games(current_games, game_ids)
     if current_games.is_empty():
-        return pl.DataFrame()
+        return None
 
     state_context = build_state_provenance_context(
         games=games,
@@ -442,18 +444,144 @@ def predict_week(
     )
 
     latest_quotes = latest_prop_quotes(prop_quotes, as_of=as_of)
+
+    return _PreparedPredictionInputs(
+        current_games=current_games,
+        team_states=team_states,
+        player_states=player_states,
+        state_context=state_context,
+        latest_quotes=latest_quotes,
+        game_odds=game_odds,
+        roster=roster,
+        injuries=injuries,
+    )
+
+
+def _persist_retained_joint_draws(
+    warehouse: Warehouse,
+    result: GameSimulationResult,
+    *,
+    retain_joint_draws: int,
+    model_version: str,
+    as_of: datetime,
+) -> None:
+    """Persist the retained joint player-draw subset for one game
+    (`simulation_player_results`), exactly as `predict_week` always has.
+    No-op when `retain_joint_draws <= 0`.
+
+    Deliberately independent of the immutable `player_game_projections`
+    product: that is always summarized from the full `result.n_draws`
+    (PHASE 7B/7D §23), never from this retained subset.
+    """
+    if retain_joint_draws <= 0:
+        return
+    keep = min(retain_joint_draws, result.n_draws)
+    joint = result.real_player_draws().filter(pl.col("draw_id") < keep)
+    run_id = prediction_id(result.game_id, as_of.isoformat(), model_version)
+    joint = joint.with_columns(pl.lit(run_id).alias("run_id"))
+    warehouse.append(
+        "simulation_player_results",
+        joint,
+        key=["run_id", "draw_id", "player_id"],
+        sort_by=["run_id", "draw_id", "player_id"],
+    )
+
+
+def _finalize_prediction_rows(
+    prediction_rows: list[dict[str, object]],
+    *,
+    official_run_id: str | None,
+    checkpoint_name: str | None,
+) -> pl.DataFrame:
+    """Assemble priced rows into the `predictions` frame and tag every row
+    with the (possibly None) official `run_id` / `checkpoint_name`. Same
+    shape `predict_week` has always produced."""
+    predictions = pl.DataFrame(prediction_rows) if prediction_rows else pl.DataFrame()
+    if not predictions.is_empty():
+        predictions = predictions.with_columns(
+            pl.lit(official_run_id).alias("run_id"),
+            pl.lit(checkpoint_name).alias("checkpoint_name"),
+        )
+    return predictions
+
+
+def _persist_prediction_rows(warehouse: Warehouse, predictions: pl.DataFrame) -> None:
+    """Append priced `predictions` rows, idempotent on the existing
+    `prediction_id` natural key. No-op on an empty frame."""
+    if predictions.is_empty():
+        return
+    warehouse.append(
+        "predictions",
+        predictions,
+        key=["prediction_id"],
+        sort_by=["as_of", "game_id", "player_id", "prop_type", "vendor", "side"],
+    )
+
+
+def predict_week(
+    warehouse: Warehouse,
+    *,
+    season: int,
+    week: int,
+    as_of: datetime,
+    model_version: str = "2026.1.0",
+    n_draws: int = 20_000,
+    retain_joint_draws: int = 0,
+    simulation_config: SimulationConfig | None = None,
+    player_state_config: PlayerStateConfig | None = None,
+    team_state_config: TeamStateConfig | None = None,
+    max_confidence_tier: int = 2,
+    market_mode: str = "live",
+    persist: bool = True,
+    game_ids: set[str] | None = None,
+    official_run_id: str | None = None,
+    checkpoint_name: str | None = None,
+    state_context_callback: Callable[[StateProvenanceContext], None] | None = None,
+) -> pl.DataFrame:
+    """Build states, simulate each game once, and price every available quote.
+
+    `official_run_id`/`checkpoint_name` are additive, orchestration-supplied
+    provenance (PHASE 5, see `nflprops.orchestration.run_store`): when
+    given, every produced prediction row carries them so a sportsbook
+    prediction row can be traced back to the official checkpoint run that
+    produced it. `None` (the default, unchanged weekly/backtest call sites)
+    leaves both columns null -- this never changes prediction math.
+
+    `state_context_callback`, if given, is invoked once with the built
+    `StateProvenanceContext` as soon as it exists (PHASE 5 orchestration
+    uses `context.state_snapshot_id` as the checkpoint's data-manifest
+    fingerprint -- see `nflprops.orchestration.flows.checkpoints` -- without
+    this function needing to duplicate state-construction logic). Never
+    called if no PIT games are found for `as_of`/`game_ids`, since no state
+    is built in that case.
+    """
+    inputs = _prepare_prediction_inputs(
+        warehouse,
+        season=season,
+        week=week,
+        as_of=as_of,
+        model_version=model_version,
+        market_mode=market_mode,
+        player_state_config=player_state_config,
+        team_state_config=team_state_config,
+        game_ids=game_ids,
+        state_context_callback=state_context_callback,
+    )
+    if inputs is None:
+        return pl.DataFrame()
+
     prediction_rows: list[dict] = []
 
-    for game in current_games.iter_rows(named=True):
+    for game in inputs.current_games.iter_rows(named=True):
         # PHASE 6: exactly one coherent football simulation per game, built
         # with zero knowledge of player-prop quotes. `prepared` stays
         # available even for a game with zero posted quotes -- pricing
         # never gates whether the simulation itself happens.
         prepared = simulate_game_for_prediction(
             game=game,
-            team_states=team_states,
-            player_states=player_states,
-            game_odds=game_odds,
+            team_states=inputs.team_states,
+            player_states=inputs.player_states,
+            game_odds=inputs.game_odds,
             as_of=as_of,
             model_version=model_version,
             market_mode=market_mode,
@@ -463,7 +591,6 @@ def predict_week(
         if prepared is None:
             continue
         result = prepared.result
-        game_id = result.game_id
 
         # PHASE 6: pricing is a pure downstream read of `result` -- it never
         # calls simulate_game_for_prediction/simulate_game, never creates an
@@ -473,44 +600,35 @@ def predict_week(
             price_current_markets(
                 prepared.game,
                 result,
-                latest_quotes,
+                inputs.latest_quotes,
                 season=season,
                 week=week,
                 as_of=as_of,
-                state_context=state_context,
-                roster=roster,
-                injuries=injuries,
+                state_context=inputs.state_context,
+                roster=inputs.roster,
+                injuries=inputs.injuries,
                 game_market_available_at=prepared.game_market_available_at,
                 market_mode=market_mode,
                 max_confidence_tier=max_confidence_tier,
             )
         )
 
-        if persist and retain_joint_draws > 0:
-            keep = min(retain_joint_draws, result.n_draws)
-            joint = result.real_player_draws().filter(pl.col("draw_id") < keep)
-            run_id = prediction_id(game_id, as_of.isoformat(), model_version)
-            joint = joint.with_columns(pl.lit(run_id).alias("run_id"))
-            warehouse.append(
-                "simulation_player_results",
-                joint,
-                key=["run_id", "draw_id", "player_id"],
-                sort_by=["run_id", "draw_id", "player_id"],
+        if persist:
+            _persist_retained_joint_draws(
+                warehouse,
+                result,
+                retain_joint_draws=retain_joint_draws,
+                model_version=model_version,
+                as_of=as_of,
             )
 
-    predictions = pl.DataFrame(prediction_rows) if prediction_rows else pl.DataFrame()
-    if not predictions.is_empty():
-        predictions = predictions.with_columns(
-            pl.lit(official_run_id).alias("run_id"),
-            pl.lit(checkpoint_name).alias("checkpoint_name"),
-        )
-    if persist and not predictions.is_empty():
-        warehouse.append(
-            "predictions",
-            predictions,
-            key=["prediction_id"],
-            sort_by=["as_of", "game_id", "player_id", "prop_type", "vendor", "side"],
-        )
+    predictions = _finalize_prediction_rows(
+        prediction_rows,
+        official_run_id=official_run_id,
+        checkpoint_name=checkpoint_name,
+    )
+    if persist:
+        _persist_prediction_rows(warehouse, predictions)
     return predictions
 
 
@@ -540,3 +658,174 @@ def predict_game(
         game_ids={game_id},
         **kwargs,
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class GamePredictionComputation:
+    """One official game/checkpoint's complete Phase-6 computation, exposed
+    as a single object so an orchestrator can reuse the ONE coherent
+    `GameSimulationResult` for BOTH the sportsbook-independent
+    `player_game_projections` artifact and current-market pricing -- never a
+    second simulation (PHASE 7D §3/§25).
+
+    * `prepared.result` (alias `.simulation`) is that single
+      `nflprops.simulation.game.GameSimulationResult`, unmodified.
+    * `price_markets()` runs the identical `price_current_markets` mapping
+      `predict_week` uses -- on demand, so the caller controls ordering
+      (the immutable projection product is persisted first, §7).
+    * Nothing here reads a player-prop quote to build the simulation, and
+      nothing here persists anything.
+    """
+
+    prepared: PreparedGameSimulation
+    player_states: dict[str, PlayerState]
+    state_context: StateProvenanceContext
+    season: int
+    week: int
+    as_of: datetime
+    market_mode: str
+    max_confidence_tier: int
+    latest_quotes: pl.DataFrame
+    roster: pl.DataFrame
+    injuries: pl.DataFrame
+
+    @property
+    def simulation(self) -> GameSimulationResult:
+        return self.prepared.result
+
+    @property
+    def game(self) -> dict[str, object]:
+        return self.prepared.game
+
+    @property
+    def simulation_input_sha256(self) -> str:
+        return self.prepared.simulation_input_sha256
+
+    def price_markets(self) -> list[dict[str, object]]:
+        """Price every currently-supported quote for this game against the
+        already-computed draws -- a pure downstream read of
+        `self.simulation`, byte-for-byte the same call `predict_week`
+        makes."""
+        return price_current_markets(
+            self.prepared.game,
+            self.prepared.result,
+            self.latest_quotes,
+            season=self.season,
+            week=self.week,
+            as_of=self.as_of,
+            state_context=self.state_context,
+            roster=self.roster,
+            injuries=self.injuries,
+            game_market_available_at=self.prepared.game_market_available_at,
+            market_mode=self.market_mode,
+            max_confidence_tier=self.max_confidence_tier,
+        )
+
+
+def compute_game_prediction(
+    warehouse: Warehouse,
+    *,
+    season: int,
+    week: int,
+    game_id: str,
+    as_of: datetime,
+    model_version: str = "2026.1.0",
+    n_draws: int = 20_000,
+    simulation_config: SimulationConfig | None = None,
+    player_state_config: PlayerStateConfig | None = None,
+    team_state_config: TeamStateConfig | None = None,
+    max_confidence_tier: int = 2,
+    market_mode: str = "live",
+    state_context_callback: Callable[[StateProvenanceContext], None] | None = None,
+) -> GamePredictionComputation | None:
+    """Run exactly one coherent football simulation for `game_id` as of
+    `as_of` and return it bundled with everything current-market pricing
+    needs -- WITHOUT pricing and WITHOUT persisting anything (PHASE 7D §4).
+
+    Built entirely from the same `_prepare_prediction_inputs` /
+    `simulate_game_for_prediction` `predict_week` uses; it is not a second
+    prediction pipeline and adds no new state-construction or simulation
+    logic. Returns ``None`` when there is no PIT-visible scheduled game for
+    `(game_id, as_of)` or when either team's structural state is not yet
+    trustworthy -- exactly `predict_week`'s existing skip conditions.
+    """
+    inputs = _prepare_prediction_inputs(
+        warehouse,
+        season=season,
+        week=week,
+        as_of=as_of,
+        model_version=model_version,
+        market_mode=market_mode,
+        player_state_config=player_state_config,
+        team_state_config=team_state_config,
+        game_ids={game_id},
+        state_context_callback=state_context_callback,
+    )
+    if inputs is None:
+        return None
+
+    matches = inputs.current_games.filter(pl.col("canonical_game_id") == game_id)
+    if matches.is_empty():
+        return None
+    game = matches.row(0, named=True)
+
+    prepared = simulate_game_for_prediction(
+        game=game,
+        team_states=inputs.team_states,
+        player_states=inputs.player_states,
+        game_odds=inputs.game_odds,
+        as_of=as_of,
+        model_version=model_version,
+        market_mode=market_mode,
+        simulation_config=simulation_config,
+        n_draws=n_draws,
+    )
+    if prepared is None:
+        return None
+
+    return GamePredictionComputation(
+        prepared=prepared,
+        player_states=inputs.player_states,
+        state_context=inputs.state_context,
+        season=season,
+        week=week,
+        as_of=as_of,
+        market_mode=market_mode,
+        max_confidence_tier=max_confidence_tier,
+        latest_quotes=inputs.latest_quotes,
+        roster=inputs.roster,
+        injuries=inputs.injuries,
+    )
+
+
+def persist_current_pricing(
+    warehouse: Warehouse,
+    computation: GamePredictionComputation,
+    priced_markets: list[dict[str, object]],
+    *,
+    official_run_id: str,
+    checkpoint_name: str,
+    retain_joint_draws: int,
+    model_version: str,
+) -> pl.DataFrame:
+    """Persist the current-sportsbook-market side of one official checkpoint
+    (PHASE 7D §7/§9): the retained joint-draw subset and the priced
+    `predictions` rows, tagged with the official `run_id`/`checkpoint_name`,
+    via the same append-only, natural-key-idempotent writes `predict_week`
+    uses. Never touches `player_game_projections` -- that immutable artifact
+    is persisted first and independently (§7/§11).
+    """
+    _persist_retained_joint_draws(
+        warehouse,
+        computation.simulation,
+        retain_joint_draws=retain_joint_draws,
+        model_version=model_version,
+        as_of=computation.as_of,
+    )
+    predictions = _finalize_prediction_rows(
+        priced_markets,
+        official_run_id=official_run_id,
+        checkpoint_name=checkpoint_name,
+    )
+    _persist_prediction_rows(warehouse, predictions)
+    return predictions
