@@ -24,6 +24,7 @@ from nflprops.simulation.allocations import (
     weighted_count_allocation_batch,
 )
 from nflprops.simulation.rng import child_rng
+from nflprops.simulation.selection import select_starter_index
 from nflprops.state.player import PlayerState
 from nflprops.state.team import TeamState
 
@@ -146,21 +147,6 @@ def _ensure_players(team: TeamSimulationInput) -> tuple[PlayerState, ...]:
             )
         )
     return tuple(active)
-
-
-def _starter_index(players: tuple[PlayerState, ...], position: str) -> int | None:
-    candidates = [
-        (i, p)
-        for i, p in enumerate(players)
-        if p.active and p.position_group == position
-    ]
-    if not candidates:
-        return None
-    if position == "QB":
-        return max(candidates, key=lambda x: (x[1].qb_attempt_share, -(x[1].depth or 99)))[0]
-    if position == "K":
-        return min(candidates, key=lambda x: x[1].depth or 99)[0]
-    return candidates[0][0]
 
 
 def _gain_aggregate(
@@ -286,7 +272,7 @@ def _simulate_team_period(
         rng=rngs["carries"],
     )
 
-    qb_idx = _starter_index(players, "QB")
+    qb_idx = select_starter_index(players, "QB")
     qb = players[qb_idx] if qb_idx is not None else players[0]
     p_int = _logit_blend(
         qb.qb_int_probability,
@@ -409,7 +395,7 @@ def _simulate_team_period(
     else:
         expected_fg_full = 1.7
     fg_attempts = rngs["fg_attempts"].poisson(expected_fg_full * period_fraction, n_draws)
-    kicker_idx = _starter_index(players, "K")
+    kicker_idx = select_starter_index(players, "K")
     kicker = players[kicker_idx] if kicker_idx is not None else None
     p_fg = kicker.fg_make_probability if kicker is not None else 0.84
     p_xp = kicker.xp_make_probability if kicker is not None else 0.95
