@@ -30,6 +30,17 @@ one `compute_run_id` uses) -- never Python's built-in ``hash()``.
 Canonical projections require a real ``prediction_runs(run_id)`` parent
 row (PHASE 5). Ad-hoc / backtest projection frames without one may stay in
 memory but must not enter this table.
+
+Parent provenance (LOCKED): ``player_game_projections`` duplicates four
+run-level identity fields that also live on the parent -- ``season``,
+``week``, ``game_id``, ``n_draws``. Before any row is written, every
+incoming row's copy of each is checked to equal the parent
+``prediction_runs`` row's value. A disagreement (valid ``run_id`` for
+GAME_A but a projection row claiming GAME_B; parent ``n_draws=100000`` but
+projection ``n_draws=50000``; ...) is a HARD ERROR
+(`ProjectionProvenanceError`): the parent run is the single source of
+truth, the child value is NEVER silently reconciled to it, and nothing --
+not even the agreeing subset of the batch -- is written.
 """
 
 from __future__ import annotations
@@ -43,6 +54,7 @@ from typing import TYPE_CHECKING, Any
 import polars as pl
 
 from nflprops.collection.resource_availability import deterministic_id
+from nflprops.orchestration.run_store import PredictionRunRecord, get_run
 
 if TYPE_CHECKING:
     from nflprops.data.storage.base import StorageBackend
@@ -131,6 +143,27 @@ class ProjectionRunMissingError(ValueError):
     """`persist_player_game_projections` was asked to persist against a
     `run_id` with no `prediction_runs` parent row. Canonical projections
     require a real production/manual run."""
+
+
+class ProjectionProvenanceError(ValueError):
+    """An incoming projection row duplicates a run-level provenance field
+    (`season`, `week`, `game_id`, or `n_draws`) that disagrees with its
+    parent `prediction_runs` row. The parent run is authoritative for
+    run-level scientific identity; a disagreement signals an upstream
+    provenance bug and is deliberately surfaced, never silently reconciled
+    to the parent. Nothing is written; existing rows are unchanged."""
+
+    def __init__(self, field: str, *, run_id: str, parent: object, incoming: object):
+        self.field = field
+        self.run_id = run_id
+        self.parent = parent
+        self.incoming = incoming
+        super().__init__(
+            f"projection {field!r}={incoming!r} disagrees with parent "
+            f"prediction_runs.{field}={parent!r} for run_id={run_id!r}. The "
+            f"parent run is authoritative; the child value is never silently "
+            f"corrected. Nothing was written."
+        )
 
 
 class ProjectionConflictError(ValueError):
@@ -275,13 +308,52 @@ def _validate_metadata(
         raise ProjectionSchemaError("created_at must be a timezone-aware datetime")
 
 
-def _prediction_run_exists(backend: StorageBackend, run_id: str) -> bool:
-    if not backend.exists(PREDICTION_RUNS_TABLE):
-        return False
-    runs = backend.read(PREDICTION_RUNS_TABLE)
-    if runs.is_empty() or "run_id" not in runs.columns:
-        return False
-    return bool((runs["run_id"] == run_id).any())
+#: Run-level identity fields `player_game_projections` duplicates from its
+#: parent `prediction_runs` row. Each incoming row's copy must equal the
+#: parent's exactly -- the run is the single source of truth.
+PARENT_PROVENANCE_FIELDS: tuple[str, ...] = ("season", "week", "game_id", "n_draws")
+
+
+def _load_prediction_run(
+    backend: StorageBackend, run_id: str
+) -> PredictionRunRecord | None:
+    """The single parent-row lookup for canonical projection persistence:
+    the one `prediction_runs` record for `run_id`, or None if there is no
+    such run. Delegates to `run_store.get_run` so parent-row parsing lives
+    in exactly one place, never re-implemented here."""
+    return get_run(backend, run_id)
+
+
+def _validate_parent_provenance(
+    parent: PredictionRunRecord, rows: list[ProjectionRow]
+) -> None:
+    """Every row's duplicated provenance (`season`, `week`, `game_id`,
+    `n_draws`) must equal the parent run's value. Raises
+    `ProjectionProvenanceError` on the first disagreement -- before
+    anything is written and before any subset is inserted. The child value
+    is never silently reconciled to the parent: a mismatch is an upstream
+    provenance bug that must surface here."""
+    expected: dict[str, object] = {
+        "season": int(parent.season),
+        "week": int(parent.week),
+        "game_id": str(parent.game_id),
+        "n_draws": int(parent.n_draws),
+    }
+    for row in rows:
+        actual: dict[str, object] = {
+            "season": int(row.season),
+            "week": int(row.week),
+            "game_id": str(row.game_id),
+            "n_draws": int(row.n_draws),
+        }
+        for field in PARENT_PROVENANCE_FIELDS:
+            if actual[field] != expected[field]:
+                raise ProjectionProvenanceError(
+                    field,
+                    run_id=parent.run_id,
+                    parent=expected[field],
+                    incoming=actual[field],
+                )
 
 
 def _build_rows(
@@ -460,8 +532,14 @@ def persist_player_game_projections(
 
     Returns counts of rows newly inserted vs. left unchanged (an exact
     scientific retry, regardless of `created_at`). Raises
-    `ProjectionSchemaError`, `ProjectionRunMissingError`, or
-    `ProjectionConflictError`; on any of them nothing is written.
+    `ProjectionSchemaError`, `ProjectionRunMissingError`,
+    `ProjectionProvenanceError`, or `ProjectionConflictError`; on any of
+    them nothing is written.
+
+    The parent `prediction_runs` row for `run_id` must both exist and
+    agree with every incoming row on `season`, `week`, `game_id`, and
+    `n_draws` (`_validate_parent_provenance`). A disagreement is surfaced,
+    never silently corrected to the parent.
     """
     _require_columns(projections)
     _validate_metadata(
@@ -471,7 +549,8 @@ def persist_player_game_projections(
         return ProjectionPersistResult(inserted=0, unchanged=0)
     _validate_values(projections)
 
-    if not _prediction_run_exists(backend, run_id):
+    parent = _load_prediction_run(backend, run_id)
+    if parent is None:
         raise ProjectionRunMissingError(
             f"no prediction_runs row for run_id={run_id!r}; canonical "
             f"player_game_projections require a real production/manual run"
@@ -480,6 +559,7 @@ def persist_player_game_projections(
     rows = _build_rows(
         projections, run_id=run_id, season=season, week=week, created_at=created_at
     )
+    _validate_parent_provenance(parent, rows)
     existing = _existing_rows_by_id(backend, (row.projection_id for row in rows))
     to_insert = _classify(rows, existing)
 

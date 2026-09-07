@@ -15,6 +15,7 @@ from nflprops.data.warehouse import Warehouse
 from nflprops.orchestration.projection_store import (
     PLAYER_GAME_PROJECTIONS_TABLE,
     ProjectionConflictError,
+    ProjectionProvenanceError,
     ProjectionRunMissingError,
     ProjectionSchemaError,
     compute_projection_id,
@@ -229,16 +230,19 @@ def test_exact_retry_with_different_created_at_is_a_noop(tmp_path: Path) -> None
 # --------------------------------------------------------------- conflicts
 
 
+# `n_draws` and `game_id` are duplicated from the parent run, so a mismatch
+# there is caught earlier by `_validate_parent_provenance`
+# (`ProjectionProvenanceError`) -- see the parent-provenance section. The
+# fields below are child-only scientific fields whose immutability is
+# guarded purely by `_classify`.
 @pytest.mark.parametrize(
     ("field", "override"),
     [
         ("mean", {"mean": 999.0}),
         ("p50", {"p50": 57.5}),
         ("p95", {"p95": 200.0}),
-        ("n_draws", {"n_draws": 2000}),
         ("team_id", {"team_id": "proj:test:away"}),
         ("position_group", {"position_group": "TE"}),
-        ("game_id", {"game_id": "proj:test:other-game"}),
     ],
 )
 def test_conflicting_scientific_field_is_a_hard_error(
@@ -268,13 +272,17 @@ def test_conflicting_scientific_field_is_a_hard_error(
 
 
 def test_conflicting_season_or_week_metadata_is_a_hard_error(tmp_path: Path) -> None:
+    """`season` / `week` are duplicated from the parent run. A re-persist
+    with a different `week` diverges from the (unchanged) parent, so it is
+    a hard error via `_validate_parent_provenance` -- nothing is written,
+    the single stored row is untouched."""
     backend = _backend(tmp_path)
-    _make_run(backend, "RUN-A")
+    _make_run(backend, "RUN-A")  # parent: season=2026, week=2
     frame = _frame([_row("proj:test:wr1", "receiving_yards")])
     persist_player_game_projections(
         backend, frame, run_id="RUN-A", season=2026, week=2, created_at=NOW
     )
-    with pytest.raises(ProjectionConflictError):
+    with pytest.raises(ProjectionProvenanceError):
         persist_player_game_projections(
             backend, frame, run_id="RUN-A", season=2026, week=3, created_at=NOW
         )
@@ -357,6 +365,150 @@ def test_unknown_run_id_rejected_even_when_other_runs_exist(tmp_path: Path) -> N
             week=2,
             created_at=NOW,
         )
+
+
+# ------------------------------------------------------- parent provenance
+
+
+def test_wrong_season_against_valid_parent_is_rejected_on_first_write(
+    tmp_path: Path,
+) -> None:
+    backend = _backend(tmp_path)
+    _make_run(backend, "RUN-A")  # parent: season=2026, week=2
+    with pytest.raises(ProjectionProvenanceError) as excinfo:
+        persist_player_game_projections(
+            backend,
+            _default_frame(),
+            run_id="RUN-A",
+            season=2025,
+            week=2,
+            created_at=NOW,
+        )
+    assert excinfo.value.field == "season"
+    assert not backend.exists(PLAYER_GAME_PROJECTIONS_TABLE)
+
+
+def test_wrong_week_against_valid_parent_is_rejected_on_first_write(
+    tmp_path: Path,
+) -> None:
+    backend = _backend(tmp_path)
+    _make_run(backend, "RUN-A")  # parent: season=2026, week=2
+    with pytest.raises(ProjectionProvenanceError) as excinfo:
+        persist_player_game_projections(
+            backend,
+            _default_frame(),
+            run_id="RUN-A",
+            season=2026,
+            week=9,
+            created_at=NOW,
+        )
+    assert excinfo.value.field == "week"
+    assert not backend.exists(PLAYER_GAME_PROJECTIONS_TABLE)
+
+
+def test_wrong_game_id_against_valid_parent_is_rejected_on_first_write(
+    tmp_path: Path,
+) -> None:
+    backend = _backend(tmp_path)
+    _make_run(backend, "RUN-A")  # parent: game_id=GAME_ID
+    frame = _frame(
+        [_row("proj:test:wr1", "receiving_yards", game_id="proj:test:OTHER-GAME")]
+    )
+    with pytest.raises(ProjectionProvenanceError) as excinfo:
+        persist_player_game_projections(
+            backend, frame, run_id="RUN-A", season=2026, week=2, created_at=NOW
+        )
+    assert excinfo.value.field == "game_id"
+    assert not backend.exists(PLAYER_GAME_PROJECTIONS_TABLE)
+
+
+def test_wrong_n_draws_against_valid_parent_is_rejected_on_first_write(
+    tmp_path: Path,
+) -> None:
+    backend = _backend(tmp_path)
+    _make_run(backend, "RUN-A")  # parent: n_draws=1000
+    frame = _frame([_row("proj:test:wr1", "receiving_yards", n_draws=50000)])
+    with pytest.raises(ProjectionProvenanceError) as excinfo:
+        persist_player_game_projections(
+            backend, frame, run_id="RUN-A", season=2026, week=2, created_at=NOW
+        )
+    assert excinfo.value.field == "n_draws"
+    assert excinfo.value.parent == 1000
+    assert excinfo.value.incoming == 50000
+    assert not backend.exists(PLAYER_GAME_PROJECTIONS_TABLE)
+
+
+def test_correct_parent_metadata_persists_normally(tmp_path: Path) -> None:
+    backend = _backend(tmp_path)
+    _make_run(backend, "RUN-A")  # parent: season=2026, week=2, GAME_ID, n_draws=1000
+    result = persist_player_game_projections(
+        backend, _default_frame(), run_id="RUN-A", season=2026, week=2, created_at=NOW
+    )
+    assert (result.inserted, result.unchanged) == (3, 0)
+    stored = backend.read(PLAYER_GAME_PROJECTIONS_TABLE)
+    assert stored.height == 3
+    assert stored["season"].unique().to_list() == [2026]
+    assert stored["week"].unique().to_list() == [2]
+    assert stored["game_id"].unique().to_list() == [GAME_ID]
+    assert stored["n_draws"].unique().to_list() == [1000]
+
+
+def test_mixed_batch_with_one_provenance_mismatch_is_atomically_rejected(
+    tmp_path: Path,
+) -> None:
+    """One provenance-correct row + one parent-mismatched row -> the whole
+    call fails and NOT even the correct row is written."""
+    backend = _backend(tmp_path)
+    _make_run(backend, "RUN-A")  # parent: game_id=GAME_ID
+    mixed = _frame(
+        [
+            _row("proj:test:wr1", "receiving_yards"),  # provenance OK
+            _row(
+                "proj:test:wr2",
+                "receiving_yards",
+                game_id="proj:test:OTHER-GAME",
+            ),  # parent-mismatched
+        ]
+    )
+    with pytest.raises(ProjectionProvenanceError):
+        persist_player_game_projections(
+            backend, mixed, run_id="RUN-A", season=2026, week=2, created_at=NOW
+        )
+    assert not backend.exists(PLAYER_GAME_PROJECTIONS_TABLE)
+
+
+def test_repersist_same_id_with_divergent_provenance_field_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """Re-persisting an already-stored `projection_id` with a `game_id` /
+    `n_draws` that now disagrees with the parent is a hard error, and the
+    stored row keeps its original values."""
+    backend = _backend(tmp_path)
+    _make_run(backend, "RUN-A")  # parent: game_id=GAME_ID, n_draws=1000
+    persist_player_game_projections(
+        backend,
+        _frame([_row("proj:test:wr1", "receiving_yards")]),
+        run_id="RUN-A",
+        season=2026,
+        week=2,
+        created_at=NOW,
+    )
+    before = backend.read(PLAYER_GAME_PROJECTIONS_TABLE).sort("projection_id")
+
+    with pytest.raises(ProjectionProvenanceError):
+        persist_player_game_projections(
+            backend,
+            _frame([_row("proj:test:wr1", "receiving_yards", n_draws=50000)]),
+            run_id="RUN-A",
+            season=2026,
+            week=2,
+            created_at=NOW,
+        )
+
+    after = backend.read(PLAYER_GAME_PROJECTIONS_TABLE).sort("projection_id")
+    assert after.equals(before)
+    assert after.height == 1
+    assert after["n_draws"].to_list() == [1000]
 
 
 # --------------------------------------------------------------- schema guards

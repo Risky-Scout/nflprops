@@ -423,3 +423,151 @@ def test_different_run_id_produces_a_distinct_projection(postgres_dsn: str) -> N
     finally:
         engine.dispose()
         backend.dispose()
+
+
+def test_first_write_provenance_mismatch_fails_at_persistence_boundary(
+    postgres_dsn: str,
+) -> None:
+    """A first-ever write whose duplicated provenance disagrees with the
+    real parent `prediction_runs` row is rejected by the application
+    persistence boundary (no composite FK needed), for each of season,
+    week, game_id, n_draws independently -- and never inserts a row."""
+    _alembic(postgres_dsn, "upgrade", "head")
+
+    import sqlalchemy as sa
+
+    from nflprops.orchestration.projection_store import (
+        ProjectionProvenanceError,
+        persist_player_game_projections,
+    )
+
+    backend = _backend(postgres_dsn)
+    engine = sa.create_engine(postgres_dsn)
+    try:
+        # each parent run: season=2026, week=2, game_id='pg:proj:game', n_draws=1000
+        _make_parent_run(backend, "pg-prov-season")
+        _make_parent_run(backend, "pg-prov-week")
+        _make_parent_run(backend, "pg-prov-game")
+        _make_parent_run(backend, "pg-prov-ndraws")
+
+        good_frame = _frame([_row("pg:wr1", "receiving_yards")])
+
+        with pytest.raises(ProjectionProvenanceError) as season_exc:
+            persist_player_game_projections(
+                backend,
+                good_frame,
+                run_id="pg-prov-season",
+                season=2025,
+                week=2,
+                created_at=NOW,
+            )
+        assert season_exc.value.field == "season"
+
+        with pytest.raises(ProjectionProvenanceError) as week_exc:
+            persist_player_game_projections(
+                backend,
+                good_frame,
+                run_id="pg-prov-week",
+                season=2026,
+                week=9,
+                created_at=NOW,
+            )
+        assert week_exc.value.field == "week"
+
+        with pytest.raises(ProjectionProvenanceError) as game_exc:
+            persist_player_game_projections(
+                backend,
+                _frame([_row("pg:wr1", "receiving_yards", game_id="pg:proj:OTHER")]),
+                run_id="pg-prov-game",
+                season=2026,
+                week=2,
+                created_at=NOW,
+            )
+        assert game_exc.value.field == "game_id"
+
+        with pytest.raises(ProjectionProvenanceError) as nd_exc:
+            persist_player_game_projections(
+                backend,
+                _frame([_row("pg:wr1", "receiving_yards", n_draws=50000)]),
+                run_id="pg-prov-ndraws",
+                season=2026,
+                week=2,
+                created_at=NOW,
+            )
+        assert nd_exc.value.field == "n_draws"
+
+        for run_id in (
+            "pg-prov-season",
+            "pg-prov-week",
+            "pg-prov-game",
+            "pg-prov-ndraws",
+        ):
+            assert _count(engine, run_id) == 0
+    finally:
+        engine.dispose()
+        backend.dispose()
+
+
+def test_provenance_mismatch_leaves_existing_canonical_rows_unchanged_postgres(
+    postgres_dsn: str,
+) -> None:
+    _alembic(postgres_dsn, "upgrade", "head")
+
+    import sqlalchemy as sa
+
+    from nflprops.orchestration.projection_store import (
+        ProjectionProvenanceError,
+        persist_player_game_projections,
+    )
+
+    run_id = "pg-prov-preserve"
+    backend = _backend(postgres_dsn)
+    engine = sa.create_engine(postgres_dsn)
+    try:
+        _make_parent_run(backend, run_id)
+        persist_player_game_projections(
+            backend,
+            _frame([_row("pg:wr1", "receiving_yards")]),
+            run_id=run_id,
+            season=2026,
+            week=2,
+            created_at=NOW,
+        )
+        assert _count(engine, run_id) == 1
+        with engine.connect() as conn:
+            before = conn.execute(
+                sa.text(
+                    "SELECT projection_id, mean, n_draws, game_id, season, week, "
+                    "created_at FROM player_game_projections WHERE run_id = :r"
+                ),
+                {"r": run_id},
+            ).all()
+
+        with pytest.raises(ProjectionProvenanceError):
+            persist_player_game_projections(
+                backend,
+                _frame(
+                    [
+                        _row("pg:wr1", "receiving_yards"),  # provenance OK
+                        _row("pg:wr2", "receiving_yards", n_draws=50000),  # mismatch
+                    ]
+                ),
+                run_id=run_id,
+                season=2026,
+                week=2,
+                created_at=NOW + timedelta(days=5),
+            )
+
+        assert _count(engine, run_id) == 1
+        with engine.connect() as conn:
+            after = conn.execute(
+                sa.text(
+                    "SELECT projection_id, mean, n_draws, game_id, season, week, "
+                    "created_at FROM player_game_projections WHERE run_id = :r"
+                ),
+                {"r": run_id},
+            ).all()
+        assert after == before
+    finally:
+        engine.dispose()
+        backend.dispose()
