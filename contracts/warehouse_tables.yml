@@ -235,6 +235,28 @@ tables:
         config_sha256, source_sha256, data_manifest_sha256, n_draws,
         retained_joint_draws, publication_status, is_final_forecast,
         fallback_from_checkpoint, failure_code, failure_detail, created_at]
+    player_game_projections:
+      key: [projection_id]
+      unique: [run_id, player_id, stat_name]
+      foreign_key: {run_id: "prediction_runs.run_id"}
+      pit: false
+      note: >
+        PHASE 7C. player_game_projections = immutable sportsbook-independent
+        summarized player distribution output. One row per
+        (run_id, player_id, stat_name) for each of the 30 approved Phase-7
+        registry stats; projection_id = SHA-256(run_id | player_id |
+        stat_name). Carries NO sportsbook fields and NO separate median
+        column (p50 IS the median). Never updated or overwritten: an
+        identical scientific re-run is an idempotent no-op, and any
+        differing scientific field for an existing projection_id is a hard
+        error. created_at is operational metadata only and is excluded from
+        scientific equality. Requires a real prediction_runs parent row;
+        ad-hoc/backtest projection frames stay in memory only. FK is NOT
+        ON DELETE CASCADE. See nflprops.orchestration.projection_store and
+        migrations/versions/0004_player_game_projections.py.
+      columns: [projection_id, run_id, season, week, game_id, player_id,
+        team_id, position_group, stat_name, n_draws, mean, p05, p10, p25,
+        p50, p75, p90, p95, created_at]
 
   governance:
     model_registry:

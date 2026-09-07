@@ -8,9 +8,11 @@ prediction math, and never leaks orchestration lateness into a prediction.
 Core model modules (`simulation`, `state`, `backtest`, `market`,
 `collection`) do not depend on Prefect. Only this package, and specifically
 `orchestration.tasks` / `orchestration.flows.*` / `orchestration.deployments`,
-may import it. `orchestration.checkpoints` and `orchestration.run_store` are
-deliberately Prefect-free pure logic, so they can be tested (and reasoned
-about) without a Prefect runtime.
+may import it. `orchestration.checkpoints`, `orchestration.run_store`, and
+`orchestration.projection_store` (PHASE 7C: immutable
+`player_game_projections` persistence) are deliberately Prefect-free pure
+logic, so they can be tested (and reasoned about) without a Prefect
+runtime.
 
 See `docs/ORCHESTRATION_ARCHITECTURE.md`.
 """
