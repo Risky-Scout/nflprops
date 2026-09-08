@@ -2,12 +2,19 @@
 missed, game-level isolation, manual-checkpoint exclusion, retry/run_id
 reuse.
 
-Games-only fixtures (no team/player history) are sufficient here: as
-`test_predict_game_and_pit_wiring.py` shows, `predict_game` finds the game
-and builds state (so the dispatcher reaches SUCCESS/MODEL_ONLY with empty
-predictions) purely from a `games` row -- these tests are about dispatcher
-bookkeeping (claiming, status, isolation), not prediction math, so the
+Games-only fixtures (no team/player history) are sufficient here: these
+tests are about dispatcher bookkeeping (claiming, status transitions,
+catch-up scheduling, per-game isolation), not prediction math, so the
 lighter fixture keeps them fast and focused.
+
+PHASE 7E note: a games-only fixture has no team/player structural history,
+so no coherent simulation and therefore no `player_game_projections`
+artifact can be produced. Per the Phase-7E certification invariant
+(MODEL_ONLY <=> a complete projection artifact exists), that outcome is
+now FAILED / NOT_PUBLISHED / GAME_NOT_MODELED -- not SUCCESS / MODEL_ONLY.
+The real end-to-end SUCCESS + projection-artifact path is certified in
+`test_phase6_checkpoint_simulation_boundary.py` and
+`test_phase7d_checkpoint_projection_integration.py`.
 """
 
 from __future__ import annotations
@@ -103,9 +110,16 @@ def test_catch_up_uses_original_scheduled_as_of_not_now(tmp_path: Path) -> None:
     t90m = [r for r in results if r.checkpoint_name == CheckpointName.T90M.value]
     assert len(t90m) == 1
     record = t90m[0]
+    # The substance under test: the run is stamped with the ORIGINAL
+    # scheduled_as_of (18:30), never the late catch-up execution time.
     assert record.scheduled_as_of == expected_scheduled_as_of
     assert record.flow_started_at == late_now
-    assert record.status is PredictionRunStatus.SUCCESS
+    # Games-only fixture -> no simulation -> no projection artifact, so by
+    # the Phase-7E invariant this is FAILED / GAME_NOT_MODELED, not
+    # SUCCESS / MODEL_ONLY. The catch-up scheduling above is unaffected.
+    assert record.status is PredictionRunStatus.FAILED
+    assert record.publication_status is PublicationStatus.NOT_PUBLISHED
+    assert record.failure_code == "GAME_NOT_MODELED"
 
 
 def test_post_kickoff_discovery_is_checkpoint_missed_without_executing_prediction(
@@ -176,9 +190,14 @@ def test_game_level_isolation_one_failure_does_not_abort_others(
             warehouse, season=season, week=week, game_id=game_id, as_of=as_of, **kwargs
         )
 
-    # PHASE 7D: isolate a failure at the single-simulation compute boundary
-    # the flow now uses; gA / gC must still each reach their own terminal
-    # SUCCESS independently.
+    # Isolate a raised exception at the single-simulation compute boundary
+    # the flow uses for gB. The property under test is that gB's exception
+    # is contained: gA and gC must still each reach their OWN independent
+    # terminal record -- the dispatcher loop is not aborted. (Games-only
+    # fixture, so gA/gC legitimately terminate as GAME_NOT_MODELED per the
+    # Phase-7E invariant; the A-succeeds / C-succeeds variant with a real
+    # model + projection artifact is certified in
+    # `test_phase7d_checkpoint_projection_integration.py`.)
     monkeypatch.setattr(checkpoints_flow, "compute_game_prediction", _flaky)
 
     now = kickoff - timedelta(minutes=90)  # T90M due for all three
@@ -187,11 +206,13 @@ def test_game_level_isolation_one_failure_does_not_abort_others(
     )
 
     by_game = {r.game_id: r for r in results}
-    assert len(by_game) == 3
-    assert by_game["gA"].status is PredictionRunStatus.SUCCESS
-    assert by_game["gC"].status is PredictionRunStatus.SUCCESS
+    assert set(by_game) == {"gA", "gB", "gC"}  # every game got its own record
+    # gB's raised AssertionError was caught and classified, distinct from
+    # gA/gC's no-model outcome -- and did not prevent gA/gC from running.
     assert by_game["gB"].status is PredictionRunStatus.FAILED
     assert by_game["gB"].failure_code == "INVARIANT_VIOLATION"
+    assert by_game["gA"].failure_code == "GAME_NOT_MODELED"
+    assert by_game["gC"].failure_code == "GAME_NOT_MODELED"
 
 
 def test_predict_game_retry_with_fixed_run_id_never_fabricates_a_new_identity_or_duplicate(

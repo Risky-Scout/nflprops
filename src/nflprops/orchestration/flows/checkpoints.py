@@ -114,7 +114,8 @@ class _CheckpointExecution:
 
     `game_modeled` is False when no coherent simulation was produced (no
     PIT-visible game, or a team whose structural state is not yet
-    trustworthy) -- the pre-Phase-7D empty-but-valid outcome. Otherwise the
+    trustworthy): there is no projection artifact, so the flow maps it to
+    FAILED (PHASE 7E §2/§13), never SUCCESS / MODEL_ONLY. Otherwise the
     `player_game_projections` product was built, validated as exactly
     `eligible_players * 30` rows, and immutably persisted BEFORE the
     pricing fields below were set. `pricing_failed` distinguishes a genuine
@@ -271,8 +272,10 @@ def game_checkpoint_flow(ctx: CheckpointRunContext, *, now: datetime) -> Predict
       this flow that remaps such a failure to DATA_HOLD, so FAILED is the
       default (§10).
     * no PIT-visible game at all -> FAILED / GAME_NOT_FOUND (unchanged).
-    * state built but neither team trustworthy enough to simulate ->
-      SUCCESS / MODEL_ONLY, exactly as before Phase 7D (no artifact).
+    * state built but no coherent simulation could be produced (no usable
+      game model, hence no projection artifact) -> FAILED / NOT_PUBLISHED /
+      GAME_NOT_MODELED (PHASE 7E §2/§13: MODEL_ONLY is reserved for a run
+      that produced a complete projection artifact).
     * projections persisted, then a genuine pricing exception ->
       PARTIAL / NOT_PUBLISHED; the projection artifact is preserved (§11).
     * projections persisted, pricing produced zero rows normally ->
@@ -318,15 +321,27 @@ def game_checkpoint_flow(ctx: CheckpointRunContext, *, now: datetime) -> Predict
         )
 
     if not execution.game_modeled:
-        # State built, but neither team's structural state is trustworthy
-        # enough to simulate (expansion / brand-new provider). Exactly the
-        # pre-Phase-7D empty-but-valid outcome: SUCCESS / MODEL_ONLY, with
-        # no projection or pricing artifact.
+        # PHASE 7E certification invariant (§2/§13): state was built, but no
+        # usable game model result exists (neither team's structural state
+        # is trustworthy enough to simulate -- expansion / brand-new
+        # provider), so there is NO player_game_projections artifact.
+        # `publication_status = MODEL_ONLY` is reserved for a run that DID
+        # produce a complete projection artifact, so this must not be
+        # SUCCESS / MODEL_ONLY. No Phase-5 DATA_HOLD data-gate maps this
+        # case, so the certified fallback is FAILED / NOT_PUBLISHED with the
+        # narrowly scoped `GAME_NOT_MODELED` code (no new run status).
         return update_run_status(
             ctx.warehouse,
             ctx.run_id,
-            status=PredictionRunStatus.SUCCESS,
-            publication_status=PublicationStatus.MODEL_ONLY,
+            status=PredictionRunStatus.FAILED,
+            publication_status=PublicationStatus.NOT_PUBLISHED,
+            failure_code="GAME_NOT_MODELED",
+            failure_detail=(
+                f"game {ctx.game_id!r} is scheduled and PIT-visible as of "
+                f"{ctx.scheduled_as_of.isoformat()}, but no coherent game "
+                "simulation could be produced (insufficient team/player "
+                "structural state); no player_game_projections artifact exists."
+            ),
             flow_completed_at=now,
         )
 

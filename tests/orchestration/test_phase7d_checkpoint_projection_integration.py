@@ -858,3 +858,74 @@ def test_dispatcher_end_to_end_persists_projections_for_due_checkpoints(
     # E*30 for each successfully modeled checkpoint run
     for _run_id, count in proj.group_by("run_id").len().iter_rows():
         assert count % 30 == 0 and count > 0
+
+
+# ------------------------------------------------------- PHASE 7E certification
+
+
+def _games_only_warehouse(tmp_path: Path) -> Warehouse:
+    """A scheduled, PIT-visible game with NO team/player structural history:
+    state context builds, but no coherent simulation (and therefore no
+    projection artifact) can be produced."""
+    warehouse = Warehouse(tmp_path / "wh")
+    warehouse.write(
+        "games",
+        pl.DataFrame(
+            [
+                {
+                    "canonical_game_id": TARGET_GAME_ID,
+                    "available_at": KICKOFF - timedelta(days=3),
+                    "date": KICKOFF,
+                    "season": SEASON,
+                    "week": WEEK,
+                    "home_canonical_team_id": "no-history-home",
+                    "visitor_canonical_team_id": "no-history-away",
+                }
+            ]
+        ),
+    )
+    return warehouse
+
+
+def test_no_model_result_is_failed_not_success_and_not_model_only(
+    tmp_path: Path,
+) -> None:
+    """PHASE 7E §13 hard acceptance gate: a checkpoint that executes but
+    produces no usable game model result (hence no projection artifact) is
+    NOT SUCCESS and NOT MODEL_ONLY -- it is FAILED / NOT_PUBLISHED /
+    GAME_NOT_MODELED (no new run status, no DATA_HOLD gate exists)."""
+    warehouse = _games_only_warehouse(tmp_path)
+    record = _execute(warehouse, run_id="p7e-no-model")
+
+    assert record.status is PredictionRunStatus.FAILED
+    assert record.status is not PredictionRunStatus.SUCCESS
+    assert record.publication_status is PublicationStatus.NOT_PUBLISHED
+    assert record.publication_status is not PublicationStatus.MODEL_ONLY
+    assert record.failure_code == "GAME_NOT_MODELED"
+    # no projection artifact was created
+    assert not warehouse.exists(PLAYER_GAME_PROJECTIONS_TABLE)
+
+
+def test_model_only_status_always_implies_a_complete_projection_artifact(
+    tmp_path: Path,
+) -> None:
+    """PHASE 7E §2 certification invariant: publication_status == MODEL_ONLY
+    <=> a complete, valid E*30 player_game_projections artifact exists."""
+    # (a) valid model + zero quotes -> MODEL_ONLY, WITH a complete artifact.
+    zero_quote = _build_warehouse(
+        tmp_path / "zero",
+        quote_visible_at=AS_OF + timedelta(seconds=1),
+        quote_hidden_at=AS_OF + timedelta(minutes=5),
+    )
+    rec_a = _execute(zero_quote, run_id="p7e-model-only")
+    assert rec_a.publication_status is PublicationStatus.MODEL_ONLY
+    proj = _projections(zero_quote, run_id="p7e-model-only")
+    e_count = proj["player_id"].n_unique()
+    assert proj.height == e_count * 30 > 0
+
+    # (b) no usable model -> the artifact does not exist, so the run is
+    # NEVER MODEL_ONLY.
+    no_model = _games_only_warehouse(tmp_path / "none")
+    rec_b = _execute(no_model, run_id="p7e-no-model-2")
+    assert rec_b.publication_status is not PublicationStatus.MODEL_ONLY
+    assert not no_model.exists(PLAYER_GAME_PROJECTIONS_TABLE)
