@@ -1,5 +1,6 @@
 """Prefect flows for official game-relative pregame checkpoints
-(PHASE 5, §28-§32; PHASE 7D projection integration).
+(PHASE 5, §28-§32; PHASE 7D projection integration; PHASE 8D threshold
+integration).
 
 `checkpoint_dispatch_flow` finds every due-and-unclaimed official
 checkpoint across the scheduled games in (season, week), atomically claims
@@ -11,12 +12,14 @@ Neither flow reimplements prediction math. `game_checkpoint_flow` calls
 `nflprops.pipelines.pregame.compute_game_prediction` with
 `as_of=scheduled_as_of` (never `now`) to obtain the ONE coherent
 `GameSimulationResult` for the game/checkpoint, then -- from that single
-simulation -- builds, validates, and immutably persists the
-sportsbook-independent `player_game_projections` product (PHASE 7B/7C)
-*before* it prices and persists current sportsbook markets from the exact
-same result. Exactly one football simulation per game/checkpoint; the
-projection artifact is never conditioned on pricing success (PHASE 7D
-§3/§7/§11).
+simulation, in this exact order -- builds and immutably persists the
+sportsbook-independent `player_game_projections` product (PHASE 7B/7C),
+then builds and immutably persists the canonical
+`player_game_threshold_events` product (PHASE 8B/8C), then prices and
+persists current sportsbook markets (PHASE 6). Exactly one football
+simulation per game/checkpoint; both canonical model artifacts are
+persisted before any current-market price, and neither is conditioned on
+pricing success (PHASE 7D §3/§7/§11, PHASE 8D §4/§10).
 """
 
 from __future__ import annotations
@@ -62,6 +65,9 @@ from nflprops.orchestration.tasks import (
     TRANSIENT_RETRY_DELAY_SECONDS,
     retry_condition_fn,
 )
+from nflprops.orchestration.threshold_event_store import (
+    persist_player_game_threshold_events,
+)
 from nflprops.pipelines.pregame import (
     _latest_games_asof,
     compute_game_prediction,
@@ -69,6 +75,7 @@ from nflprops.pipelines.pregame import (
 )
 from nflprops.projections import build_player_game_projections, eligible_player_states
 from nflprops.projections.stats import REGISTRY_SIZE
+from nflprops.thresholds import build_player_game_threshold_events
 
 if TYPE_CHECKING:
     from nflprops.simulation.game import SimulationConfig
@@ -110,23 +117,35 @@ def _classify_exception(exc: BaseException) -> tuple[str, str]:
 
 @dataclass(frozen=True)
 class _CheckpointExecution:
-    """Outcome of one official checkpoint's model execution (PHASE 7D).
+    """Outcome of one official checkpoint's model execution (PHASE 7D/8D).
 
     `game_modeled` is False when no coherent simulation was produced (no
     PIT-visible game, or a team whose structural state is not yet
-    trustworthy): there is no projection artifact, so the flow maps it to
-    FAILED (PHASE 7E §2/§13), never SUCCESS / MODEL_ONLY. Otherwise the
-    `player_game_projections` product was built, validated as exactly
-    `eligible_players * 30` rows, and immutably persisted BEFORE the
-    pricing fields below were set. `pricing_failed` distinguishes a genuine
-    downstream pricing exception (run -> PARTIAL, projections preserved)
-    from an ordinary zero-quote result (`priced_row_count == 0`, run ->
-    MODEL_ONLY)."""
+    trustworthy): there is NO projection artifact and NO threshold
+    artifact, so the flow maps it to FAILED (PHASE 7E §2/§13), never
+    SUCCESS / MODEL_ONLY.
+
+    Otherwise the `player_game_projections` product was built, validated as
+    exactly `eligible_players * 30` rows, and immutably persisted; then --
+    from the SAME simulation -- the `player_game_threshold_events` product
+    was built and immutably persisted (the certified Phase-8C layer is
+    authoritative for its E*131 completeness / provenance / immutability).
+    `threshold_failed` marks a Phase-8 build/persist exception AFTER
+    projections persisted: the run is PARTIAL, projections retained, no
+    current pricing ran. `pricing_failed` (only reachable once BOTH
+    canonical artifacts exist) distinguishes a genuine downstream pricing
+    exception (run -> PARTIAL, both artifacts preserved) from an ordinary
+    zero-quote result (`priced_row_count == 0`, run -> MODEL_ONLY -- which
+    now means both complete canonical model artifacts exist)."""
 
     game_modeled: bool
     eligible_players: int
     projection_rows_persisted: int
+    threshold_rows_persisted: int
     priced_row_count: int
+    threshold_failed: bool
+    threshold_failure_code: str | None
+    threshold_failure_detail: str | None
     pricing_failed: bool
     pricing_failure_code: str | None
     pricing_failure_detail: str | None
@@ -150,18 +169,26 @@ def _run_game_checkpoint_task(
     by identical-scientific-output no-op (PHASE 7C), `predictions` /
     `simulation_player_results` by their existing natural keys.
 
-    Order (PHASE 7D §3/§7/§10/§11/§22/§23):
+    Order (PHASE 7D §3/§7/§10/§11/§22/§23 + PHASE 8D §4/§5/§6/§10):
 
     1. `compute_game_prediction` -> the ONE coherent `GameSimulationResult`
        (as of `scheduled_as_of`), plus the pre-simulation player states.
     2. From that single result: build the 30-stat projection product,
        assert it is exactly `E * 30` rows, and immutably persist it. Any
        failure here propagates (deterministic -> non-retryable -> the flow
-       maps it to FAILED); pricing is never reached.
-    3. Only then: price current sportsbook markets from the SAME result and
-       persist them. A genuine exception here is caught and returned as
-       `pricing_failed` (the flow maps it to PARTIAL) -- the already-
-       persisted projection artifact is never rolled back.
+       maps it to FAILED); nothing downstream runs.
+    3. From the SAME result and the SAME player states: build the canonical
+       `E * 131` threshold-event product (certified Phase-8B API) and
+       immutably persist it (certified Phase-8C API -- authoritative for
+       provenance / player-universe / completeness / catalog / idempotency
+       / atomicity; never duplicated here). A failure here is CAUGHT and
+       returned as `threshold_failed` -- the flow maps it to PARTIAL, the
+       already-persisted projection artifact is retained, and pricing is
+       never reached.
+    4. Only once BOTH canonical model artifacts exist: price current
+       sportsbook markets from the SAME result and persist them. A genuine
+       exception here is caught and returned as `pricing_failed` (the flow
+       maps it to PARTIAL) -- neither canonical artifact is rolled back.
     """
     computation = compute_game_prediction(
         ctx.warehouse,
@@ -183,7 +210,11 @@ def _run_game_checkpoint_task(
             game_modeled=False,
             eligible_players=0,
             projection_rows_persisted=0,
+            threshold_rows_persisted=0,
             priced_row_count=0,
+            threshold_failed=False,
+            threshold_failure_code=None,
+            threshold_failure_detail=None,
             pricing_failed=False,
             pricing_failure_code=None,
             pricing_failure_detail=None,
@@ -191,20 +222,21 @@ def _run_game_checkpoint_task(
 
     simulation = computation.simulation
     eligible = eligible_player_states(simulation, computation.player_states)
+
+    # --- PHASE 7: player_game_projections (failure -> FAILED) -------------
     projections = build_player_game_projections(
         simulation, player_states=computation.player_states
     )
     expected_rows = len(eligible) * REGISTRY_SIZE
     if projections.height != expected_rows:
         # §22: a supposedly successful build that is not exactly E*30 must
-        # fail before pricing -- never silently publish an incomplete
-        # player projection product.
+        # fail before anything downstream -- never silently publish an
+        # incomplete player projection product.
         raise AssertionError(
             f"official checkpoint projection build produced {projections.height} "
             f"rows; expected E*30 = {expected_rows} (E={len(eligible)} eligible "
-            "players). Refusing to price or publish an incomplete projection product."
+            "players). Refusing to continue with an incomplete projection product."
         )
-
     persist_player_game_projections(
         ctx.warehouse,
         projections,
@@ -214,6 +246,42 @@ def _run_game_checkpoint_task(
         created_at=datetime.now(UTC),
     )
 
+    # --- PHASE 8: player_game_threshold_events (failure -> PARTIAL) -------
+    # Built from the SAME simulation object and the SAME player_states used
+    # for Phase-7 eligibility; no second simulation, no quote input. The
+    # Phase-8C persistence layer enforces E*131 completeness / parent
+    # provenance / player-universe match against the just-persisted Phase-7
+    # artifact / catalog-key validation / immutability / atomicity -- none
+    # of that is re-implemented here.
+    try:
+        threshold_events = build_player_game_threshold_events(
+            simulation, player_states=computation.player_states
+        )
+        threshold_result = persist_player_game_threshold_events(
+            ctx.warehouse,
+            threshold_events,
+            run_id=ctx.run_id,
+            season=ctx.season,
+            week=ctx.week,
+            created_at=datetime.now(UTC),
+        )
+    except Exception as exc:
+        code, detail = _classify_exception(exc)
+        return _CheckpointExecution(
+            game_modeled=True,
+            eligible_players=len(eligible),
+            projection_rows_persisted=projections.height,
+            threshold_rows_persisted=0,
+            priced_row_count=0,
+            threshold_failed=True,
+            threshold_failure_code="THRESHOLD_ERROR",
+            threshold_failure_detail=f"{code}: {detail}",
+            pricing_failed=False,
+            pricing_failure_code=None,
+            pricing_failure_detail=None,
+        )
+
+    # --- PHASE 6: current sportsbook pricing (failure -> PARTIAL) ---------
     try:
         priced = computation.price_markets()
         persist_current_pricing(
@@ -231,7 +299,11 @@ def _run_game_checkpoint_task(
             game_modeled=True,
             eligible_players=len(eligible),
             projection_rows_persisted=projections.height,
+            threshold_rows_persisted=threshold_result.total,
             priced_row_count=0,
+            threshold_failed=False,
+            threshold_failure_code=None,
+            threshold_failure_detail=None,
             pricing_failed=True,
             pricing_failure_code=code,
             pricing_failure_detail=detail,
@@ -241,7 +313,11 @@ def _run_game_checkpoint_task(
         game_modeled=True,
         eligible_players=len(eligible),
         projection_rows_persisted=projections.height,
+        threshold_rows_persisted=threshold_result.total,
         priced_row_count=len(priced),
+        threshold_failed=False,
+        threshold_failure_code=None,
+        threshold_failure_detail=None,
         pricing_failed=False,
         pricing_failure_code=None,
         pricing_failure_detail=None,
@@ -275,13 +351,26 @@ def game_checkpoint_flow(ctx: CheckpointRunContext, *, now: datetime) -> Predict
     * state built but no coherent simulation could be produced (no usable
       game model, hence no projection artifact) -> FAILED / NOT_PUBLISHED /
       GAME_NOT_MODELED (PHASE 7E §2/§13: MODEL_ONLY is reserved for a run
-      that produced a complete projection artifact).
-    * projections persisted, then a genuine pricing exception ->
-      PARTIAL / NOT_PUBLISHED; the projection artifact is preserved (§11).
-    * projections persisted, pricing produced zero rows normally ->
-      SUCCESS / MODEL_ONLY (§8/§12).
-    * projections persisted, pricing produced rows -> SUCCESS / PUBLISHED
-      (unchanged publication semantics, §9).
+      that produced BOTH complete canonical model artifacts).
+    * projections persisted, then a Phase-8 threshold build/persist
+      exception -> PARTIAL / NOT_PUBLISHED / THRESHOLD_ERROR; the Phase-7
+      projection artifact is retained and no current pricing ran
+      (PHASE 8D §10/§11).
+    * both canonical artifacts persisted, then a genuine pricing exception
+      -> PARTIAL / NOT_PUBLISHED; both artifacts are preserved
+      (PHASE 7D §11, PHASE 8D §10).
+    * both canonical artifacts persisted, pricing produced zero rows
+      normally -> SUCCESS / MODEL_ONLY -- which now means BOTH the complete
+      Phase-7 projection artifact AND the complete Phase-8 threshold
+      artifact exist (PHASE 8D §8/§11).
+    * both canonical artifacts persisted, pricing produced rows ->
+      SUCCESS / PUBLISHED (unchanged publication semantics, §9).
+
+    A run only reaches SUCCESS (MODEL_ONLY or PUBLISHED) once BOTH
+    `persist_player_game_projections` AND
+    `persist_player_game_threshold_events` have returned without raising,
+    so a run is never publication-eligible without both complete canonical
+    model artifacts (PHASE 8D §11).
     """
     update_run_status(ctx.warehouse, ctx.run_id, status=PredictionRunStatus.RUNNING)
 
@@ -345,10 +434,27 @@ def game_checkpoint_flow(ctx: CheckpointRunContext, *, now: datetime) -> Predict
             flow_completed_at=now,
         )
 
+    if execution.threshold_failed:
+        # PHASE 8D §10/§11: the complete Phase-7 projection artifact is
+        # persisted; the Phase-8 threshold build/persist then failed. The
+        # Phase-8C persist layer is atomic, so there is no partial
+        # threshold artifact -- and no current pricing ran. The run is
+        # PARTIAL / NOT_PUBLISHED with the projection artifact retained.
+        return update_run_status(
+            ctx.warehouse,
+            ctx.run_id,
+            status=PredictionRunStatus.PARTIAL,
+            publication_status=PublicationStatus.NOT_PUBLISHED,
+            failure_code=execution.threshold_failure_code,
+            failure_detail=execution.threshold_failure_detail,
+            flow_completed_at=now,
+        )
+
     if execution.pricing_failed:
-        # §11/§12: projections were built, validated as E*30, and immutably
-        # persisted; current-market pricing then raised. The projection
-        # artifact stays; the run is PARTIAL / NOT_PUBLISHED.
+        # §11/§12 + PHASE 8D §10: both canonical model artifacts (Phase-7
+        # projections and Phase-8 threshold events) were built and
+        # immutably persisted; current-market pricing then raised. Both
+        # artifacts stay; the run is PARTIAL / NOT_PUBLISHED.
         return update_run_status(
             ctx.warehouse,
             ctx.run_id,
