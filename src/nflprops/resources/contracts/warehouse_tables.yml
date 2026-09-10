@@ -257,6 +257,36 @@ tables:
       columns: [projection_id, run_id, season, week, game_id, player_id,
         team_id, position_group, stat_name, n_draws, mean, p05, p10, p25,
         p50, p75, p90, p95, created_at]
+    player_game_threshold_events:
+      key: [threshold_event_id]
+      unique: [run_id, player_id, stat_name, event_type, threshold]
+      foreign_key: {run_id: "prediction_runs.run_id"}
+      pit: false
+      note: >
+        PHASE 8C. player_game_threshold_events = immutable
+        sportsbook-independent store of raw AT_LEAST threshold / milestone
+        probabilities derived (PHASE 8B) from the SAME Phase-7 coherent
+        simulation draws that feed player_game_projections. One row per
+        (run_id, player_id, stat_name, event_type, threshold);
+        threshold_event_id = SHA-256(run_id | player_id | stat_name |
+        event_type | threshold). Stores ONLY p_hit (p_miss = 1 - p_hit is
+        never stored) -- no American odds, no push probability, no EV, no
+        vendor, no sportsbook line/price. CHECK constraints: threshold > 0,
+        n_draws > 0, 0 <= p_hit <= 1, event_type = 'AT_LEAST'. Never
+        updated or overwritten: an identical scientific re-run is an
+        idempotent no-op, any differing scientific field for an existing
+        threshold_event_id is a hard error, and p_hit equality is EXACT
+        (no tolerance). created_at is operational metadata only, excluded
+        from scientific equality. Requires a real prediction_runs parent
+        row AND a complete Phase-7 player_game_projections artifact for the
+        same run (the authoritative eligible-player set) -- the persisted
+        product is the complete E x catalog.event_count grid, never a
+        sparse subset. FK is NOT ON DELETE CASCADE. See
+        nflprops.orchestration.threshold_event_store and
+        migrations/versions/0005_player_game_threshold_events.py.
+      columns: [threshold_event_id, run_id, season, week, game_id,
+        player_id, team_id, position_group, stat_name, event_type,
+        threshold, p_hit, n_draws, catalog_version, created_at]
 
   governance:
     model_registry:
