@@ -27,6 +27,19 @@ from nflprops.data.warehouse import Warehouse
 NOW = datetime(2026, 9, 10, tzinfo=UTC)
 
 
+def _received_at(result, resource_type: ResourceType) -> datetime:
+    """The ``collector_received_at`` the engine actually wrote for
+    ``resource_type`` in this run -- the point in time at/after which its
+    feed is available. Anchoring assertions to this value (rather than a
+    hard-coded future ``as_of``) keeps the point-in-time check
+    (``collector_received_at <= as_of``) time-independent."""
+    runs = [r for r in result.resource_runs if r.resource_type == resource_type]
+    assert len(runs) == 1
+    received = runs[0].collector_received_at
+    assert received is not None
+    return received
+
+
 def _provider_with_game_but_no_injuries() -> FakeProvider:
     provider = FakeProvider()
     provider.seed_team("t1", nickname="Home", abbreviation="HOM")
@@ -67,7 +80,7 @@ def test_zero_row_injury_collection_establishes_availability(tmp_path: Path) -> 
     provider = _provider_with_game_but_no_injuries()
     warehouse = Warehouse(tmp_path / "warehouse")
 
-    collect_once(
+    result = collect_once(
         provider=provider,
         season=2026,
         week=1,
@@ -77,12 +90,22 @@ def test_zero_row_injury_collection_establishes_availability(tmp_path: Path) -> 
     )
 
     resource_runs = warehouse.read("collector_resource_runs")
-    later = NOW + timedelta(minutes=1)
+    received = _received_at(result, ResourceType.INJURIES)
 
+    # PIT contract: available at (>=) its own collector_received_at ...
     assert (
-        resource_feed_available_at(resource_runs, resource_type=ResourceType.INJURIES, as_of=later)
+        resource_feed_available_at(
+            resource_runs, resource_type=ResourceType.INJURIES, as_of=received
+        )
         is True
     )
-    # And through the (deprecated) injury_availability wrapper, which now
-    # reads the same generalized source.
-    assert injury_feed_available_at(resource_runs, as_of=later) is True
+    assert injury_feed_available_at(resource_runs, as_of=received) is True
+    # ... and NOT available one microsecond before it was received.
+    just_before = received - timedelta(microseconds=1)
+    assert (
+        resource_feed_available_at(
+            resource_runs, resource_type=ResourceType.INJURIES, as_of=just_before
+        )
+        is False
+    )
+    assert injury_feed_available_at(resource_runs, as_of=just_before) is False

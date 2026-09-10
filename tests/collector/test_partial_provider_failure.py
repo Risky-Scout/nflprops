@@ -31,6 +31,19 @@ from nflprops.data.warehouse import Warehouse
 NOW = datetime(2026, 9, 10, tzinfo=UTC)
 
 
+def _received_at(result, resource_type: ResourceType) -> datetime:
+    """The ``collector_received_at`` the engine actually wrote for
+    ``resource_type`` in this run. Anchoring availability assertions to
+    this value (rather than a hard-coded future ``as_of``) keeps the
+    point-in-time check (``collector_received_at <= as_of``)
+    time-independent."""
+    runs = [r for r in result.resource_runs if r.resource_type == resource_type]
+    assert len(runs) == 1
+    received = runs[0].collector_received_at
+    assert received is not None
+    return received
+
+
 class _InjuriesFailProvider(FakeProvider):
     def injuries(self, team_ids=None, player_ids=None):
         raise RuntimeError("simulated injury feed outage")
@@ -104,26 +117,42 @@ def test_injury_data_available_is_false_but_odds_props_remain_available(tmp_path
     provider, _home = _seeded_provider()
     warehouse = Warehouse(tmp_path / "warehouse")
 
-    collect_once(
+    result = collect_once(
         provider=provider, season=2026, week=1, warehouse=warehouse, config=Config(data={}), now=NOW
     )
 
     resource_runs = warehouse.read("collector_resource_runs")
-    later = NOW + timedelta(minutes=1)
 
+    # The injuries run errored (PROVIDER_ERROR), so it wrote no
+    # collector_received_at and NEVER establishes availability -- true at
+    # every as_of, including far in the future.
+    far_future = NOW + timedelta(days=365)
     assert (
-        resource_feed_available_at(resource_runs, resource_type=ResourceType.INJURIES, as_of=later)
+        resource_feed_available_at(
+            resource_runs, resource_type=ResourceType.INJURIES, as_of=far_future
+        )
         is False
     )
-    assert (
-        resource_feed_available_at(resource_runs, resource_type=ResourceType.GAME_ODDS, as_of=later)
-        is True
-    )
-    assert (
-        resource_feed_available_at(resource_runs, resource_type=ResourceType.PLAYER_PROPS, as_of=later)
-        is True
-    )
-    assert (
-        resource_feed_available_at(resource_runs, resource_type=ResourceType.ROSTERS, as_of=later)
-        is True
-    )
+
+    # Every successful resource IS available -- checked at (>=) its own
+    # collector_received_at, and NOT one microsecond before.
+    for resource_type in (
+        ResourceType.GAME_ODDS,
+        ResourceType.PLAYER_PROPS,
+        ResourceType.ROSTERS,
+    ):
+        received = _received_at(result, resource_type)
+        assert (
+            resource_feed_available_at(
+                resource_runs, resource_type=resource_type, as_of=received
+            )
+            is True
+        )
+        assert (
+            resource_feed_available_at(
+                resource_runs,
+                resource_type=resource_type,
+                as_of=received - timedelta(microseconds=1),
+            )
+            is False
+        )

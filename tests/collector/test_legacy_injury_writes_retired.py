@@ -34,6 +34,19 @@ from nflprops.pipelines.lean import LeanIngestor
 NOW = datetime(2026, 9, 10, tzinfo=UTC)
 
 
+def _received_at(result, resource_type: ResourceType) -> datetime:
+    """The ``collector_received_at`` the engine actually wrote for
+    ``resource_type`` in this run. Anchoring the availability assertion to
+    this value (rather than a hard-coded future ``as_of``) keeps the
+    point-in-time check (``collector_received_at <= as_of``)
+    time-independent."""
+    runs = [r for r in result.resource_runs if r.resource_type == resource_type]
+    assert len(runs) == 1
+    received = runs[0].collector_received_at
+    assert received is not None
+    return received
+
+
 class _IngestWeekFakeProvider:
     """Minimal duck-typed provider stub for LeanIngestor.ingest_week --
     never touches the network."""
@@ -142,10 +155,22 @@ def test_collect_once_writes_collector_resource_runs_not_legacy_table(
     assert not warehouse.exists(INJURY_SNAPSHOT_RUNS_TABLE)
 
     resource_runs = warehouse.read("collector_resource_runs")
-    later = NOW + timedelta(minutes=1)
+    received = _received_at(result, ResourceType.INJURIES)
+    # PIT contract: the injury feed is available at (>=) its own
+    # collector_received_at, and not one microsecond before.
     assert (
-        resource_feed_available_at(resource_runs, resource_type=ResourceType.INJURIES, as_of=later)
+        resource_feed_available_at(
+            resource_runs, resource_type=ResourceType.INJURIES, as_of=received
+        )
         is True
+    )
+    assert (
+        resource_feed_available_at(
+            resource_runs,
+            resource_type=ResourceType.INJURIES,
+            as_of=received - timedelta(microseconds=1),
+        )
+        is False
     )
 
 
