@@ -14,6 +14,10 @@ Checks:
   6. Every invariant has a unique id.
   7. Every warehouse table declared PIT appears under a layer that supports it.
   8. Python enums in domain/enums.py match the contract enums.
+  9. threshold_catalog.yml: exactly 131 AT_LEAST events; every ladder is a
+     strictly-ascending list of positive integers with no duplicate
+     (stat_name, threshold); every stat is a Phase-7 registry stat or a
+     declared catalog-derived stat with a deterministic derivation.
 
 Exit code 0 = clean. Non-zero = at least one violation, listed.
 """
@@ -47,6 +51,7 @@ def main() -> int:
     feats = load("feature_registry.yml")
     invs = load("invariants.yml")
     tables = load("warehouse_tables.yml")
+    threshold_catalog = load("threshold_catalog.yml")
 
     # --- 2. prop enum agreement -------------------------------------------
     bdl_props = set(bdl["enums"]["player_prop_types"])
@@ -130,6 +135,65 @@ def main() -> int:
     except ImportError as exc:  # pragma: no cover
         problems.append(f"could not import nflprops.domain.enums: {exc}")
 
+    # --- 9. threshold catalog (PHASE 8) ----------------------------------
+    try:
+        from nflprops.projections.stats import REGISTRY_STAT_NAMES
+        from nflprops.thresholds.catalog import (
+            ThresholdCatalogError,
+            parse_threshold_catalog,
+        )
+
+        registry_stats = frozenset(REGISTRY_STAT_NAMES)
+        try:
+            catalog = parse_threshold_catalog(
+                threshold_catalog, registry_stats=registry_stats
+            )
+        except ThresholdCatalogError as exc:
+            problems.append(f"threshold_catalog.yml: {exc}")
+        else:
+            if catalog.event_count != 131:
+                problems.append(
+                    f"threshold_catalog.yml: expected exactly 131 events, "
+                    f"catalog defines {catalog.event_count}"
+                )
+            if catalog.event_type != "AT_LEAST":
+                problems.append(
+                    f"threshold_catalog.yml: event_type must be AT_LEAST, "
+                    f"got {catalog.event_type!r}"
+                )
+            # every ladder stat resolves; derived stats declare a derivation.
+            known = registry_stats | frozenset(catalog.derived_stats)
+            for ladder in catalog.ladders:
+                if ladder.stat_name not in known:
+                    problems.append(
+                        f"threshold_catalog.yml: stat {ladder.stat_name!r} is "
+                        f"not a registry stat or declared catalog-derived stat"
+                    )
+                if list(ladder.thresholds) != sorted(set(ladder.thresholds)):
+                    problems.append(
+                        f"threshold_catalog.yml: {ladder.stat_name!r} thresholds "
+                        f"are not strictly ascending / unique"
+                    )
+                if any(t < 1 for t in ladder.thresholds):
+                    problems.append(
+                        f"threshold_catalog.yml: {ladder.stat_name!r} has a "
+                        f"non-positive threshold"
+                    )
+            for name, derived in catalog.derived_stats.items():
+                if not derived.derivation.strip():
+                    problems.append(
+                        f"threshold_catalog.yml: derived stat {name!r} has no "
+                        f"derivation"
+                    )
+                for component in derived.inputs:
+                    if component not in registry_stats:
+                        problems.append(
+                            f"threshold_catalog.yml: derived stat {name!r} input "
+                            f"{component!r} is not a registry stat"
+                        )
+    except ImportError as exc:  # pragma: no cover
+        problems.append(f"could not import nflprops threshold catalog: {exc}")
+
     # --- report ------------------------------------------------------------
     if problems:
         print(f"CONTRACT VALIDATION FAILED — {len(problems)} problem(s):\n")
@@ -142,6 +206,10 @@ def main() -> int:
     print(f"  features registered : {len(feats['features'])}")
     print(f"  invariants declared : {len(seen)}")
     print(f"  BDL endpoints       : {len(bdl['endpoints'])}")
+    print(
+        f"  threshold events    : "
+        f"{sum(len(v['values']) for v in threshold_catalog['thresholds'].values())}"
+    )
     print("")
     print("NOTE: this validates INTERNAL consistency only. It does NOT verify the")
     print("field inventory against the real BDL OpenAPI spec. For that, pin the spec")
