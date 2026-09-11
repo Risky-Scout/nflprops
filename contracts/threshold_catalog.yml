@@ -22,8 +22,19 @@
 #   STANDARD_THRESHOLD_ELIGIBLE -> scalar count / yardage / points ladder
 #   MILESTONE_ONLY              -> small natural count-milestone set
 #
-# Total events = 131  (111 standard + 20 milestone) over 23 catalog stats
-# (22 Phase-7 registry stats + 1 catalog-derived stat, `offensive_tds`).
+# 23 Phase-8 catalog stat series
+#     = 22 Phase-7 registry-backed threshold stat series
+#     +  1 catalog-derived stat series (`offensive_tds`)
+# 131 total canonical AT_LEAST events
+#     = 111 STANDARD threshold events + 20 MILESTONE threshold events
+#
+# Registry classification (of the 30 Phase-7 registry stats):
+#     16 STANDARD registry stats  + 6 MILESTONE registry stats  (= the 22
+#        registry-backed catalog series above)
+#      5 binary Phase-7 stats deliberately NOT duplicated here
+#        (anytime_td, anytime_td_1q / _1h / _2h, first_td)
+#      3 registry stats with no independent Phase-8 ladder -- components
+#        only (receiving_tds, rushing_tds, xp_made)
 # =====================================================================
 version: "2026.1.0"
 

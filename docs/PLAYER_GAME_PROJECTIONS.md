@@ -2,8 +2,11 @@
 
 **Status:** PHASE 7 certified (7A eligibility, 7B in-memory engine, 7C immutable
 persistence + parent provenance, 7D official-checkpoint integration, 7E
-certification). Phase 8 (threshold ladders / milestone pricing / odds) is
-explicitly **deferred** — see [Phase-8 deferral](#phase-8-deferral).
+certification). Phase 8 (raw threshold / milestone **probabilities**) is now a
+certified sibling product,
+[`player_game_threshold_events`](THRESHOLD_MILESTONE_PROBABILITIES.md); threshold
+**odds / pricing / EV** remain deferred — see
+[Phase-8 deferral](#phase-8-deferral).
 
 ---
 
@@ -368,11 +371,20 @@ silently agreeing with a "no designation" reading.
 
 ## Phase-8 deferral
 
-The following are **Phase 8** and are intentionally **not** implemented here:
-threshold ladders, standard milestones, arbitrary threshold probabilities,
-American odds for thresholds, `player_threshold_prices`, consensus / best-price,
-confidence surfaces, Opportunities, Kelly, final-forecast policy, retraining /
-recalibration, API, dashboard, and WizardOfOdds / SportsOdds publishing.
+The following are **not** implemented in *this* (`player_game_projections`)
+product: threshold ladders, standard milestones, arbitrary threshold
+probabilities, American odds for thresholds, `player_threshold_prices`,
+consensus / best-price, confidence surfaces, Opportunities, Kelly, final-forecast
+policy, retraining / recalibration, API, dashboard, and WizardOfOdds /
+SportsOdds publishing.
 
 `player_game_projections` is the sportsbook-independent model artifact those
 phases build on; it does not itself price thresholds.
+
+**Phase 8 (now certified)** adds the sibling canonical product
+`player_game_threshold_events` — raw `AT_LEAST` threshold / milestone
+probabilities (`p_hit` only) from the *same* one `GameSimulationResult`, over a
+versioned 131-event catalog. See
+[`docs/THRESHOLD_MILESTONE_PROBABILITIES.md`](THRESHOLD_MILESTONE_PROBABILITIES.md).
+American odds / push-adjusted pricing / devig / EV / consensus / ranking / Kelly
+/ API / dashboard / publishing remain **Phase 9+**.
