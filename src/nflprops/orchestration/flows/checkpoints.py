@@ -1,6 +1,6 @@
 """Prefect flows for official game-relative pregame checkpoints
 (PHASE 5, §28-§32; PHASE 7D projection integration; PHASE 8D threshold
-integration).
+integration; PHASE 9D canonical pricing integration).
 
 `checkpoint_dispatch_flow` finds every due-and-unclaimed official
 checkpoint across the scheduled games in (season, week), atomically claims
@@ -12,14 +12,30 @@ Neither flow reimplements prediction math. `game_checkpoint_flow` calls
 `nflprops.pipelines.pregame.compute_game_prediction` with
 `as_of=scheduled_as_of` (never `now`) to obtain the ONE coherent
 `GameSimulationResult` for the game/checkpoint, then -- from that single
-simulation, in this exact order -- builds and immutably persists the
-sportsbook-independent `player_game_projections` product (PHASE 7B/7C),
-then builds and immutably persists the canonical
-`player_game_threshold_events` product (PHASE 8B/8C), then prices and
-persists current sportsbook markets (PHASE 6). Exactly one football
-simulation per game/checkpoint; both canonical model artifacts are
-persisted before any current-market price, and neither is conditioned on
-pricing success (PHASE 7D §3/§7/§11, PHASE 8D §4/§10).
+simulation, in this exact order:
+
+1. builds and immutably persists the sportsbook-independent
+   `player_game_projections` product (PHASE 7B/7C);
+2. builds and immutably persists the canonical
+   `player_game_threshold_events` product (PHASE 8B/8C);
+3. prices current sportsbook markets EXACTLY ONCE
+   (`GamePredictionComputation.price_markets`, PHASE 6/9B);
+4. immutably persists that SAME priced frame as the canonical
+   `player_prop_pricing_artifacts` + `player_prop_prices` product
+   (`nflprops.orchestration.pricing_store.persist_player_prop_pricing`,
+   PHASE 9C) -- now the authoritative pricing record, including for a
+   zero-quote run (`row_count == 0` is a complete artifact, never an
+   absent one);
+5. mirrors that SAME priced frame into the legacy Warehouse/Parquet
+   `predictions` compatibility output (`persist_current_pricing`) -- a
+   compatibility sink, not the canonical record, retained until PHASE 9E.
+
+Exactly one football simulation and exactly one pricing calculation per
+game/checkpoint; both canonical model artifacts are persisted before any
+current-market price, canonical pricing persists before the legacy
+mirror, and none of steps 3-5 is conditioned on any other's success
+except in the order given (PHASE 7D §3/§7/§11, PHASE 8D §4/§10,
+PHASE 9D §2/§6/§9/§10).
 """
 
 from __future__ import annotations
@@ -28,6 +44,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+import polars as pl
 from prefect import flow, task
 
 from nflprops.backtest.leakage import LeakageError as BacktestLeakageError
@@ -49,6 +66,7 @@ from nflprops.orchestration.checkpoints import (
     scheduled_as_of as compute_scheduled_as_of,
 )
 from nflprops.orchestration.manifest import compute_data_manifest_sha256
+from nflprops.orchestration.pricing_store import persist_player_prop_pricing
 from nflprops.orchestration.projection_store import persist_player_game_projections
 from nflprops.orchestration.run_store import (
     FAILURE_CHECKPOINT_MISSED,
@@ -132,11 +150,32 @@ class _CheckpointExecution:
     authoritative for its E*131 completeness / provenance / immutability).
     `threshold_failed` marks a Phase-8 build/persist exception AFTER
     projections persisted: the run is PARTIAL, projections retained, no
-    current pricing ran. `pricing_failed` (only reachable once BOTH
-    canonical artifacts exist) distinguishes a genuine downstream pricing
-    exception (run -> PARTIAL, both artifacts preserved) from an ordinary
-    zero-quote result (`priced_row_count == 0`, run -> MODEL_ONLY -- which
-    now means both complete canonical model artifacts exist)."""
+    current pricing ran.
+
+    PHASE 9D pricing has three independently-failable stages, in order:
+
+    1. `pricing_failed` -- either the ONE `price_current_markets()` call
+       itself raised (a genuine pricing-calculation exception: unsupported
+       count-style milestone, unknown market type, invalid sportsbook
+       price, ...), OR the certified Phase-9C
+       `persist_player_prop_pricing` call raised. Either way NO canonical
+       pricing artifact exists (`canonical_pricing_persisted=False`); both
+       canonical model artifacts (projections, thresholds) are preserved;
+       the run is PARTIAL. Phase-9C's own atomicity already guarantees no
+       partial canonical pricing artifact is ever left behind.
+    2. Once the canonical Phase-9C artifact is persisted
+       (`canonical_pricing_persisted=True`), the legacy Warehouse
+       compatibility mirror (`persist_current_pricing`) runs from the
+       SAME already-computed priced frame -- no second pricing call.
+       `legacy_mirror_failed` marks an exception there: until Phase 9E
+       certifies no required consumer depends on the legacy output, this
+       still fails the run closed (PARTIAL), but the canonical projection,
+       threshold, AND pricing artifacts are all retained.
+    3. Both canonical persistence and the legacy mirror succeeding, with
+       `priced_row_count == 0`, is an ordinary zero-quote result -> run ->
+       MODEL_ONLY, which now additionally requires the canonical Phase-9
+       pricing artifact header to exist (never merely inferred from a
+       zero row count)."""
 
     game_modeled: bool
     eligible_players: int
@@ -149,6 +188,10 @@ class _CheckpointExecution:
     pricing_failed: bool
     pricing_failure_code: str | None
     pricing_failure_detail: str | None
+    canonical_pricing_persisted: bool
+    legacy_mirror_failed: bool
+    legacy_mirror_failure_code: str | None
+    legacy_mirror_failure_detail: str | None
 
 
 @task(
@@ -186,9 +229,20 @@ def _run_game_checkpoint_task(
        already-persisted projection artifact is retained, and pricing is
        never reached.
     4. Only once BOTH canonical model artifacts exist: price current
-       sportsbook markets from the SAME result and persist them. A genuine
-       exception here is caught and returned as `pricing_failed` (the flow
-       maps it to PARTIAL) -- neither canonical artifact is rolled back.
+       sportsbook markets from the SAME result, EXACTLY ONCE (PHASE 9B). A
+       genuine exception here is caught and returned as `pricing_failed`
+       (the flow maps it to PARTIAL) -- neither canonical model artifact
+       is rolled back, and no canonical pricing artifact is created.
+    5. From that SAME priced frame: immutably persist the canonical
+       Phase-9C `player_prop_pricing_artifacts` + `player_prop_prices`
+       product. A failure here is ALSO `pricing_failed` -- Phase-9C's own
+       atomicity guarantees no partial artifact is left behind -- and the
+       legacy mirror below never runs.
+    6. Only once the canonical pricing artifact exists: mirror the SAME
+       priced frame into the legacy Warehouse `predictions` compatibility
+       output. A failure here is `legacy_mirror_failed` (the flow still
+       maps it to PARTIAL until PHASE 9E, but the canonical projection /
+       threshold / pricing artifacts are all retained).
     """
     computation = compute_game_prediction(
         ctx.warehouse,
@@ -218,6 +272,10 @@ def _run_game_checkpoint_task(
             pricing_failed=False,
             pricing_failure_code=None,
             pricing_failure_detail=None,
+            canonical_pricing_persisted=False,
+            legacy_mirror_failed=False,
+            legacy_mirror_failure_code=None,
+            legacy_mirror_failure_detail=None,
         )
 
     simulation = computation.simulation
@@ -279,11 +337,68 @@ def _run_game_checkpoint_task(
             pricing_failed=False,
             pricing_failure_code=None,
             pricing_failure_detail=None,
+            canonical_pricing_persisted=False,
+            legacy_mirror_failed=False,
+            legacy_mirror_failure_code=None,
+            legacy_mirror_failure_detail=None,
         )
 
-    # --- PHASE 6: current sportsbook pricing (failure -> PARTIAL) ---------
+    def _failed_execution(
+        *, pricing_failure_code: str, pricing_failure_detail: str
+    ) -> _CheckpointExecution:
+        return _CheckpointExecution(
+            game_modeled=True,
+            eligible_players=len(eligible),
+            projection_rows_persisted=projections.height,
+            threshold_rows_persisted=threshold_result.total,
+            priced_row_count=0,
+            threshold_failed=False,
+            threshold_failure_code=None,
+            threshold_failure_detail=None,
+            pricing_failed=True,
+            pricing_failure_code=pricing_failure_code,
+            pricing_failure_detail=pricing_failure_detail,
+            canonical_pricing_persisted=False,
+            legacy_mirror_failed=False,
+            legacy_mirror_failure_code=None,
+            legacy_mirror_failure_detail=None,
+        )
+
+    # --- PHASE 6/9B: price current sportsbook markets, exactly once -------
+    # (failure -> PARTIAL, no canonical pricing artifact, no legacy mirror)
     try:
         priced = computation.price_markets()
+    except Exception as exc:
+        code, detail = _classify_exception(exc)
+        return _failed_execution(pricing_failure_code=code, pricing_failure_detail=detail)
+
+    # --- PHASE 9C: canonical SQL pricing persistence, from the SAME -------
+    # already-computed `priced` frame -- no second pricing call. Failure ->
+    # PARTIAL; Phase-9C's own atomicity guarantees no partial artifact.
+    # The legacy Warehouse mirror below never runs unless this succeeds.
+    try:
+        pricing_frame = pl.DataFrame(priced) if priced else pl.DataFrame()
+        pricing_result = persist_player_prop_pricing(
+            ctx.warehouse,
+            pricing_frame,
+            run_id=ctx.run_id,
+            season=ctx.season,
+            week=ctx.week,
+            created_at=datetime.now(UTC),
+        )
+    except Exception as exc:
+        code, detail = _classify_exception(exc)
+        return _failed_execution(
+            pricing_failure_code="PRICING_PERSISTENCE_ERROR",
+            pricing_failure_detail=f"{code}: {detail}",
+        )
+
+    # --- Legacy Warehouse compatibility mirror, from the SAME `priced` ----
+    # frame -- no second pricing call. Until PHASE 9E certifies no required
+    # consumer depends on this output, a failure here still fails the run
+    # closed (PARTIAL), but the canonical projection / threshold / pricing
+    # artifacts persisted above are ALL retained (§7).
+    try:
         persist_current_pricing(
             ctx.warehouse,
             computation,
@@ -300,13 +415,17 @@ def _run_game_checkpoint_task(
             eligible_players=len(eligible),
             projection_rows_persisted=projections.height,
             threshold_rows_persisted=threshold_result.total,
-            priced_row_count=0,
+            priced_row_count=pricing_result.row_count,
             threshold_failed=False,
             threshold_failure_code=None,
             threshold_failure_detail=None,
-            pricing_failed=True,
-            pricing_failure_code=code,
-            pricing_failure_detail=detail,
+            pricing_failed=False,
+            pricing_failure_code=None,
+            pricing_failure_detail=None,
+            canonical_pricing_persisted=True,
+            legacy_mirror_failed=True,
+            legacy_mirror_failure_code="LEGACY_PRICING_MIRROR_ERROR",
+            legacy_mirror_failure_detail=f"{code}: {detail}",
         )
 
     return _CheckpointExecution(
@@ -314,13 +433,17 @@ def _run_game_checkpoint_task(
         eligible_players=len(eligible),
         projection_rows_persisted=projections.height,
         threshold_rows_persisted=threshold_result.total,
-        priced_row_count=len(priced),
+        priced_row_count=pricing_result.row_count,
         threshold_failed=False,
         threshold_failure_code=None,
         threshold_failure_detail=None,
         pricing_failed=False,
         pricing_failure_code=None,
         pricing_failure_detail=None,
+        canonical_pricing_persisted=True,
+        legacy_mirror_failed=False,
+        legacy_mirror_failure_code=None,
+        legacy_mirror_failure_detail=None,
     )
 
 
@@ -356,21 +479,28 @@ def game_checkpoint_flow(ctx: CheckpointRunContext, *, now: datetime) -> Predict
       exception -> PARTIAL / NOT_PUBLISHED / THRESHOLD_ERROR; the Phase-7
       projection artifact is retained and no current pricing ran
       (PHASE 8D §10/§11).
-    * both canonical artifacts persisted, then a genuine pricing exception
-      -> PARTIAL / NOT_PUBLISHED; both artifacts are preserved
-      (PHASE 7D §11, PHASE 8D §10).
-    * both canonical artifacts persisted, pricing produced zero rows
-      normally -> SUCCESS / MODEL_ONLY -- which now means BOTH the complete
-      Phase-7 projection artifact AND the complete Phase-8 threshold
-      artifact exist (PHASE 8D §8/§11).
-    * both canonical artifacts persisted, pricing produced rows ->
+    * both canonical model artifacts persisted, then either the pricing
+      calculation itself or the canonical Phase-9C pricing persistence
+      raised -> PARTIAL / NOT_PUBLISHED; both canonical MODEL artifacts
+      are preserved, no canonical pricing artifact exists, and the legacy
+      mirror never ran (PHASE 7D §11, PHASE 8D §10, PHASE 9D §8/§9).
+    * the canonical pricing artifact persisted, then the legacy Warehouse
+      compatibility mirror raised -> PARTIAL / NOT_PUBLISHED; ALL THREE
+      canonical artifacts (projections, thresholds, pricing) are
+      preserved (PHASE 9D §7).
+    * all three canonical artifacts persisted, pricing produced zero rows
+      normally -> SUCCESS / MODEL_ONLY -- which now means the complete
+      Phase-7 projection artifact, the complete Phase-8 threshold
+      artifact, AND an explicit complete (possibly zero-row) Phase-9
+      pricing artifact all exist (PHASE 8D §8/§11, PHASE 9D §3/§4/§23).
+    * all three canonical artifacts persisted, pricing produced rows ->
       SUCCESS / PUBLISHED (unchanged publication semantics, §9).
 
-    A run only reaches SUCCESS (MODEL_ONLY or PUBLISHED) once BOTH
-    `persist_player_game_projections` AND
-    `persist_player_game_threshold_events` have returned without raising,
-    so a run is never publication-eligible without both complete canonical
-    model artifacts (PHASE 8D §11).
+    A run only reaches SUCCESS (MODEL_ONLY or PUBLISHED) once
+    `persist_player_game_projections`, `persist_player_game_threshold_events`,
+    AND `persist_player_prop_pricing` have all returned without raising, so
+    a run is never publication-eligible without all three complete
+    canonical artifacts (PHASE 8D §11, PHASE 9D §23).
     """
     update_run_status(ctx.warehouse, ctx.run_id, status=PredictionRunStatus.RUNNING)
 
@@ -451,10 +581,15 @@ def game_checkpoint_flow(ctx: CheckpointRunContext, *, now: datetime) -> Predict
         )
 
     if execution.pricing_failed:
-        # §11/§12 + PHASE 8D §10: both canonical model artifacts (Phase-7
+        # PHASE 9D §8/§9: both canonical model artifacts (Phase-7
         # projections and Phase-8 threshold events) were built and
-        # immutably persisted; current-market pricing then raised. Both
-        # artifacts stay; the run is PARTIAL / NOT_PUBLISHED.
+        # immutably persisted; either the ONE pricing calculation itself
+        # raised, or the certified Phase-9C `persist_player_prop_pricing`
+        # call raised. Either way NO canonical pricing artifact exists
+        # (Phase-9C's own atomicity guarantees nothing partial was
+        # written), the legacy Warehouse mirror never ran, and both
+        # canonical model artifacts stay. The run is PARTIAL / NOT_PUBLISHED.
+        assert not execution.canonical_pricing_persisted
         return update_run_status(
             ctx.warehouse,
             ctx.run_id,
@@ -465,6 +600,28 @@ def game_checkpoint_flow(ctx: CheckpointRunContext, *, now: datetime) -> Predict
             flow_completed_at=now,
         )
 
+    if execution.legacy_mirror_failed:
+        # PHASE 9D §7: the canonical Phase-9C pricing artifact (and both
+        # upstream canonical model artifacts) persisted successfully; the
+        # legacy Warehouse compatibility mirror then raised. Until
+        # PHASE 9E certifies no required consumer depends on that legacy
+        # output, this still fails the run closed -- but nothing canonical
+        # is rolled back or rewritten.
+        assert execution.canonical_pricing_persisted
+        return update_run_status(
+            ctx.warehouse,
+            ctx.run_id,
+            status=PredictionRunStatus.PARTIAL,
+            publication_status=PublicationStatus.NOT_PUBLISHED,
+            failure_code=execution.legacy_mirror_failure_code,
+            failure_detail=execution.legacy_mirror_failure_detail,
+            flow_completed_at=now,
+        )
+
+    # PHASE 9D §3/§23: a run is never MODEL_ONLY (nor PUBLISHED) without an
+    # explicit, complete canonical Phase-9 pricing artifact header -- never
+    # merely inferred from `priced_row_count == 0`.
+    assert execution.canonical_pricing_persisted
     publication_status = (
         PublicationStatus.MODEL_ONLY
         if execution.priced_row_count == 0
