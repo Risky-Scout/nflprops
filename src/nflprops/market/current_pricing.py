@@ -14,6 +14,16 @@ resample/redraw a player stat. Every value it produces comes from reading
 `GameSimulationResult.player_draws`/`.first_td_player` via
 `nflprops.simulation.props.summarize_prop` -- a pure filter/aggregate over
 already-generated draws.
+
+PHASE 9B adds push-aware MODEL fair pricing (`p_model_fair_nonpush`,
+`model_fair_decimal`, `model_fair_american`, from
+`nflprops.market.odds`) alongside the pre-existing sportsbook devigged fair
+price (`p_market_fair`, from `nflprops.market.devig`) -- the two are
+distinct quantities and are never aliased or collapsed into one field.
+An unrecognized `market_type`, or a `MarketType.MILESTONE` quote for a
+prop with no defined AT_LEAST hit-probability distribution, now fails
+closed (`UnsupportedMarketTypeError` / `UnsupportedMilestoneMarketError`)
+instead of silently producing zero rows.
 """
 
 from __future__ import annotations
@@ -29,11 +39,14 @@ from nflprops.backtest.provenance import (
     audit_prediction_inputs,
     latest_entity_available_at,
 )
+from nflprops.domain.enums import DevigConfidence, MarketType
 from nflprops.market.devig import proportional_two_sided
 from nflprops.market.odds import (
     american_to_decimal,
+    conditional_nonpush_fair_probability,
     expected_value,
-    implied_to_american,
+    fair_american_odds,
+    fair_decimal_odds,
 )
 from nflprops.market.odds import (
     edge as probability_edge,
@@ -41,6 +54,35 @@ from nflprops.market.odds import (
 from nflprops.market.timing import quote_knowledge_time, quote_time_source
 from nflprops.simulation.game import GameSimulationResult
 from nflprops.simulation.props import prop_confidence_tier, summarize_prop
+
+#: PHASE 9B §16: the only two recognized, priceable quote market types. Any
+#: other value must fail closed rather than falling through to the
+#: MILESTONE branch by default.
+_SUPPORTED_MARKET_TYPES = frozenset(
+    {MarketType.OVER_UNDER.value, MarketType.MILESTONE.value}
+)
+
+
+class UnsupportedMarketTypeError(ValueError):
+    """Raised when a quote's `market_type` is not a recognized, priceable
+    value (PHASE 9B §16). Fails the whole pricing step closed rather than
+    silently treating an unrecognized market type as MILESTONE -- an
+    unrecognized market type is a data-quality problem, not a benign
+    "book didn't offer this side" absence.
+    """
+
+
+class UnsupportedMilestoneMarketError(ValueError):
+    """Raised when a `MarketType.MILESTONE` quote is for a prop type with
+    no defined AT_LEAST hit-probability distribution -- i.e. any prop
+    outside the five supported binary anytime-TD-family / first_td
+    products (PHASE 9B §15).
+
+    Generic sportsbook count-style milestone execution (2+, 3+ on
+    non-binary props such as `fg_made`) is explicitly deferred to a later
+    phase; this fails closed instead of silently producing zero priced
+    rows for the quote (the prior PHASE 9A-audited behavior).
+    """
 
 
 def prediction_id(*parts: object) -> str:
@@ -66,6 +108,17 @@ def _price_quote(
     if confidence_tier is None:
         return []
 
+    # TECH DEBT (PHASE 9A/9B, not fixed here by design): `line_value` is
+    # `Decimal` at the canonical quote schema boundary specifically to avoid
+    # a float-parsed `67.49999999999999` line (see market/odds.py:parse_line).
+    # That discipline is dropped here -- today's whole-number and half-number
+    # NFL prop lines are exactly binary-representable in `float`, so the push
+    # comparison in `summarize_prop` (`values == line`) stays exact in
+    # practice. A future line granularity that is NOT binary-exact (e.g. a
+    # `.1`/`.3`/`.7` increment) would silently reintroduce the float bug the
+    # Decimal boundary exists to prevent, and would need a deliberate
+    # Decimal-preserving comparison policy -- never an epsilon-based push
+    # comparison, which would misclassify genuine near-miss non-pushes.
     line = float(quote["line_value"]) if quote.get("line_value") is not None else None
     dist = summarize_prop(result, player_id, prop_type, line=line)
 
@@ -113,8 +166,15 @@ def _price_quote(
     }
 
     market_type = str(quote["market_type"])
+    if market_type not in _SUPPORTED_MARKET_TYPES:
+        # PHASE 9B §16: fail closed. Never silently fall through to the
+        # MILESTONE branch for an unrecognized market_type.
+        raise UnsupportedMarketTypeError(
+            f"unsupported market_type={market_type!r} for "
+            f"prop_type={prop_type!r} line={line!r}"
+        )
     rows: list[dict] = []
-    if market_type == "over_under":
+    if market_type == MarketType.OVER_UNDER.value:
         over_odds = quote.get("over_odds")
         under_odds = quote.get("under_odds")
         if over_odds is None or under_odds is None:
@@ -127,25 +187,26 @@ def _price_quote(
             if p_model is None:
                 continue
             decimal_odds = american_to_decimal(odds)
+            p_win = float(p_model)
+            p_push_f = float(p_push or 0.0)
             row = dict(base)
             row.update(
                 {
                     "side": side,
                     "american_odds": odds,
-                    "p_model_raw": float(p_model),
-                    "p_push": float(p_push or 0.0),
+                    "p_model_raw": p_win,
+                    "p_push": p_push_f,
+                    # PHASE 9B §3/§4/§5: MODEL-side conditional non-push fair
+                    # price -- distinct from `p_market_fair` (sportsbook
+                    # devigged) below. Never conflate the two.
+                    "p_model_fair_nonpush": conditional_nonpush_fair_probability(
+                        p_win, p_push_f
+                    ),
+                    "model_fair_decimal": fair_decimal_odds(p_win, p_push_f),
+                    "model_fair_american": fair_american_odds(p_win, p_push_f),
                     "p_market_fair": float(p_market),
-                    "edge": probability_edge(float(p_model), float(p_market)),
-                    "ev_per_unit": expected_value(
-                        float(p_model),
-                        decimal_odds,
-                        float(p_push or 0.0),
-                    ),
-                    "model_fair_american": (
-                        implied_to_american(float(p_model))
-                        if 0 < float(p_model) < 1
-                        else None
-                    ),
+                    "edge": probability_edge(p_win, float(p_market)),
+                    "ev_per_unit": expected_value(p_win, decimal_odds, p_push_f),
                     "devig_method": fair.method.value,
                     "devig_confidence": fair.confidence.value,
                 }
@@ -162,24 +223,46 @@ def _price_quote(
             )
             rows.append(row)
     else:
+        # MarketType.MILESTONE.
+        if dist.p_hit is None:
+            # PHASE 9B §15: a MILESTONE quote for a prop type with no
+            # defined AT_LEAST hit-probability distribution (i.e. outside
+            # the five supported binary anytime-TD-family / first_td
+            # products). Fail closed instead of silently returning [].
+            raise UnsupportedMilestoneMarketError(
+                "no AT_LEAST hit-probability distribution for "
+                f"prop_type={prop_type!r} market_type={market_type!r} "
+                f"line={line!r}"
+            )
         odds = quote.get("milestone_odds")
-        if odds is None or dist.p_hit is None:
+        if odds is None:
             return []
-        p = float(dist.p_hit)
+        p_win = float(dist.p_hit)
+        p_push_f = 0.0
         row = dict(base)
         row.update(
             {
                 "side": "HIT",
                 "american_odds": int(odds),
-                "p_model_raw": p,
-                "p_push": 0.0,
+                "p_model_raw": p_win,
+                "p_push": p_push_f,
+                # PHASE 9B §13: these one-sided binary markets never push, so
+                # the conditional fair probability is identical to the raw
+                # hit probability -- but it is still computed through the
+                # shared helper for a single, type-consistent code path.
+                "p_model_fair_nonpush": conditional_nonpush_fair_probability(
+                    p_win, p_push_f
+                ),
+                "model_fair_decimal": fair_decimal_odds(p_win, p_push_f),
+                "model_fair_american": fair_american_odds(p_win, p_push_f),
                 # One-sided BDL milestone quote cannot be fully devigged alone.
                 "p_market_fair": None,
                 "edge": None,
-                "ev_per_unit": expected_value(p, american_to_decimal(int(odds)), 0.0),
-                "model_fair_american": (implied_to_american(p) if 0 < p < 1 else None),
+                "ev_per_unit": expected_value(
+                    p_win, american_to_decimal(int(odds)), p_push_f
+                ),
                 "devig_method": None,
-                "devig_confidence": "one_sided_unbenchmarked",
+                "devig_confidence": DevigConfidence.ONE_SIDED_UNBENCHMARKED.value,
             }
         )
         row["prediction_id"] = prediction_id(

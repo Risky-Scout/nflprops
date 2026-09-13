@@ -189,6 +189,10 @@ class DevigConfidence(str, Enum):  # noqa: UP042
     FULL = "full"          # both sides quoted by the same vendor
     PARTIAL = "partial"    # field normalization with an estimated NONE state
     BORROWED = "borrowed"  # overround estimated from other markets
+    ONE_SIDED_UNBENCHMARKED = "one_sided_unbenchmarked"  # one-sided milestone,
+    # no two-sided book price to devig against at all (SPEC §56, PHASE 9B).
+    # Distinct from BORROWED: there is no reference overround to borrow from
+    # either. Must never be reported as FULL/PARTIAL/BORROWED.
 
 
 #: Sentinel for the no-touchdown state in first_td. MUST remain in the probability
