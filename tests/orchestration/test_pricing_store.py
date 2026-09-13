@@ -35,6 +35,8 @@ from nflprops.orchestration.pricing_store import (
     PricingSchemaError,
     compute_scientific_content_hash,
     persist_player_prop_pricing,
+    recompute_confidence_tier,
+    recompute_quote_age_seconds,
 )
 from nflprops.orchestration.run_store import (
     PredictionRunRecord,
@@ -329,6 +331,14 @@ def test_exact_retry_is_idempotent_and_created_at_is_retained(tmp_path: Path) ->
         ("line", 999.5),
         ("model_version", "9999.9.9"),
         ("n_draws", N_DRAWS + 1),
+        # PHASE 9C scientific-equality correction: distribution summaries
+        # characterize the whole modeled distribution, not just the one
+        # quoted line, and are NOT implied by p_model_raw/p_push -- they
+        # must participate in scientific equality and the artifact hash.
+        ("model_mean", 999.999),
+        ("model_median", 888.888),
+        ("p50", 777.777),
+        ("p90", 666.666),
     ],
 )
 def test_scientific_conflict_on_retry_leaves_stored_data_unchanged(
@@ -542,3 +552,123 @@ def test_multibook_rows_remain_independent(tmp_path: Path) -> None:
     }
     assert lines_by_vendor.get("fakebook") == 75.0
     assert lines_by_vendor.get("otherbook") == 80.5
+
+
+# ------------------------------------- PHASE 9C scientific-equality correction
+
+
+def test_p_model_calibrated_mutation_is_a_hard_scientific_conflict(tmp_path: Path) -> None:
+    """`p_model_calibrated` is always `None` in today's uncalibrated
+    pipeline, but the column exists precisely because a future OOF
+    calibrator will populate it -- protection must already work now,
+    before that happens, not be bolted on later."""
+    backend, pricing = _seed(
+        tmp_path, "RUN-CALIBRATED", extra_quotes=[_quote(prop_type="receiving_yards")]
+    )
+    calibrated = pricing.with_columns(pl.lit(0.42).alias("p_model_calibrated"))
+    persist_player_prop_pricing(
+        backend, calibrated, run_id="RUN-CALIBRATED", season=SEASON, week=WEEK, created_at=AS_OF
+    )
+    rows_before = _rows_for_run(backend, "RUN-CALIBRATED")
+    header_before = _artifact_row(backend, "RUN-CALIBRATED")
+
+    target_id = calibrated["prediction_id"][0]
+    mutated = calibrated.with_columns(
+        pl.when(pl.col("prediction_id") == target_id)
+        .then(pl.lit(0.99))
+        .otherwise(pl.col("p_model_calibrated"))
+        .alias("p_model_calibrated")
+    )
+    with pytest.raises(_CONFLICT_ERRORS):
+        persist_player_prop_pricing(
+            backend, mutated, run_id="RUN-CALIBRATED", season=SEASON, week=WEEK, created_at=AS_OF
+        )
+
+    rows_after = _rows_for_run(backend, "RUN-CALIBRATED")
+    header_after = _artifact_row(backend, "RUN-CALIBRATED")
+    assert rows_after.equals(rows_before)
+    assert header_after == header_before
+
+
+def test_changing_created_at_only_is_an_idempotent_no_op(tmp_path: Path) -> None:
+    """Explicit, dedicated proof (beyond the general retry test) that
+    varying ONLY `created_at` across a retry -- with every scientific
+    field, including the newly-protected distribution summaries, held
+    fixed -- is a no-op and the original `created_at` is retained."""
+    backend, pricing = _seed(
+        tmp_path, "RUN-CREATED-AT-ONLY", extra_quotes=[_quote(prop_type="receiving_yards")]
+    )
+    first = persist_player_prop_pricing(
+        backend,
+        pricing,
+        run_id="RUN-CREATED-AT-ONLY",
+        season=SEASON,
+        week=WEEK,
+        created_at=AS_OF,
+    )
+    again = persist_player_prop_pricing(
+        backend,
+        pricing,
+        run_id="RUN-CREATED-AT-ONLY",
+        season=SEASON,
+        week=WEEK,
+        created_at=AS_OF + timedelta(days=30),
+    )
+    assert again.rows_inserted == 0
+    assert again.rows_unchanged == first.row_count
+    assert again.artifact_inserted is False
+    assert again.scientific_content_sha256 == first.scientific_content_sha256
+
+    stored = _rows_for_run(backend, "RUN-CREATED-AT-ONLY")
+    assert set(stored["created_at"].to_list()) == {AS_OF}
+    header = _artifact_row(backend, "RUN-CREATED-AT-ONLY")
+    assert header["created_at"] == AS_OF
+
+
+def test_quote_age_seconds_is_exactly_reconstructible_from_persisted_timestamps(
+    tmp_path: Path,
+) -> None:
+    """DERIVED_REDUNDANT proof: `quote_age_seconds` recomputes exactly from
+    the already-SCIENTIFIC `as_of` / `quote_available_at` columns."""
+    backend, pricing = _seed(
+        tmp_path, "RUN-DERIVED-AGE", extra_quotes=[_quote(prop_type="receiving_yards")]
+    )
+    persist_player_prop_pricing(
+        backend, pricing, run_id="RUN-DERIVED-AGE", season=SEASON, week=WEEK, created_at=AS_OF
+    )
+    stored = _rows_for_run(backend, "RUN-DERIVED-AGE")
+    assert stored.height > 0
+    for row in stored.iter_rows(named=True):
+        recomputed = recompute_quote_age_seconds(row["as_of"], row["quote_available_at"])
+        assert recomputed == pytest.approx(row["quote_age_seconds"])
+
+
+def test_confidence_tier_is_exactly_reconstructible_from_persisted_prop_type(
+    tmp_path: Path,
+) -> None:
+    """DERIVED_REDUNDANT proof: `confidence_tier` recomputes exactly from
+    the already-SCIENTIFIC `prop_type` column via the locked, versioned
+    catalog lookup."""
+    backend, pricing = _seed(
+        tmp_path,
+        "RUN-DERIVED-TIER",
+        extra_quotes=[
+            _quote(prop_type="receiving_yards"),
+            _quote(
+                prop_type="anytime_td",
+                market_type="milestone",
+                line_value=None,
+                over_odds=None,
+                under_odds=None,
+                milestone_odds=150,
+            ),
+        ],
+    )
+    persist_player_prop_pricing(
+        backend, pricing, run_id="RUN-DERIVED-TIER", season=SEASON, week=WEEK, created_at=AS_OF
+    )
+    stored = _rows_for_run(backend, "RUN-DERIVED-TIER")
+    assert stored.height > 0
+    for row in stored.iter_rows(named=True):
+        recomputed = recompute_confidence_tier(row["prop_type"])
+        assert recomputed == row["confidence_tier"]

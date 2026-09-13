@@ -65,6 +65,37 @@ schema uses the shorter ``provider_updated_at`` / ``opened_at`` /
 ``collector_received_at`` names to match the canonical quote schema
 (``nflprops.domain.models.PlayerProp``). The rename happens only at the
 persistence boundary in this module.
+
+Column classification (PHASE 9C scientific-equality correction): every
+persisted ``player_prop_prices`` column is exactly one of:
+
+* SCIENTIFIC -- part of ``SCIENTIFIC_FIELDS``; participates in row
+  conflict detection and the artifact ``scientific_content_sha256``.
+  This now explicitly includes the distribution-summary columns
+  (``model_mean``, ``model_median``, ``p05``-``p95``) and
+  ``p_model_calibrated``: these characterize the *whole* modeled
+  distribution, not just the one line a given quote happens to price,
+  and are NOT a deterministic function of ``p_model_raw``/``p_push``
+  alone -- two distributions can share a win/push probability at one
+  line while differing in mean, median, or other percentiles. An
+  earlier version of this module incorrectly treated them as derived;
+  that was a genuine scientific-immutability gap, corrected here.
+* DERIVED_REDUNDANT -- still persisted (never silently dropped), but
+  excluded from scientific equality/hash because it is a PROVEN, pure,
+  deterministic function of other SCIENTIFIC columns already covered
+  by the hash, so an actual drift always already surfaces there:
+
+  - ``confidence_tier`` = ``nflprops.simulation.props.prop_confidence_tier
+    (prop_type)`` -- a static, versioned lookup keyed only by the
+    already-scientific ``prop_type`` column. See
+    ``recompute_confidence_tier`` below.
+  - ``quote_age_seconds`` = ``(as_of - quote_available_at)
+    .total_seconds()`` -- both operands are already-scientific,
+    already-hash-protected columns. See ``recompute_quote_age_seconds``
+    below.
+
+* OPERATIONAL -- ``created_at`` only, on both tables. Never part of
+  scientific equality.
 """
 
 from __future__ import annotations
@@ -80,6 +111,7 @@ import polars as pl
 
 from nflprops.market.current_pricing import prediction_id as compute_prediction_id
 from nflprops.orchestration.run_store import PredictionRunRecord, get_run
+from nflprops.simulation.props import prop_confidence_tier
 
 if TYPE_CHECKING:
     from nflprops.data.storage.base import StorageBackend
@@ -144,14 +176,24 @@ REQUIRED_INPUT_COLUMNS: tuple[str, ...] = (
 )
 
 #: Fields that define a pricing row's scientific identity/equality.
-#: `created_at` is deliberately absent -- operational metadata only.
-#: Descriptive/distributional columns (`confidence_tier`, `model_mean`,
-#: `model_median`, the percentile columns, `p_model_calibrated`,
-#: `quote_age_seconds`) are deliberately absent too: they are
-#: deterministically implied by the same shared simulation draws that
-#: already fix `p_model_raw`/`p_push`, so they carry no independent
-#: identity for the *priced market* -- a genuine scientific drift would
-#: already surface as a `p_model_raw`/`p_push` conflict.
+#: `created_at` is OPERATIONAL and deliberately absent (both tables).
+#:
+#: `confidence_tier` and `quote_age_seconds` are DERIVED_REDUNDANT and
+#: deliberately absent: each is a PROVEN pure deterministic function of
+#: other fields already in this tuple (`prop_type`, and
+#: `as_of`/`quote_available_at` respectively -- see
+#: `recompute_confidence_tier` / `recompute_quote_age_seconds`), so a
+#: genuine drift in either always already surfaces as a conflict on the
+#: field it derives from.
+#:
+#: `model_mean`, `model_median`, the percentile columns (`p05`-`p95`),
+#: and `p_model_calibrated` are SCIENTIFIC and deliberately INCLUDED:
+#: they characterize the modeled distribution as a whole, not merely the
+#: probability of the one quoted line, and are NOT implied by
+#: `p_model_raw`/`p_push` -- two distributions can share a win/push
+#: probability at one line while differing in mean, median, or other
+#: percentiles. (An earlier version of this module wrongly excluded
+#: them; this is the corrected, LOCKED set.)
 SCIENTIFIC_FIELDS: tuple[str, ...] = (
     "run_id",
     "season",
@@ -182,7 +224,23 @@ SCIENTIFIC_FIELDS: tuple[str, ...] = (
     "provider_updated_at",
     "opened_at",
     "collector_received_at",
+    "model_mean",
+    "model_median",
+    "p05",
+    "p10",
+    "p25",
+    "p50",
+    "p75",
+    "p90",
+    "p95",
+    "p_model_calibrated",
 )
+
+#: Fields persisted but deliberately excluded from `SCIENTIFIC_FIELDS`
+#: because each is a proven, pure, deterministic function of fields that
+#: ARE in `SCIENTIFIC_FIELDS`. See `recompute_confidence_tier` and
+#: `recompute_quote_age_seconds`.
+DERIVED_REDUNDANT_FIELDS: tuple[str, ...] = ("confidence_tier", "quote_age_seconds")
 
 #: Run-level identity fields duplicated from the parent `prediction_runs`
 #: row. Each incoming row's copy must equal the parent's exactly.
@@ -536,6 +594,7 @@ def _validate_values(frame: pl.DataFrame) -> None:
         "model_fair_american",
         "p_market_fair",
         "edge",
+        "p_model_calibrated",
     ):
         series = frame[column].drop_nulls()
         if series.len() > 0 and not series.is_finite().all():
@@ -556,7 +615,7 @@ def _validate_values(frame: pl.DataFrame) -> None:
             "pricing column 'p_model_raw' + 'p_push' exceeds 1.0 for at least one row"
         )
 
-    for column in ("p_model_fair_nonpush", "p_market_fair"):
+    for column in ("p_model_fair_nonpush", "p_market_fair", "p_model_calibrated"):
         series = frame[column].drop_nulls()
         if series.len() > 0 and ((series < 0.0) | (series > 1.0)).any():
             raise PricingSchemaError(
@@ -810,6 +869,27 @@ def compute_scientific_content_hash(rows: Iterable[PricingRow]) -> str:
         parts.append("\x1f".join(row_parts))
     payload = "\x1e".join(parts)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def recompute_confidence_tier(prop_type: str) -> int | None:
+    """Proof-of-derivation helper for the DERIVED_REDUNDANT `confidence_tier`
+    column: the exact, pure function of the already-SCIENTIFIC `prop_type`
+    column that produces it (`nflprops.simulation.props.prop_confidence_tier`,
+    a static versioned lookup with no other inputs). Returns `None` only for
+    a `prop_type` the catalog doesn't recognize -- never reachable for a row
+    that already passed persistence, since `prop_confidence_tier` gates
+    `price_current_markets` upstream.
+    """
+    return prop_confidence_tier(prop_type)
+
+
+def recompute_quote_age_seconds(as_of: datetime, quote_available_at: datetime) -> float:
+    """Proof-of-derivation helper for the DERIVED_REDUNDANT
+    `quote_age_seconds` column: the exact formula
+    (`nflprops.market.current_pricing._price_quote`) over the two
+    already-SCIENTIFIC timestamp columns that produce it.
+    """
+    return (as_of - quote_available_at).total_seconds()
 
 
 def _row_to_artifact(record: Mapping[str, Any]) -> PricingArtifact:

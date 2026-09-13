@@ -465,6 +465,34 @@ def test_persist_against_real_parent_is_idempotent_and_immutable(
                 backend, conflicting, run_id=run_id, season=SEASON, week=WEEK, created_at=AS_OF
             )
         assert _rows_count(engine, run_id) == expected
+
+        # PHASE 9C scientific-equality correction: a distribution-summary
+        # mutation (not just american_odds/p_model_raw etc.) must also
+        # conflict, round-tripped through real Postgres storage.
+        distribution_conflict = pricing.with_columns(
+            pl.when(pl.col("prediction_id") == target_id)
+            .then(pl.lit(123456.0))
+            .otherwise(pl.col("model_mean"))
+            .alias("model_mean")
+        )
+        with pytest.raises(PricingArtifactConflictError):
+            persist_player_prop_pricing(
+                backend,
+                distribution_conflict,
+                run_id=run_id,
+                season=SEASON,
+                week=WEEK,
+                created_at=AS_OF,
+            )
+        assert _rows_count(engine, run_id) == expected
+        with engine.connect() as conn:
+            stored_mean = conn.execute(
+                sa.text(
+                    f"SELECT model_mean FROM {ROWS_TABLE} WHERE prediction_id = :p"
+                ),
+                {"p": target_id},
+            ).scalar_one()
+        assert stored_mean != 123456.0
     finally:
         engine.dispose()
         backend.dispose()
