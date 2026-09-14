@@ -447,6 +447,54 @@ def _run_game_checkpoint_task(
     )
 
 
+_PRICING_ARTIFACT_INVARIANT_CODE = "PRICING_ARTIFACT_INVARIANT_VIOLATION"
+
+
+def _pricing_artifact_invariant_violation(
+    ctx: CheckpointRunContext,
+    *,
+    now: datetime,
+    expected: bool,
+    actual: bool,
+    where: str,
+) -> PredictionRunRecord | None:
+    """Explicit, ALWAYS-EXECUTING runtime guard for the
+    `canonical_pricing_persisted` invariant, called at every terminal
+    branch in `game_checkpoint_flow` that depends on it.
+
+    Deliberately NOT a Python `assert` (PHASE 9D correction): `assert` is
+    compiled out entirely under `python -O` / `PYTHONOPTIMIZE=1`, which
+    would silently remove exactly the check that keeps a run from
+    reaching SUCCESS/MODEL_ONLY or SUCCESS/PUBLISHED without a
+    successfully persisted canonical Phase-9 pricing artifact header. A
+    publication-safety invariant must never depend on an interpreter flag.
+
+    Returns a terminal PARTIAL/NOT_PUBLISHED `PredictionRunRecord` --
+    failing the run closed -- if `actual != expected`; returns `None`
+    (the caller proceeds with its own normal terminal transition)
+    otherwise. Every call site in `game_checkpoint_flow` that used to
+    read ``assert execution.canonical_pricing_persisted`` (or its
+    negation) now calls this instead.
+    """
+    if actual == expected:
+        return None
+    return update_run_status(
+        ctx.warehouse,
+        ctx.run_id,
+        status=PredictionRunStatus.PARTIAL,
+        publication_status=PublicationStatus.NOT_PUBLISHED,
+        failure_code=_PRICING_ARTIFACT_INVARIANT_CODE,
+        failure_detail=(
+            f"internal invariant violated at {where}: expected "
+            f"canonical_pricing_persisted={expected!r}, got {actual!r} for "
+            f"run_id={ctx.run_id!r}. Failing closed rather than proceeding "
+            f"with a publication decision an unavailable assertion would "
+            f"otherwise have silently let through."
+        ),
+        flow_completed_at=now,
+    )
+
+
 # validate_parameters=False on both flows below: they take live, in-process
 # objects (Warehouse, Config, CheckpointRunContext, SimulationConfig, ...)
 # rather than JSON-serializable values -- Prefect's default Pydantic-based
@@ -589,7 +637,14 @@ def game_checkpoint_flow(ctx: CheckpointRunContext, *, now: datetime) -> Predict
         # (Phase-9C's own atomicity guarantees nothing partial was
         # written), the legacy Warehouse mirror never ran, and both
         # canonical model artifacts stay. The run is PARTIAL / NOT_PUBLISHED.
-        assert not execution.canonical_pricing_persisted
+        if violation := _pricing_artifact_invariant_violation(
+            ctx,
+            now=now,
+            expected=False,
+            actual=execution.canonical_pricing_persisted,
+            where="pricing_failed branch",
+        ):
+            return violation
         return update_run_status(
             ctx.warehouse,
             ctx.run_id,
@@ -607,7 +662,14 @@ def game_checkpoint_flow(ctx: CheckpointRunContext, *, now: datetime) -> Predict
         # PHASE 9E certifies no required consumer depends on that legacy
         # output, this still fails the run closed -- but nothing canonical
         # is rolled back or rewritten.
-        assert execution.canonical_pricing_persisted
+        if violation := _pricing_artifact_invariant_violation(
+            ctx,
+            now=now,
+            expected=True,
+            actual=execution.canonical_pricing_persisted,
+            where="legacy_mirror_failed branch",
+        ):
+            return violation
         return update_run_status(
             ctx.warehouse,
             ctx.run_id,
@@ -618,10 +680,20 @@ def game_checkpoint_flow(ctx: CheckpointRunContext, *, now: datetime) -> Predict
             flow_completed_at=now,
         )
 
-    # PHASE 9D §3/§23: a run is never MODEL_ONLY (nor PUBLISHED) without an
-    # explicit, complete canonical Phase-9 pricing artifact header -- never
-    # merely inferred from `priced_row_count == 0`.
-    assert execution.canonical_pricing_persisted
+    # PHASE 9D §3/§23 (hardened): a run is never MODEL_ONLY (nor PUBLISHED)
+    # without an explicit, complete canonical Phase-9 pricing artifact
+    # header -- never merely inferred from `priced_row_count == 0`, and
+    # never gated only by an `assert` (stripped entirely under `python -O`
+    # / `PYTHONOPTIMIZE`). This is the critical publication-safety check:
+    # it always executes, in every interpreter mode.
+    if violation := _pricing_artifact_invariant_violation(
+        ctx,
+        now=now,
+        expected=True,
+        actual=execution.canonical_pricing_persisted,
+        where="SUCCESS terminal transition",
+    ):
+        return violation
     publication_status = (
         PublicationStatus.MODEL_ONLY
         if execution.priced_row_count == 0

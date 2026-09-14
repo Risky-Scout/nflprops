@@ -14,6 +14,7 @@ reimplementation.
 
 from __future__ import annotations
 
+import dataclasses
 from datetime import timedelta
 from pathlib import Path
 
@@ -27,7 +28,9 @@ from test_phase7d_checkpoint_projection_integration import (
     _claim_run,
     _ctx,
     _execute,
+    _projections,
 )
+from test_phase8d_checkpoint_threshold_integration import _thresholds
 
 import nflprops.pipelines.pregame as pregame_module
 from nflprops.data.warehouse import Warehouse
@@ -49,7 +52,11 @@ from nflprops.orchestration.pricing_store import (
     PLAYER_PROP_PRICING_ARTIFACTS_TABLE,
     compute_scientific_content_hash,
 )
-from nflprops.orchestration.run_store import PredictionRunStatus, PublicationStatus
+from nflprops.orchestration.run_store import (
+    PredictionRunStatus,
+    PublicationStatus,
+    update_run_status,
+)
 
 
 def _raises(*_a, **_k):
@@ -557,3 +564,202 @@ def _assert_exactly_one_pricing_call(warehouse: Warehouse, *, run_id: str) -> No
     assert calls["pricing"] == 1
     assert calls["simulation"] == 1
     assert execution.canonical_pricing_persisted is True
+
+
+# --------------------------------------------------- explicit runtime publication gate
+#
+# PHASE 9D correction: the three `assert execution.canonical_pricing_persisted`
+# (or its negation) statements that used to guard `game_checkpoint_flow`'s
+# terminal transitions are Python `assert`s -- compiled out entirely under
+# `python -O` / `PYTHONOPTIMIZE=1`. A publication-safety invariant must
+# never depend on an interpreter flag, so they are replaced with
+# `_pricing_artifact_invariant_violation`, an explicit, always-executing
+# check. These tests force the guarded field to the "should be impossible"
+# value immediately before each terminal transition and require the run
+# fails closed rather than silently proceeding -- proving the behavior no
+# longer depends on assertions being enabled.
+
+
+def test_forced_missing_canonical_artifact_never_reaches_success(tmp_path: Path) -> None:
+    """The critical gate: force `canonical_pricing_persisted=False` on an
+    otherwise-genuinely-successful execution, immediately before the
+    SUCCESS/MODEL_ONLY-or-PUBLISHED terminal transition. The run must
+    fail closed to PARTIAL/NOT_PUBLISHED -- never SUCCESS, never
+    MODEL_ONLY, never PUBLISHED -- with the real, already-persisted
+    canonical upstream artifacts (projections, thresholds) retained."""
+    warehouse = _build_warehouse(tmp_path)
+    ctx = _ctx(warehouse, run_id="p9d-gate-forced-false")
+    _claim_run(warehouse, run_id="p9d-gate-forced-false")
+
+    real_task = checkpoints_flow._run_game_checkpoint_task
+
+    def _forced(*a, **k):
+        execution = real_task.fn(*a, **k)
+        # sanity: this is a genuinely successful execution being tampered
+        # with, not a scenario that would have failed on its own merits.
+        assert execution.canonical_pricing_persisted is True
+        assert execution.pricing_failed is False
+        assert execution.legacy_mirror_failed is False
+        return dataclasses.replace(execution, canonical_pricing_persisted=False)
+
+    checkpoints_flow._run_game_checkpoint_task = _forced
+    try:
+        record = game_checkpoint_flow(ctx, now=AS_OF + timedelta(minutes=1))
+    finally:
+        checkpoints_flow._run_game_checkpoint_task = real_task
+
+    assert record.status is PredictionRunStatus.PARTIAL
+    assert record.status is not PredictionRunStatus.SUCCESS
+    assert record.publication_status is PublicationStatus.NOT_PUBLISHED
+    assert record.publication_status is not PublicationStatus.MODEL_ONLY
+    assert record.publication_status is not PublicationStatus.PUBLISHED
+    assert record.failure_code == "PRICING_ARTIFACT_INVARIANT_VIOLATION"
+
+    # the real projection/threshold artifacts (genuinely persisted before
+    # the forced tamper) are retained -- only the terminal decision was
+    # affected, per the same "canonical artifacts stay" failure semantics
+    # as every other pricing-related PARTIAL branch.
+    assert _projections(warehouse, run_id="p9d-gate-forced-false").height > 0
+    assert _thresholds(warehouse, run_id="p9d-gate-forced-false").height > 0
+    # and the canonical pricing rows really were persisted (by the real
+    # task) -- the forced-false only lied about it at the flow level.
+    assert _pricing_rows(warehouse, run_id="p9d-gate-forced-false").height > 0
+
+
+def test_forced_unexpected_canonical_artifact_in_pricing_failed_branch_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """The `pricing_failed` branch expects `canonical_pricing_persisted`
+    to be False (Phase-9C atomicity guarantees no partial artifact). Force
+    the opposite and require the run still fails closed, now flagged as
+    an explicit invariant violation rather than silently trusting a
+    contradictory internal state."""
+    warehouse = _build_warehouse(tmp_path)
+    ctx = _ctx(warehouse, run_id="p9d-gate-pricing-failed")
+    _claim_run(warehouse, run_id="p9d-gate-pricing-failed")
+
+    real_price = pregame_module.price_current_markets
+    pregame_module.price_current_markets = _raises
+    real_task = checkpoints_flow._run_game_checkpoint_task
+
+    def _forced(*a, **k):
+        execution = real_task.fn(*a, **k)
+        assert execution.pricing_failed is True
+        assert execution.canonical_pricing_persisted is False
+        return dataclasses.replace(execution, canonical_pricing_persisted=True)
+
+    checkpoints_flow._run_game_checkpoint_task = _forced
+    try:
+        record = game_checkpoint_flow(ctx, now=AS_OF + timedelta(minutes=1))
+    finally:
+        checkpoints_flow._run_game_checkpoint_task = real_task
+        pregame_module.price_current_markets = real_price
+
+    assert record.status is PredictionRunStatus.PARTIAL
+    assert record.publication_status is PublicationStatus.NOT_PUBLISHED
+    assert record.failure_code == "PRICING_ARTIFACT_INVARIANT_VIOLATION"
+
+
+def test_forced_missing_canonical_artifact_in_legacy_mirror_failed_branch_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """The `legacy_mirror_failed` branch expects
+    `canonical_pricing_persisted` to be True (canonical pricing must have
+    succeeded before the legacy mirror even runs). Force the opposite and
+    require an explicit invariant-violation failure, not a silent
+    PARTIAL that happens to be right for the wrong reason."""
+    warehouse = _build_warehouse(tmp_path)
+    ctx = _ctx(warehouse, run_id="p9d-gate-legacy-failed")
+    _claim_run(warehouse, run_id="p9d-gate-legacy-failed")
+
+    real_persist_legacy = checkpoints_flow.persist_current_pricing
+    checkpoints_flow.persist_current_pricing = _raises
+    real_task = checkpoints_flow._run_game_checkpoint_task
+
+    def _forced(*a, **k):
+        execution = real_task.fn(*a, **k)
+        assert execution.legacy_mirror_failed is True
+        assert execution.canonical_pricing_persisted is True
+        return dataclasses.replace(execution, canonical_pricing_persisted=False)
+
+    checkpoints_flow._run_game_checkpoint_task = _forced
+    try:
+        record = game_checkpoint_flow(ctx, now=AS_OF + timedelta(minutes=1))
+    finally:
+        checkpoints_flow._run_game_checkpoint_task = real_task
+        checkpoints_flow.persist_current_pricing = real_persist_legacy
+
+    assert record.status is PredictionRunStatus.PARTIAL
+    assert record.publication_status is PublicationStatus.NOT_PUBLISHED
+    assert record.failure_code == "PRICING_ARTIFACT_INVARIANT_VIOLATION"
+
+
+def test_game_checkpoint_flow_contains_no_assert_for_the_publication_gate() -> None:
+    """Structural proof that the publication gate cannot silently vanish
+    under `python -O` / `PYTHONOPTIMIZE=1` (which compiles out every
+    `assert` statement, whole-module, with no way to opt back in at
+    runtime): parse the actual source of `game_checkpoint_flow` and of
+    `_pricing_artifact_invariant_violation` and require zero `ast.Assert`
+    nodes in either. This is a deterministic, environment-independent
+    complement to the behavioral forcing tests above -- it proves the
+    property structurally rather than by spawning a real `-O`
+    interpreter (which exercises unrelated parts of the stack and is not
+    what this gate's correctness depends on)."""
+    import ast
+    import inspect
+
+    import nflprops.orchestration.flows.checkpoints as checkpoints_module
+
+    for func in (
+        checkpoints_module.game_checkpoint_flow,
+        checkpoints_module._pricing_artifact_invariant_violation,
+    ):
+        tree = ast.parse(inspect.getsource(func))
+        asserts = [node for node in ast.walk(tree) if isinstance(node, ast.Assert)]
+        assert asserts == [], (
+            f"{func.__name__} contains a literal `assert` statement -- "
+            f"python -O / PYTHONOPTIMIZE=1 strips these entirely, so a "
+            f"publication-safety invariant must never be expressed as one: "
+            f"{[ast.dump(a) for a in asserts]}"
+        )
+
+
+def test_pricing_artifact_invariant_violation_helper_return_contract(tmp_path: Path) -> None:
+    """Unit-level proof of the new helper's own contract, independent of
+    the full flow: `None` when the invariant holds (caller proceeds with
+    its own transition), a PARTIAL/NOT_PUBLISHED record with the
+    dedicated failure code when it doesn't."""
+    warehouse = _build_warehouse(tmp_path)
+    ctx = _ctx(warehouse, run_id="p9d-gate-helper-unit")
+    _claim_run(warehouse, run_id="p9d-gate-helper-unit")
+    update_run_status(warehouse, "p9d-gate-helper-unit", status=PredictionRunStatus.RUNNING)
+
+    ok = checkpoints_flow._pricing_artifact_invariant_violation(
+        ctx, now=AS_OF, expected=True, actual=True, where="unit-test-ok"
+    )
+    assert ok is None
+
+    violation = checkpoints_flow._pricing_artifact_invariant_violation(
+        ctx, now=AS_OF, expected=True, actual=False, where="unit-test-violation"
+    )
+    assert violation is not None
+    assert violation.status is PredictionRunStatus.PARTIAL
+    assert violation.publication_status is PublicationStatus.NOT_PUBLISHED
+    assert violation.failure_code == "PRICING_ARTIFACT_INVARIANT_VIOLATION"
+    assert "unit-test-violation" in (violation.failure_detail or "")
+
+
+# ---------------------------------------------- zero/nonzero/missing artifact matrix
+#
+# Cross-references to existing coverage, made explicit per the required
+# three-way matrix:
+#
+# * zero-row valid canonical artifact -> MODEL_ONLY allowed:
+#   `test_zero_quote_run_has_explicit_zero_row_pricing_artifact_and_is_model_only`
+# * nonzero valid canonical artifact -> PUBLISHED/SUCCESS allowed:
+#   `test_official_checkpoint_persists_canonical_pricing_artifact_and_rows`
+# * missing artifact -> never MODEL_ONLY/PUBLISHED:
+#   `test_forced_missing_canonical_artifact_never_reaches_success` (above)
+#   and `test_pricing_calculation_failure_blocks_canonical_artifact_and_legacy_mirror`
+#   / `test_canonical_pricing_persistence_failure_blocks_legacy_mirror`
+#   (genuine failure paths, artifact never created at all).
