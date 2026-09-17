@@ -287,6 +287,143 @@ tables:
       columns: [threshold_event_id, run_id, season, week, game_id,
         player_id, team_id, position_group, stat_name, event_type,
         threshold, p_hit, n_draws, catalog_version, created_at]
+    player_prop_pricing_artifacts:
+      key: [run_id]
+      foreign_key: {run_id: "prediction_runs.run_id"}
+      pit: false
+      note: >
+        PHASE 9C. Header row proving canonical push-aware sportsbook pricing
+        completed for run_id, even when it produced zero priced rows (a
+        zero-quote MODEL_ONLY run) -- row_count = 0 is a valid, complete
+        artifact; its ABSENCE, not its row count, means "pricing never
+        ran." Pins row_count and scientific_content_sha256 (a deterministic,
+        order-independent hash of the complete scientific
+        player_prop_prices row set) so a reconciliation query never has to
+        re-trust an unverified count. Immutable: an exact scientific retry
+        (any created_at) is a no-op; a differing row_count or hash for an
+        existing run_id is a hard error. FK is NOT ON DELETE CASCADE. See
+        nflprops.orchestration.pricing_store and
+        migrations/versions/0006_player_prop_pricing.py.
+      columns: [run_id, season, week, game_id, as_of, model_version,
+        row_count, scientific_content_sha256, created_at]
+    player_prop_prices:
+      key: [prediction_id]
+      foreign_key: {run_id: "prediction_runs.run_id"}
+      pit: true
+      note: >
+        PHASE 9B/9C. Immutable canonical push-aware MODEL fair pricing --
+        one row per priced quote/side, keyed by the pre-existing,
+        UNCHANGED prediction_id (blake2b, nflprops.market.current_pricing.
+        prediction_id; not recomputed with SHA-256 here, so this table does
+        not introduce a second competing pricing identity). Carries raw
+        win/push probabilities, the conditional non-push MODEL fair
+        probability/odds (p_model_fair_nonpush, model_fair_decimal,
+        model_fair_american -- distinct from the sportsbook-devigged
+        p_market_fair), push-aware EV against the offered American price,
+        and the full modeled-distribution summary (model_mean, model_median,
+        p05-p95, p_model_calibrated) -- all SCIENTIFIC and part of
+        scientific_content_sha256; confidence_tier and quote_age_seconds
+        are DERIVED_REDUNDANT (proven pure functions of already-scientific
+        columns) and excluded from the hash; created_at is OPERATIONAL
+        only. quote_available_at <= as_of is enforced independently here
+        (defense in depth) in addition to the Phase-9B pricing layer's own
+        PIT guard. Requires a real prediction_runs parent row; every row's
+        season/week/game_id/model_version/n_draws/as_of must agree with the
+        parent (hard PricingProvenanceError otherwise). FK is NOT ON DELETE
+        CASCADE. See nflprops.orchestration.pricing_store and
+        migrations/versions/0006_player_prop_pricing.py.
+      columns: [prediction_id, run_id, season, week, game_id, player_id,
+        prop_type, market_type, vendor, side, line, american_odds,
+        p_model_raw, p_push, p_model_fair_nonpush, model_fair_decimal,
+        model_fair_american, p_market_fair, devig_method, devig_confidence,
+        ev_per_unit, edge, n_draws, model_version, as_of,
+        quote_available_at, quote_time_source, provider_updated_at,
+        opened_at, collector_received_at, confidence_tier, model_mean,
+        model_median, p05, p10, p25, p50, p75, p90, p95, p_model_calibrated,
+        quote_age_seconds, created_at]
+    player_prop_distribution_artifacts:
+      key: [run_id]
+      foreign_key: {run_id: "prediction_runs.run_id"}
+      pit: false
+      note: >
+        PHASE 10B. Header row proving the canonical raw exact-outcome PMF
+        product completed for run_id. Pins distribution_count (always
+        E * 25, E = the Phase-7 eligible player count for the run),
+        outcome_row_count, and scientific_content_sha256 (a deterministic,
+        order-independent hash of the complete raw PMF set). Immutable:
+        distribution_id already embeds run_id, so cross-run identity
+        collisions are structurally impossible and conflict detection is a
+        single artifact-level gate -- an exact scientific retry (any
+        created_at) is a no-op; a differing distribution_count/
+        outcome_row_count/hash for an existing run_id is a hard error. FK
+        is NOT ON DELETE CASCADE. See
+        nflprops.orchestration.distribution_store and
+        migrations/versions/0007_player_prop_distributions.py.
+      columns: [run_id, season, week, game_id, as_of, model_version,
+        n_draws, distribution_count, outcome_row_count,
+        scientific_content_sha256, created_at]
+    player_prop_distributions:
+      key: [distribution_key]
+      unique: [distribution_id, "run_id,player_id,prop_type"]
+      foreign_key: {run_id: "prediction_runs.run_id"}
+      pit: false
+      note: >
+        PHASE 10B. One row per (run_id, player_id, prop_type) -- one
+        canonical raw PMF, sportsbook-independent, derived from the SAME
+        Phase-7 coherent simulation draws (nflprops.simulation.props.
+        prop_values, UNCHANGED) that feed player_game_projections. Keyed
+        externally by distribution_id = SHA-256(run_id | player_id |
+        prop_type) and internally by a deterministic BIGINT
+        distribution_key surrogate derived from distribution_id (never a
+        DB sequence -- identical across local Warehouse and PostgreSQL,
+        stable under retry). Carries ONLY structural metadata
+        (support_min/support_max -- signed, since yardage props can be
+        negative -- n_draws, outcome_count, raw_content_sha256); no
+        mean/median/percentile/over/under/push/fair-odds summary is ever
+        stored here -- those are deterministically derived later from
+        player_prop_distribution_outcomes only. Requires a real
+        prediction_runs parent row AND a complete Phase-7
+        player_game_projections artifact for the same run (the
+        authoritative eligible-player set) -- the persisted product is the
+        complete E x 25 grid, never a sparse subset, no position
+        filtering. FK is NOT ON DELETE CASCADE. See
+        nflprops.orchestration.distribution_store and
+        migrations/versions/0007_player_prop_distributions.py.
+      columns: [distribution_key, distribution_id, run_id, game_id,
+        player_id, team_id, position_group, prop_type, support_min,
+        support_max, n_draws, outcome_count, raw_content_sha256, created_at]
+    player_prop_distribution_outcomes:
+      key: ["distribution_key,outcome"]
+      foreign_key: {distribution_key: "player_prop_distributions.distribution_key"}
+      pit: false
+      note: >
+        PHASE 10B. One row per (distribution, outcome) with p_raw > 0 --
+        P_raw(X=x) = count(draw == x) / n_draws over ALL simulation draws.
+        Only strictly-positive-probability outcomes are stored; an outcome
+        inside [support_min, support_max] that is absent has probability
+        exactly zero, and no positive tail mass is ever discarded. CHECK
+        constraint: 0 < p_raw <= 1. Immutable together with its parent
+        player_prop_distributions row (never independently mutated). See
+        nflprops.orchestration.distribution_store and
+        migrations/versions/0007_player_prop_distributions.py.
+      columns: [distribution_key, outcome, p_raw]
+    player_prop_prediction_distribution_links:
+      key: [prediction_id]
+      foreign_key: {prediction_id: "player_prop_prices.prediction_id",
+        distribution_id: "player_prop_distributions.distribution_id"}
+      pit: false
+      note: >
+        PHASE 10B. Explicit prediction_id -> distribution_id linkage so the
+        certified, immutable player_prop_prices table is never altered to
+        carry a distribution column. Many sportsbook quotes/lines for the
+        same (run_id, player_id, prop_type) link to the SAME
+        distribution_id -- no PMF duplication. A zero-quote run has a
+        complete set of distributions and legitimately zero links.
+        Immutable: an exact retry (same distribution_id) is a no-op; a
+        differing distribution_id for an already-linked prediction_id is a
+        hard error. See nflprops.orchestration.distribution_store and
+        migrations/versions/0007_player_prop_distributions.py.
+      columns: [prediction_id, distribution_id, created_at]
 
   governance:
     model_registry:

@@ -295,13 +295,17 @@ def test_publication_gate_final_cross_check(tmp_path: Path) -> None:
 # ------------------------------------------------------------- persistence lock
 
 
-def test_migration_head_is_still_0006() -> None:
-    """§31: no new migration is expected for Phase 9E."""
+def test_migration_0006_is_still_certified_and_unmodified() -> None:
+    """§31: Phase 9E itself added zero migrations -- 0006_player_prop_pricing
+    was the head at the end of Phase 9E. A later, separately-authorized
+    phase (PHASE 10B) may legitimately extend the chain with its own new
+    migration; this test certifies only that 0006 still exists in the
+    chain as an ancestor revision, never replaced or rewritten."""
     import subprocess
 
     repo_root = Path(__file__).resolve().parents[2]
     result = subprocess.run(
-        [sys.executable, "-m", "alembic", "heads"],
+        [sys.executable, "-m", "alembic", "history"],
         cwd=str(repo_root),
         capture_output=True,
         text=True,
