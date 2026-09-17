@@ -18,6 +18,12 @@ Checks:
      strictly-ascending list of positive integers with no duplicate
      (stat_name, threshold); every stat is a Phase-7 registry stat or a
      declared catalog-derived stat with a deterministic derivation.
+ 10. calibration_registry.yml: parses and structurally validates (PHASE
+     10C1); its locked scope is exactly ['JOINT_GAME']; approval and
+     promotion gate lists are disjoint; every DIRECTLY_LABELED_PROP_TYPES /
+     UNLABELED_PROP_TYPES entry in nflprops.calibration.artifact is one of
+     the 25 BDL prop types, the two sets are disjoint, and together they
+     cover the full set.
 
 Exit code 0 = clean. Non-zero = at least one violation, listed.
 """
@@ -194,6 +200,61 @@ def main() -> int:
     except ImportError as exc:  # pragma: no cover
         problems.append(f"could not import nflprops threshold catalog: {exc}")
 
+    # --- 10. calibration registry (PHASE 10C1) -----------------------------
+    calibration_registry_field_count = 0
+    try:
+        from nflprops.calibration.artifact import (
+            DIRECTLY_LABELED_PROP_TYPES,
+            UNLABELED_PROP_TYPES,
+        )
+        from nflprops.calibration.contract import (
+            CalibrationRegistryContractError,
+            load_calibration_registry_contract,
+        )
+
+        try:
+            calibration_contract = load_calibration_registry_contract()
+        except CalibrationRegistryContractError as exc:
+            problems.append(f"calibration_registry.yml: {exc}")
+        else:
+            calibration_registry_field_count = len(calibration_contract.artifact_immutable_fields)
+            if calibration_contract.supported_scope_types != frozenset({"JOINT_GAME"}):
+                problems.append(
+                    "calibration_registry.yml: supported_scope_types must be "
+                    f"exactly ['JOINT_GAME'], got "
+                    f"{sorted(calibration_contract.supported_scope_types)}"
+                )
+
+            all_props = set(props["props"].keys())
+            labeled_unknown = DIRECTLY_LABELED_PROP_TYPES - all_props
+            unlabeled_unknown = UNLABELED_PROP_TYPES - all_props
+            if labeled_unknown:
+                problems.append(
+                    f"calibration.artifact.DIRECTLY_LABELED_PROP_TYPES has "
+                    f"non-prop-map value(s): {sorted(labeled_unknown)}"
+                )
+            if unlabeled_unknown:
+                problems.append(
+                    f"calibration.artifact.UNLABELED_PROP_TYPES has non-prop-map "
+                    f"value(s): {sorted(unlabeled_unknown)}"
+                )
+            overlap = DIRECTLY_LABELED_PROP_TYPES & UNLABELED_PROP_TYPES
+            if overlap:
+                problems.append(
+                    "calibration.artifact: DIRECTLY_LABELED_PROP_TYPES and "
+                    f"UNLABELED_PROP_TYPES overlap: {sorted(overlap)}"
+                )
+            union = DIRECTLY_LABELED_PROP_TYPES | UNLABELED_PROP_TYPES
+            if union != all_props:
+                problems.append(
+                    "calibration.artifact: DIRECTLY_LABELED_PROP_TYPES + "
+                    "UNLABELED_PROP_TYPES does not cover exactly prop_map.yml's "
+                    f"25 props (missing={sorted(all_props - union)}, "
+                    f"extra={sorted(union - all_props)})"
+                )
+    except ImportError as exc:  # pragma: no cover
+        problems.append(f"could not import nflprops calibration registry: {exc}")
+
     # --- report ------------------------------------------------------------
     if problems:
         print(f"CONTRACT VALIDATION FAILED — {len(problems)} problem(s):\n")
@@ -210,6 +271,7 @@ def main() -> int:
         f"  threshold events    : "
         f"{sum(len(v['values']) for v in threshold_catalog['thresholds'].values())}"
     )
+    print(f"  calibration fields  : {calibration_registry_field_count}")
     print("")
     print("NOTE: this validates INTERNAL consistency only. It does NOT verify the")
     print("field inventory against the real BDL OpenAPI spec. For that, pin the spec")

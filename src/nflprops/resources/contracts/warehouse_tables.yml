@@ -424,6 +424,111 @@ tables:
         hard error. See nflprops.orchestration.distribution_store and
         migrations/versions/0007_player_prop_distributions.py.
       columns: [prediction_id, distribution_id, created_at]
+    calibration_artifacts:
+      key: [calibration_artifact_id]
+      pit: false
+      note: >
+        PHASE 10C1. One immutable row per fitted joint-game calibration
+        artifact -- REGISTRY ONLY: no calibration algorithm, no fitting,
+        no draw weights, no calibrated PMF (that is PHASE 10C2+). Scope is
+        locked to scope_type = 'JOINT_GAME' (contracts/
+        calibration_registry.yml: live_scope_is_joint_game_only) -- there
+        is no live public prop/player/position-specific calibration scope,
+        since that would imply multiple simultaneous weight vectors over
+        the same game and break joint coherence. calibration_artifact_id
+        is a deterministic SHA-256 over the artifact's identity fields
+        (nflprops.calibration.artifact.compute_calibration_artifact_id);
+        scientific_content_sha256 is a second, broader SHA-256 over every
+        immutable column, used for the exact-retry-vs-conflict gate. The
+        payload bytes themselves are opaque in PHASE 10C1 and live in
+        object storage (nflprops.data.storage.object_store, same split as
+        simulation_artifacts from migration 0001) -- this table stores
+        only object_uri/payload_sha256/payload_byte_count. created_at is
+        operational metadata only. No FK to prediction_runs: a calibration
+        artifact is cross-run (fit once, applied to many future runs). See
+        nflprops.calibration.artifact/.registry and
+        migrations/versions/0008_calibration_artifact_registry.py.
+      columns: [calibration_artifact_id, calibration_schema_version,
+        algorithm_family, algorithm_version, scope_type, checkpoint_scope,
+        base_model_version, simulation_config_version,
+        feature_contract_version, prop_contract_version,
+        calibration_contract_version, training_cutoff, training_start,
+        training_end, training_manifest_sha256, code_sha, payload_format,
+        payload_schema_version, object_uri, payload_sha256,
+        payload_byte_count, scientific_content_sha256, created_at]
+    calibration_validations:
+      key: [validation_id]
+      foreign_key: {calibration_artifact_id: "calibration_artifacts.calibration_artifact_id"}
+      pit: false
+      note: >
+        PHASE 10C1. Append-only validation evidence -- one artifact may
+        accumulate many rows over time; a row is never mutated or deleted.
+        Explicitly records PropType label-coverage completeness
+        (directly_labeled_prop_types/unlabeled_prop_types, JSON-encoded
+        TEXT): Phase 10C-A found exactly 15 of the 25 certified PropTypes
+        have a direct historical settlement label
+        (nflprops.pipelines.settle); the other 10 are PBP-gated
+        (contracts/prop_map.yml confidence_tier 3) and have none. A
+        validation row must never claim direct validation for one of
+        those ten. metrics_json is deliberately generic/versioned in
+        PHASE 10C1 -- actual metric computation is PHASE 10C2.
+        approval_required_gates
+        (chronology/leakage/simulation-invariants/reproducibility/
+        support-preservation/first-td-simplex) gate an APPROVED lifecycle
+        event; promotion_gate_passed is a separate, strictly additional
+        bar required only for a PROMOTED event
+        (contracts/calibration_registry.yml). See
+        nflprops.calibration.registry.record_validation.
+      columns: [validation_id, calibration_artifact_id,
+        validation_schema_version, validation_manifest_sha256, scored_from,
+        scored_through, total_game_count, pit_faithful_game_count,
+        degraded_pit_game_count, total_label_count,
+        directly_labeled_prop_types, unlabeled_prop_types, metrics_json,
+        chronology_checks_passed, leakage_checks_passed,
+        simulation_invariants_passed, reproducibility_passed,
+        support_preservation_passed, first_td_simplex_passed,
+        promotion_gate_passed, created_at]
+    calibration_lifecycle_events:
+      key: [lifecycle_event_id]
+      foreign_key: {calibration_artifact_id: "calibration_artifacts.calibration_artifact_id",
+        validation_id: "calibration_validations.validation_id"}
+      pit: false
+      note: >
+        PHASE 10C1. Append-only REGISTERED / APPROVED / PROMOTED /
+        INVALIDATED / RETIRED events -- the scientific calibration_artifacts
+        row is never mutated to change approval/promotion state; every
+        state change is a new event row. validation_id is nullable
+        (REGISTERED/INVALIDATED/RETIRED need not reference a validation).
+        INVALIDATED/RETIRED are terminal: once recorded, no further
+        APPROVED/PROMOTED event may ever be recorded for that artifact,
+        and nflprops.calibration.registry.resolve_calibration_champion
+        must never resolve it -- independent of whatever a (possibly
+        stale) calibration_champions row still points at. See
+        nflprops.calibration.registry.
+      columns: [lifecycle_event_id, calibration_artifact_id, event_type,
+        validation_id, reason_code, reason_detail, created_at]
+    calibration_champions:
+      key: [champion_key]
+      foreign_key: {calibration_artifact_id: "calibration_artifacts.calibration_artifact_id",
+        promoted_via_event_id: "calibration_lifecycle_events.lifecycle_event_id"}
+      pit: false
+      note: >
+        PHASE 10C1. The ONE intentionally MUTABLE table in the calibration
+        registry: a pointer, not a scientific artifact. champion_key is a
+        deterministic SHA-256 of
+        (scope_type, checkpoint_scope, compatibility_digest)
+        (nflprops.calibration.artifact.compute_champion_key) -- at most one
+        row may exist per exact applicability key. A row is written ONLY
+        by nflprops.calibration.registry.promote_calibration_champion
+        after an explicit, successful promotion decision -- never by
+        "latest artifact wins", and registering or approving an artifact
+        never touches this table. No wall-clock expiry of any kind
+        (contracts/calibration_registry.yml: no_wall_clock_expiry): a
+        quiet day with no new settled labels or no challenger promotion
+        leaves the champion pointer exactly as it was.
+      columns: [champion_key, scope_type, checkpoint_scope,
+        compatibility_digest, calibration_artifact_id, promoted_via_event_id,
+        updated_at]
 
   governance:
     model_registry:
