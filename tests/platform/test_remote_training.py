@@ -141,7 +141,7 @@ def test_verify_checked_out_sha_rejects_mismatch() -> None:
 
 def test_resolve_science_entrypoint_missing_module_fails_closed() -> None:
     with pytest.raises(rt.ScienceEntrypointNotAvailableError, match="not importable"):
-        rt.resolve_science_entrypoint("nflprops.calibration.phase10c3a_runner")
+        rt.resolve_science_entrypoint("nflprops.platform._definitely_does_not_exist")
 
 
 def test_resolve_science_entrypoint_missing_main_fails_closed(
@@ -161,6 +161,89 @@ def test_resolve_science_entrypoint_returns_main(
     monkeypatch.setitem(sys.modules, fake.__name__, fake)
     main = rt.resolve_science_entrypoint(fake.__name__)
     assert main(science_ref=VALID_SHA) == {"model_version": "test"}
+
+
+# --- Platform -> Science handoff: the real integrated Phase 10C3A runner ------
+
+
+def test_resolve_science_entrypoint_resolves_real_phase10c3a_runner() -> None:
+    # Proves the Platform <-> Science handoff: now that both tracks are
+    # integrated onto one commit, the default Science entry point must
+    # resolve to a real callable -- not raise "not importable" the way it
+    # correctly did before integration.
+    main = rt.resolve_science_entrypoint(rt.DEFAULT_SCIENCE_ENTRYPOINT)
+    assert callable(main)
+
+
+def test_resolved_phase10c3a_runner_adapter_requires_data_dir() -> None:
+    # The structured-runner adapter must fail closed rather than invent a
+    # data root when no verified snapshot was prepared.
+    main = rt.resolve_science_entrypoint(rt.DEFAULT_SCIENCE_ENTRYPOINT)
+    with pytest.raises(rt.RemoteTrainingConfigError, match="data_dir"):
+        main(
+            science_ref=VALID_SHA,
+            data_manifest_sha256=VALID_MANIFEST_SHA,
+            data_dir=None,
+            n_draws=rt.PRODUCTION_N_DRAWS,
+            mode="production",
+            promotion_evidence_eligible=True,
+        )
+
+
+def test_resolved_phase10c3a_runner_adapter_builds_matching_runner_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Verifies the argument mapping the adapter performs: Platform's
+    # n_draws/mode/data root/output directory/manifest hash must reach the
+    # Science RunnerConfig unchanged. This is the "Platform production
+    # invocation and Science CLI agree" contract, checked without running
+    # the real (heavy) historical pipeline -- `run` is stubbed.
+    from nflprops.calibration import phase10c3a_runner as science
+
+    captured: dict = {}
+
+    def fake_run(config: science.RunnerConfig) -> dict:
+        captured["config"] = config
+        return {
+            "model_version": config.model_version,
+            "promotion_decision": "INSUFFICIENT_EVIDENCE",
+            "registration": {"payload_sha256": "deadbeef"},
+        }
+
+    monkeypatch.setattr(science, "run", fake_run)
+    main = rt.resolve_science_entrypoint(rt.DEFAULT_SCIENCE_ENTRYPOINT)
+
+    data_dir = tmp_path / "snapshot"
+    data_dir.mkdir()
+    output_dir = tmp_path / "output"
+    result = main(
+        science_ref=VALID_SHA,
+        data_manifest_sha256=VALID_MANIFEST_SHA,
+        data_dir=data_dir,
+        n_draws=rt.PRODUCTION_N_DRAWS,
+        mode="production",
+        promotion_evidence_eligible=True,
+        output_dir=output_dir,
+    )
+
+    config = captured["config"]
+    assert config.data_root == data_dir
+    assert config.output_dir == output_dir
+    assert config.n_draws == rt.PRODUCTION_N_DRAWS
+    assert config.mode == "production"
+    assert config.expect_data_manifest_sha256 == VALID_MANIFEST_SHA
+    assert result["challenger_payload_hash"] == "deadbeef"
+    assert (output_dir / "phase10c3a_report.json").exists()
+
+
+def test_platform_and_science_agree_on_production_draw_count() -> None:
+    from nflprops.calibration import phase10c3a_runner as science
+
+    assert rt.PRODUCTION_N_DRAWS == science.PRODUCTION_N_DRAWS == 20_000
+
+
+def test_platform_smoke_cap_is_structurally_below_production() -> None:
+    assert rt.MAX_SMOKE_N_DRAWS < rt.PRODUCTION_N_DRAWS
 
 
 # --- never touches champion promotion -----------------------------------------
@@ -229,6 +312,7 @@ def test_execute_remote_training_missing_entrypoint_fails_closed_and_still_write
         science_ref=VALID_SHA,
         data_manifest_sha256=VALID_MANIFEST_SHA,
         mode="production",
+        entry_point="nflprops.platform._definitely_does_not_exist",
     )
     report_path = tmp_path / "report.json"
     with pytest.raises(rt.ScienceEntrypointNotAvailableError):

@@ -172,7 +172,46 @@ def test_ci_has_platform_scope_guard_job() -> None:
     doc = _load(CI)
     assert "platform-scope-guard" in doc["jobs"]
     guard = doc["jobs"]["platform-scope-guard"]
-    assert guard["if"] == "github.event_name == 'pull_request'"
+    assert guard["if"] == (
+        "github.event_name == 'pull_request' && "
+        "github.head_ref == 'work/platform-automation'"
+    )
+
+
+def test_ci_platform_scope_guard_is_restricted_to_platform_branch() -> None:
+    # The guard must only fire for the dedicated Platform-automation branch,
+    # never for every pull request -- otherwise a dev -> main integration PR
+    # (which legitimately carries certified science changes) would be
+    # misclassified as an out-of-scope Platform change.
+    doc = _load(CI)
+    guard_if = doc["jobs"]["platform-scope-guard"]["if"]
+    assert "github.head_ref" in guard_if
+    assert "work/platform-automation" in guard_if
+
+
+def test_ci_platform_scope_guard_diffs_against_actual_pr_base() -> None:
+    # The guard must compare against the PR's own base ref/merge-base, not a
+    # hardcoded `main`, so it stays correct when the Platform branch is
+    # based on something other than main (e.g. dev/nflprops-production).
+    text = CI.read_text()
+    guard_block = text.split("platform-scope-guard:", 1)[1]
+    assert "github.event.pull_request.base.ref" in guard_block
+    assert "git fetch origin main" not in guard_block
+    assert "merge-base origin/main" not in guard_block
+
+
+def test_ci_dev_to_main_integration_pr_will_not_trigger_platform_guard() -> None:
+    # Simulates evaluating the guard's `if` condition for a hypothetical
+    # dev/nflprops-production -> main PR: head_ref is the dev branch, not
+    # the Platform branch, so the guard must not run.
+    doc = _load(CI)
+    guard_if = doc["jobs"]["platform-scope-guard"]["if"]
+    head_ref = "dev/nflprops-production"
+    condition = guard_if.replace(
+        "github.head_ref == 'work/platform-automation'",
+        repr(head_ref == "work/platform-automation").lower(),
+    ).replace("github.event_name == 'pull_request'", "true")
+    assert condition == "true && false"
 
 
 def test_ci_has_migration_head_validation_job() -> None:

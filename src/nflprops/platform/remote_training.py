@@ -210,8 +210,107 @@ def verify_checked_out_sha(
     return actual
 
 
+# The Phase 10C3A CLI's own `parse_args` defaults (see
+# nflprops/calibration/phase10c3a_runner.py::parse_args) -- mirrored here so
+# a structured-runner invocation from this module is configured identically
+# to `python -m nflprops.calibration.phase10c3a_runner` with only
+# --data-root/--output-dir/--n-draws/--mode/--expect-data-manifest-sha256
+# supplied. Argument-mapping glue only; no science default is invented here.
+_STRUCTURED_RUNNER_SEASON_MIN = 2022
+_STRUCTURED_RUNNER_SEASON_MAX = 2025
+_STRUCTURED_RUNNER_MODEL_VERSION = "phase10c3a-real-run-v1"
+_STRUCTURED_RUNNER_REGULARIZATION_LAMBDA = 0.01
+_STRUCTURED_RUNNER_MAX_FIT_ITERATIONS = 200
+
+
+def _adapt_structured_runner(
+    module: Any, runner_config_cls: Any, structured_run: Callable[[Any], dict[str, Any]]
+) -> Callable[..., dict[str, Any]]:
+    """Wrap the Phase 10C3A `RunnerConfig` + `run(config) -> dict` interface
+    (the version-controlled Science entry point) in this module's plain
+    kwargs entrypoint contract. Pure argument mapping: constructs the same
+    `RunnerConfig` the Science CLI would build from equivalent flags and
+    calls the unmodified `run()`; no science calculation is reimplemented or
+    altered here.
+    """
+
+    def adapter(
+        *,
+        science_ref: str,
+        data_manifest_sha256: str | None = None,
+        data_dir: Path | None = None,
+        n_draws: int | None = None,
+        mode: str | None = None,
+        promotion_evidence_eligible: bool | None = None,
+        output_dir: Path | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        if data_dir is None:
+            raise RemoteTrainingConfigError(
+                "structured Science runner requires a prepared data_dir "
+                "(the verified downloaded data snapshot) to use as "
+                "--data-root"
+            )
+        resolved_output_dir = (
+            Path(output_dir) if output_dir is not None else Path(data_dir) / "phase10c3a-output"
+        )
+        config = runner_config_cls(
+            data_root=Path(data_dir),
+            output_dir=resolved_output_dir,
+            season_min=_STRUCTURED_RUNNER_SEASON_MIN,
+            season_max=_STRUCTURED_RUNNER_SEASON_MAX,
+            n_draws=n_draws,
+            mode=mode,
+            model_version=_STRUCTURED_RUNNER_MODEL_VERSION,
+            regularization_lambda=_STRUCTURED_RUNNER_REGULARIZATION_LAMBDA,
+            max_fit_iterations=_STRUCTURED_RUNNER_MAX_FIT_ITERATIONS,
+            expect_data_manifest_sha256=data_manifest_sha256,
+        )
+        result = structured_run(config)
+
+        # Same filename/location the Science CLI's own `main()` writes to
+        # (`config.output_dir / "phase10c3a_report.json"`), so the
+        # machine-readable report lands in the same place whether the
+        # runner is invoked via CLI or via this structured call.
+        resolved_output_dir.mkdir(parents=True, exist_ok=True)
+        report_path = resolved_output_dir / "phase10c3a_report.json"
+        report_path.write_text(json.dumps(result, indent=2, default=str))
+
+        registration = result.get("registration") or {}
+        return {
+            "model_version": result.get("model_version"),
+            "challenger_payload_hash": registration.get("payload_sha256"),
+            "validation_result": {
+                "real_game_coherence_check": result.get("real_game_coherence_check"),
+                "reproducibility_check": result.get("reproducibility_check"),
+            },
+            "promotion_eligibility_result": {
+                "eligible": result.get("promotion_decision") == "ELIGIBLE_FOR_PROMOTION",
+                "decision": result.get("promotion_decision"),
+                "overall_promotion_gate": result.get("overall_promotion_gate"),
+            },
+            "report_path": str(report_path),
+        }
+
+    return adapter
+
+
 def resolve_science_entrypoint(entry_point: str) -> Callable[..., dict[str, Any]]:
-    """Import `entry_point` and return its `main` callable.
+    """Import `entry_point` and return a callable matching this module's
+    entrypoint contract: `main(*, science_ref, data_manifest_sha256,
+    data_dir, n_draws, mode, promotion_evidence_eligible, ...) -> dict`.
+
+    Two supported Science module shapes:
+
+    1. The version-controlled Phase 10C3A structured interface --
+       `RunnerConfig` + `run(config) -> dict` -- adapted into this module's
+       kwargs contract by `_adapt_structured_runner`. This is the shape
+       `nflprops.calibration.phase10c3a_runner` actually exposes; its own
+       `main(argv) -> int` is a separate, CLI-only convenience wrapper and
+       is never called from here.
+    2. A module that already exposes `main(**kwargs) -> dict` directly,
+       matching this module's contract natively (e.g. a future Science
+       entry point, or a test double).
 
     Fails closed with `ScienceEntrypointNotAvailableError` -- never returns
     a stand-in, never silently skips training. This is the only place this
@@ -230,6 +329,12 @@ def resolve_science_entrypoint(entry_point: str) -> Callable[..., dict[str, Any]
             "docs/PLATFORM_AUTOMATION.md. Failing the job rather than "
             "pretending training happened."
         ) from exc
+
+    runner_config_cls = getattr(module, "RunnerConfig", None)
+    structured_run = getattr(module, "run", None)
+    if runner_config_cls is not None and callable(structured_run):
+        return _adapt_structured_runner(module, runner_config_cls, structured_run)
+
     main = getattr(module, "main", None)
     if main is None or not callable(main):
         raise ScienceEntrypointNotAvailableError(
@@ -311,6 +416,7 @@ def execute_remote_training(
         [str], Callable[..., dict[str, Any]]
     ] = resolve_science_entrypoint,
     prepare_data: Callable[[], Path] | None = None,
+    output_dir: Path | None = None,
 ) -> RemoteTrainingRunReport:
     """Run one remote-training invocation end to end and always write a
     report. Raises on any failure (after writing the failure report) so the
@@ -341,6 +447,7 @@ def execute_remote_training(
             n_draws=request.n_draws,
             mode=request.mode.value,
             promotion_evidence_eligible=request.promotion_evidence_eligible,
+            output_dir=output_dir,
         )
         if not isinstance(result, dict):
             raise RemoteTrainingError(
@@ -410,6 +517,14 @@ def run(
     data_dir: str | None = typer.Option(
         None, help="Ephemeral workspace already populated by `prepare-data`, if any."
     ),
+    output_dir: str | None = typer.Option(
+        None,
+        help=(
+            "Directory for the Science entry point's own machine-readable "
+            "report + logs (its --output-dir, for a structured Science "
+            "runner). Defaults to a subdirectory of data_dir."
+        ),
+    ),
 ) -> None:
     """Validate inputs, verify the checkout, and invoke the Science entry
     point. Exits non-zero on any failure -- never silently continues."""
@@ -427,6 +542,7 @@ def run(
 
     resolved_report_path = Path(report_path)
     resolved_data_dir = Path(data_dir) if data_dir is not None else None
+    resolved_output_dir = Path(output_dir) if output_dir is not None else None
     try:
         execute_remote_training(
             request,
@@ -436,6 +552,7 @@ def run(
             prepare_data=(lambda: resolved_data_dir)
             if resolved_data_dir is not None
             else None,
+            output_dir=resolved_output_dir,
         )
     except RemoteTrainingError as exc:
         typer.echo(f"FAILED: {exc}", err=True)

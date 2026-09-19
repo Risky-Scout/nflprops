@@ -147,19 +147,22 @@ jobs:
 
   platform-scope-guard:
     # PLATFORM AUTOMATION PRs must never touch model science or create a
-    # migration (§1/§2 of the platform brief) -- this only runs for pull
-    # requests targeting main, where a real merge-base diff is meaningful.
-    if: github.event_name == 'pull_request'
+    # migration (§1/§2 of the platform brief). This guard is specific to the
+    # dedicated Platform-automation branch and compares against that PR's
+    # ACTUAL base ref/merge-base -- it must never run on the eventual
+    # dev/nflprops-production -> main integration PR, which legitimately
+    # carries certified science changes accumulated on dev since main.
+    if: github.event_name == 'pull_request' && github.head_ref == 'work/platform-automation'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Diff against merge-base with main
+      - name: Diff against PR base
         run: |
-          git fetch origin main --quiet
-          BASE="$(git merge-base origin/main HEAD)"
-          echo "Comparing HEAD against merge-base $BASE"
+          git fetch origin "${{ github.event.pull_request.base.ref }}" --quiet
+          BASE="$(git merge-base origin/${{ github.event.pull_request.base.ref }} HEAD)"
+          echo "Comparing HEAD against merge-base $BASE (PR base: ${{ github.event.pull_request.base.ref }})"
           git diff --name-only "$BASE"...HEAD > /tmp/changed_files.txt
           cat /tmp/changed_files.txt
 
