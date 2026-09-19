@@ -214,6 +214,14 @@ def test_ci_dev_to_main_integration_pr_will_not_trigger_platform_guard() -> None
     assert condition == "true && false"
 
 
+def test_ci_runs_on_push_to_dev_integration_branch() -> None:
+    # The integrated dev branch must get ordinary CI on every push so the
+    # full suite runs in GitHub rather than only ever running on main.
+    doc = _load(CI)
+    assert "dev/nflprops-production" in doc[True]["push"]["branches"]
+    assert "main" in doc[True]["push"]["branches"]
+
+
 def test_ci_has_migration_head_validation_job() -> None:
     doc = _load(CI)
     assert "migration-head" in doc["jobs"]

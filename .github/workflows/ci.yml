@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev/nflprops-production]
   pull_request:
   schedule:
     # Nightly provider schema-drift check. SPEC §7.
