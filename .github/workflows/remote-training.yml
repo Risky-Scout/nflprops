@@ -1,0 +1,145 @@
+name: Remote NFL Training
+
+# GitHub-controlled remote training/calibration. Runs the version-controlled
+# Science entry point at an explicit git SHA on dedicated remote Linux
+# compute -- never on Joseph's Mac, never on the WizardOfOdds serving host.
+# See docs/PLATFORM_AUTOMATION.md.
+#
+# This workflow contains no model science and performs no automatic
+# champion promotion or public deployment side effect.
+
+on:
+  workflow_dispatch:
+    inputs:
+      science_ref:
+        description: "Explicit 40-character git SHA to check out and run (never a branch name or 'latest')."
+        required: true
+        type: string
+      data_manifest_sha256:
+        description: "Explicit SHA-256 of the pinned training-data manifest."
+        required: true
+        type: string
+      manifest_object_key:
+        description: "Object-store key of the manifest.json describing the training-data snapshot."
+        required: true
+        type: string
+      mode:
+        description: "production (locked to 20,000 draws, may produce promotion evidence) or smoke (fast contract check, never promotion evidence)."
+        required: true
+        type: choice
+        options:
+          - production
+          - smoke
+        default: smoke
+      smoke_n_draws:
+        description: "Draw count for smoke mode only. Ignored in production mode, which is always exactly 20,000."
+        required: false
+        type: string
+        default: ""
+      entry_point:
+        description: "Dotted module path of the Science entry point to invoke."
+        required: false
+        type: string
+        default: "nflprops.calibration.phase10c3a_runner"
+
+permissions:
+  contents: read
+
+concurrency:
+  # Only production runs serialize against each other -- smoke runs (used
+  # for fast contract checks) never block or get blocked by production.
+  group: ${{ inputs.mode == 'production' && 'remote-training-production' || format('remote-training-smoke-{0}', github.run_id) }}
+  cancel-in-progress: false
+
+jobs:
+  train:
+    name: Remote training (${{ inputs.mode }})
+    # EXTERNAL PROVISIONING REQUIRED: this label is not yet registered to
+    # any machine. See docs/PLATFORM_AUTOMATION.md
+    # #external-provisioning-still-required. Never falls back to a
+    # GitHub-hosted runner or to Joseph's Mac -- an unregistered label
+    # simply leaves the job queued rather than silently running production
+    # training somewhere unapproved.
+    runs-on: [self-hosted, nflprops-training]
+    timeout-minutes: 480
+
+    steps:
+      - name: Reject unversioned science_ref early
+        run: |
+          if ! [[ "${{ inputs.science_ref }}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::science_ref must be an explicit 40-character git SHA, got '${{ inputs.science_ref }}'"
+            exit 1
+          fi
+
+      - name: Checkout at explicit science_ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.science_ref }}
+          fetch-depth: 0
+
+      - name: Verify checked-out SHA matches requested science_ref
+        run: |
+          ACTUAL="$(git rev-parse HEAD)"
+          if [ "$ACTUAL" != "${{ inputs.science_ref }}" ]; then
+            echo "::error::checked out $ACTUAL but requested science_ref was ${{ inputs.science_ref }}"
+            exit 1
+          fi
+          echo "VERIFIED_SCIENCE_SHA=$ACTUAL" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project (platform harness; Science extras if present)
+        run: pip install -e ".[dev,storage,orchestration]"
+
+      - name: Prepare verified training-data snapshot
+        env:
+          OBJECT_STORE_ENDPOINT: ${{ secrets.OBJECT_STORE_ENDPOINT }}
+          OBJECT_STORE_REGION: ${{ secrets.OBJECT_STORE_REGION }}
+          OBJECT_STORE_BUCKET: ${{ secrets.OBJECT_STORE_BUCKET }}
+          OBJECT_STORE_ACCESS_KEY: ${{ secrets.OBJECT_STORE_ACCESS_KEY }}
+          OBJECT_STORE_SECRET_KEY: ${{ secrets.OBJECT_STORE_SECRET_KEY }}
+        run: |
+          python -m nflprops.platform.remote_training prepare-data \
+            --manifest-object-key "${{ inputs.manifest_object_key }}" \
+            --data-manifest-sha256 "${{ inputs.data_manifest_sha256 }}" \
+            --workspace "$RUNNER_TEMP/training-data"
+
+      - name: Run remote training
+        env:
+          OBJECT_STORE_ENDPOINT: ${{ secrets.OBJECT_STORE_ENDPOINT }}
+          OBJECT_STORE_REGION: ${{ secrets.OBJECT_STORE_REGION }}
+          OBJECT_STORE_BUCKET: ${{ secrets.OBJECT_STORE_BUCKET }}
+          OBJECT_STORE_ACCESS_KEY: ${{ secrets.OBJECT_STORE_ACCESS_KEY }}
+          OBJECT_STORE_SECRET_KEY: ${{ secrets.OBJECT_STORE_SECRET_KEY }}
+          NFLPROPS_ENV: production
+          NFLPROPS_STORAGE_BACKEND: postgres
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python -m nflprops.platform.remote_training run \
+            --science-ref "${{ inputs.science_ref }}" \
+            --data-manifest-sha256 "${{ inputs.data_manifest_sha256 }}" \
+            --mode "${{ inputs.mode }}" \
+            --entry-point "${{ inputs.entry_point }}" \
+            ${{ inputs.smoke_n_draws != '' && format('--smoke-n-draws {0}', inputs.smoke_n_draws) || '' }} \
+            --report-path "$RUNNER_TEMP/remote_training_report.json" \
+            --repository "${{ github.repository }}" \
+            --workflow-sha "${{ github.sha }}" \
+            --data-dir "$RUNNER_TEMP/training-data"
+
+      - name: Clean ephemeral training-data workspace
+        if: always()
+        run: |
+          python -m nflprops.platform.remote_training cleanup-data \
+            --workspace "$RUNNER_TEMP/training-data"
+
+      - name: Upload run report and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-training-${{ inputs.mode }}-${{ github.run_id }}
+          if-no-files-found: warn
+          retention-days: 90
+          path: |
+            ${{ runner.temp }}/remote_training_report.json
