@@ -19,7 +19,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install -e ".[dev]"
+      # [orchestration] pulls in prefect -- required so tests/orchestration/*
+      # collect at all; those modules import nflprops.orchestration, which
+      # imports prefect (see the [project.optional-dependencies] comment in
+      # pyproject.toml). Never needed by core model code.
+      - run: pip install -e ".[dev,orchestration]"
 
       - name: Validate machine-readable contracts
         run: python tools/validate_contracts.py
@@ -70,7 +74,9 @@ jobs:
         with:
           python-version: "3.11"
 
-      - run: pip install -e ".[dev]"
+      # See the matching comment on the `test` job: mypy must see prefect's
+      # types to typecheck src/nflprops/orchestration/* correctly.
+      - run: pip install -e ".[dev,orchestration]"
 
       - name: Strict mypy non-regression gate
         run: |
