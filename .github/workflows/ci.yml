@@ -22,8 +22,11 @@ jobs:
       # [orchestration] pulls in prefect -- required so tests/orchestration/*
       # collect at all; those modules import nflprops.orchestration, which
       # imports prefect (see the [project.optional-dependencies] comment in
-      # pyproject.toml). Never needed by core model code.
-      - run: pip install -e ".[dev,orchestration]"
+      # pyproject.toml). [storage] pulls in sqlalchemy/psycopg/alembic/boto3,
+      # required for the Docker-gated PostgreSQL/MinIO integration tests this
+      # job's own step name below claims to run. Neither is needed by core
+      # model code.
+      - run: pip install -e ".[dev,orchestration,storage]"
 
       - name: Validate machine-readable contracts
         run: python tools/validate_contracts.py
@@ -74,9 +77,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      # See the matching comment on the `test` job: mypy must see prefect's
-      # types to typecheck src/nflprops/orchestration/* correctly.
-      - run: pip install -e ".[dev,orchestration]"
+      # See the matching comment on the `test` job: mypy must see
+      # prefect's/sqlalchemy's/etc. types to typecheck
+      # src/nflprops/orchestration/* and src/nflprops/data/storage/*
+      # correctly.
+      - run: pip install -e ".[dev,orchestration,storage]"
 
       - name: Strict mypy non-regression gate
         run: |
