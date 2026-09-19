@@ -32,6 +32,7 @@ features_app = typer.Typer(help="Point-in-time feature building.")
 state_app = typer.Typer(help="Empirical-Bayes state updates.")
 collect_app = typer.Typer(help="Continuous point-in-time collection (PHASE 4).")
 checkpoint_app = typer.Typer(help="Official pregame checkpoints (PHASE 5).")
+platform_app = typer.Typer(help="Platform operational status (PLATFORM AUTOMATION).")
 
 app.add_typer(provider_app, name="provider")
 app.add_typer(ingest_app, name="ingest")
@@ -41,6 +42,7 @@ app.add_typer(features_app, name="features")
 app.add_typer(state_app, name="state")
 app.add_typer(collect_app, name="collect")
 app.add_typer(checkpoint_app, name="checkpoint")
+app.add_typer(platform_app, name="platform")
 
 
 # --- provider ---------------------------------------------------------------
@@ -716,6 +718,42 @@ def coverage() -> None:
     for table in tables:
         frame = warehouse.read(table)
         typer.echo(f"{table}: {frame.height} rows")
+
+
+@platform_app.command("health")
+def platform_health() -> None:
+    """Read-only infrastructure health report (JSON). Not a publication
+    readiness gate -- see docs/READINESS_2026.md for that."""
+    import json
+
+    from nflprops.data.storage.settings import StorageSettings
+    from nflprops.platform.health import (
+        collect_platform_health,
+        database_reachable_check,
+        object_store_reachable_check,
+    )
+
+    settings = StorageSettings.from_env()
+    checks = {"database": database_reachable_check(settings.database_url)}
+    if settings.object_store_configured():
+        from nflprops.data.storage.object_store import ObjectStoreSettings
+
+        checks["object_store"] = object_store_reachable_check(
+            ObjectStoreSettings(
+                endpoint_url=settings.object_store_endpoint,  # type: ignore[arg-type]
+                region=settings.object_store_region,  # type: ignore[arg-type]
+                bucket=settings.object_store_bucket,  # type: ignore[arg-type]
+                access_key=settings.object_store_access_key,  # type: ignore[arg-type]
+                secret_key=settings.object_store_secret_key,  # type: ignore[arg-type]
+            )
+        )
+    else:
+        checks["object_store"] = lambda: (False, "object store is not configured")
+
+    report = collect_platform_health(checks)
+    typer.echo(json.dumps(report.as_dict(), indent=2, sort_keys=True))
+    if not report.healthy:
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

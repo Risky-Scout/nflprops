@@ -33,7 +33,10 @@ jobs:
       - name: Lint
         run: ruff check src tests
 
-      - name: Test
+      - name: Byte-compile every module
+        run: python -m compileall -q src
+
+      - name: Test (includes Docker-gated PostgreSQL/MinIO integration tests where available)
         run: pytest -q
 
       # --- architectural guards. These are the rules that keep the package
@@ -123,3 +126,52 @@ jobs:
         env:
           BDL_API_KEY: ${{ secrets.BDL_API_KEY }}
         run: nflprops provider drift bdl
+
+  migration-head:
+    # Alembic's migration graph must resolve to exactly one head. `alembic
+    # heads` only inspects migrations/versions/ -- it needs no DATABASE_URL.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[storage]"
+      - name: Validate single Alembic head
+        run: |
+          alembic heads | tee /tmp/alembic_heads.txt
+          COUNT=$(grep -c . /tmp/alembic_heads.txt || true)
+          if [ "$COUNT" -ne 1 ]; then
+            echo "FAIL: expected exactly one Alembic head, found $COUNT"
+            exit 1
+          fi
+
+  platform-scope-guard:
+    # PLATFORM AUTOMATION PRs must never touch model science or create a
+    # migration (§1/§2 of the platform brief) -- this only runs for pull
+    # requests targeting main, where a real merge-base diff is meaningful.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Diff against merge-base with main
+        run: |
+          git fetch origin main --quiet
+          BASE="$(git merge-base origin/main HEAD)"
+          echo "Comparing HEAD against merge-base $BASE"
+          git diff --name-only "$BASE"...HEAD > /tmp/changed_files.txt
+          cat /tmp/changed_files.txt
+
+          FORBIDDEN='^src/nflprops/(calibration|distributions|simulation|projections|thresholds)/|^src/nflprops/market/current_pricing\.py$'
+          if grep -E "$FORBIDDEN" /tmp/changed_files.txt; then
+            echo "FAIL: this PR touches model-science files (see § SCIENCE IS OUT OF SCOPE)"
+            exit 1
+          fi
+
+          if grep -E '^migrations/versions/' /tmp/changed_files.txt; then
+            echo "FAIL: this PR adds/modifies an Alembic migration (§ NO ALEMBIC MIGRATION IN THIS PARALLEL PHASE)"
+            exit 1
+          fi
+        # This job only guards the science/migration boundary described
+        # above; it deliberately does not gate on any other path.
