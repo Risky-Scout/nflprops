@@ -33,8 +33,11 @@ stats are ingested after the game finishes).
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import polars as pl
@@ -69,6 +72,43 @@ class HistoricalReplayError(ValueError):
     """A structural precondition of real-historical replay was violated:
     a missing required warehouse table, a naive datetime, or a game row
     missing an expected column."""
+
+
+@dataclass(frozen=True)
+class WarehouseTables:
+    """Every warehouse table `build_labeled_game` reads, loaded once.
+
+    `build_labeled_game` re-reads all eight tables from `backend` on
+    every call when `tables` is omitted -- correct, but O(n_games) redundant
+    disk I/O over an unchanging historical warehouse (the dominant real-run
+    cost, unrelated to `n_draws`). A caller replaying many games loads this
+    ONCE via `load_warehouse_tables` and passes it to every `build_labeled_game`
+    / `replay_games` call instead -- same frames, same values, purely fewer
+    reads; no scoring/simulation semantics differ either way.
+    """
+
+    games: pl.DataFrame
+    player_stats: pl.DataFrame
+    team_stats: pl.DataFrame
+    players: pl.DataFrame
+    roster: pl.DataFrame
+    injuries: pl.DataFrame
+    injury_runs: pl.DataFrame
+    game_odds: pl.DataFrame
+
+
+def load_warehouse_tables(backend: StorageBackend) -> WarehouseTables:
+    """Read every table `build_labeled_game` needs exactly once."""
+    return WarehouseTables(
+        games=backend.read("games"),
+        player_stats=backend.read("player_game_stats"),
+        team_stats=backend.read("team_game_stats"),
+        players=backend.read("players"),
+        roster=_empty_or(backend, "roster_snapshots"),
+        injuries=_empty_or(backend, "injury_snapshots"),
+        injury_runs=_empty_or(backend, "collector_resource_runs"),
+        game_odds=_empty_or(backend, "game_odds_snapshots"),
+    )
 
 
 @dataclass(frozen=True)
@@ -150,6 +190,7 @@ def build_labeled_game(
     player_state_config: PlayerStateConfig | None = None,
     team_state_config: TeamStateConfig | None = None,
     settlement_rules: SettlementRuleSet | None = None,
+    tables: WarehouseTables | None = None,
 ) -> LabeledGame | GameReplaySkip:
     """Real historical replay of one game: build PIT-safe states from data
     strictly available at kickoff, run the certified
@@ -159,18 +200,23 @@ def build_labeled_game(
     game cannot be simulated (untrustworthy team structural state -- the
     same pre-existing `simulate_game_for_prediction` skip condition
     `predict_week` has always had) or has no scoreable evidence at all.
+
+    `tables`, if given (`load_warehouse_tables(backend)`), is used instead of
+    re-reading `backend` -- identical values, purely fewer disk reads for a
+    caller replaying many games against the same unchanging warehouse.
     """
     game_id = str(game_row["canonical_game_id"])
     as_of = _aware(game_row["date"], field="game.date")
 
-    games = backend.read("games")
-    player_stats = backend.read("player_game_stats")
-    team_stats = backend.read("team_game_stats")
-    players = backend.read("players")
-    roster = _empty_or(backend, "roster_snapshots")
-    injuries = _empty_or(backend, "injury_snapshots")
-    injury_runs = _empty_or(backend, "collector_resource_runs")
-    game_odds = _empty_or(backend, "game_odds_snapshots")
+    loaded = tables if tables is not None else load_warehouse_tables(backend)
+    games = loaded.games
+    player_stats = loaded.player_stats
+    team_stats = loaded.team_stats
+    players = loaded.players
+    roster = loaded.roster
+    injuries = loaded.injuries
+    injury_runs = loaded.injury_runs
+    game_odds = loaded.game_odds
 
     team_states = build_team_states(
         team_stats, player_stats, as_of=as_of, strict=False,
@@ -255,12 +301,20 @@ def replay_games(
     team_state_config: TeamStateConfig | None = None,
     settlement_rules: SettlementRuleSet | None = None,
     on_progress: object | None = None,
+    tables: WarehouseTables | None = None,
 ) -> ReplayBatchResult:
     """Replay every row of `game_rows` (as returned by `list_final_games`).
     Honest bookkeeping: every game becomes exactly one `LabeledGame` or one
     `GameReplaySkip`, never silently disappears. `on_progress`, if given,
-    is called with `(index, total, game_id)` after each game."""
+    is called with `(index, total, game_id)` after each game.
+
+    `tables`, if given, is loaded once and reused for every game instead of
+    re-reading `backend` per game (see `WarehouseTables`); omitted, this
+    reads fresh (and therefore redundantly, once per game) exactly as
+    before.
+    """
     rules = settlement_rules if settlement_rules is not None else load_settlement_rules()
+    loaded = tables if tables is not None else load_warehouse_tables(backend)
     labeled: list[LabeledGame] = []
     skips: list[GameReplaySkip] = []
     total = game_rows.height
@@ -271,6 +325,7 @@ def replay_games(
             player_state_config=player_state_config,
             team_state_config=team_state_config,
             settlement_rules=rules,
+            tables=loaded,
         )
         if isinstance(result, LabeledGame):
             labeled.append(result)
@@ -291,7 +346,6 @@ def compute_training_manifest_sha256(games: list[LabeledGame] | tuple[LabeledGam
     test_compute_training_manifest_sha256_is_deterministic`); it changes
     if -- and only if -- the actual training evidence changes.
     """
-    import hashlib
 
     def _serialize_game(game: LabeledGame) -> str:
         label_parts = sorted(
@@ -311,3 +365,34 @@ def compute_training_manifest_sha256(games: list[LabeledGame] | tuple[LabeledGam
     ordered = sorted(games, key=lambda g: g.game_id)
     payload = "\x1e".join(["training_manifest/v1", *(_serialize_game(g) for g in ordered)])
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def compute_data_root_manifest(data_root: Path) -> dict[str, str]:
+    """Deterministic `{relative_parquet_path: sha256_hex}` manifest of every
+    `*.parquet` file under `data_root`, sorted by path.
+
+    This is a manifest of the RAW WAREHOUSE INPUT (what real-historical
+    replay reads), distinct from `compute_training_manifest_sha256` (a
+    manifest of the DERIVED training evidence one fit consumed). A remote
+    runner invocation records/verifies this so a promotion decision can be
+    tied to an exact, reproducible input data snapshot -- never to "whatever
+    happened to be on disk."
+    """
+    root = Path(data_root)
+    manifest: dict[str, str] = {}
+    for path in sorted(root.rglob("*.parquet")):
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+        manifest[str(path.relative_to(root))] = digest.hexdigest()
+    return manifest
+
+
+def compute_data_root_manifest_sha256(data_root: Path) -> str:
+    """Single deterministic SHA-256 digest of `compute_data_root_manifest`
+    (sorted-key canonical JSON) -- one value to record/compare instead of
+    the full per-file mapping."""
+    manifest = compute_data_root_manifest(data_root)
+    canonical = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
