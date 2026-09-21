@@ -33,12 +33,15 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
+from typing import TypeVar
 
 from nflprops.calibration.entropy_tilting import ALGORITHM_FAMILY, ALGORITHM_VERSION
 from nflprops.calibration.joint_feature_contract import (
     FEATURE_CONTRACT_VERSION,
     FEATURE_NAMES,
 )
+
+_T = TypeVar("_T")
 
 #: Bump only for a genuine change to the payload's on-disk structure.
 PAYLOAD_SCHEMA_VERSION = "joint_game_calibration_payload/v1"
@@ -208,7 +211,7 @@ def build_calibration_payload(
     )
 
 
-def _require(raw: dict, key: str, kind: type) -> object:
+def _require(raw: dict[str, object], key: str, kind: type[_T]) -> _T:
     if key not in raw:
         raise MalformedCalibrationPayloadError(f"payload missing required key: {key!r}")
     value = raw[key]

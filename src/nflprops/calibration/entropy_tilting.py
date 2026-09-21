@@ -99,7 +99,7 @@ def softmax_weights(theta: np.ndarray, features: np.ndarray) -> np.ndarray:
             "softmax normalization failed: non-finite or non-positive total mass"
         )
 
-    weights = exp_scores / total
+    weights: np.ndarray = exp_scores / total
     if not np.all(np.isfinite(weights)) or not np.all(weights > 0.0):
         raise EntropyTiltingError("softmax produced a non-finite or non-positive weight")
 

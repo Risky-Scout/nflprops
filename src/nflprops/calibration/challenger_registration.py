@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from nflprops.calibration.artifact import (
     JOINT_GAME_SCOPE,
@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from nflprops.calibration.challenger import LabeledGame
+    from nflprops.calibration.payload import JointCalibrationPayload
     from nflprops.data.storage.base import StorageBackend
     from nflprops.orchestration.calibration_store import CalibrationValidation
 
@@ -58,7 +59,7 @@ class ChallengerRegistration:
 
 def build_challenger_payload(
     fit: FitResult, *, optimizer: str, tolerance: float, training_manifest_sha256: str
-):
+) -> JointCalibrationPayload:
     optimization = OptimizationMetadata(
         optimizer=optimizer,
         converged=fit.converged,
@@ -157,12 +158,16 @@ def register_challenger(
         validation_manifest_sha256=validation_manifest_sha256,
         scored_from=scored_from,
         scored_through=scored_through,
-        total_game_count=int(coverage["total_game_count"]),
-        pit_faithful_game_count=int(coverage["pit_faithful_game_count"]),
-        degraded_pit_game_count=int(coverage["degraded_pit_game_count"]),
+        total_game_count=cast(int, coverage["total_game_count"]),
+        pit_faithful_game_count=cast(int, coverage["pit_faithful_game_count"]),
+        degraded_pit_game_count=cast(int, coverage["degraded_pit_game_count"]),
         total_label_count=sum(len(g.labels) for g in training_games),
-        directly_labeled_prop_types=frozenset(coverage["directly_scored_prop_types"]),
-        unlabeled_prop_types=frozenset(coverage["unlabeled_prop_types"]),
+        directly_labeled_prop_types=frozenset(
+            cast("tuple[str, ...]", coverage["directly_scored_prop_types"])
+        ),
+        unlabeled_prop_types=frozenset(
+            cast("tuple[str, ...]", coverage["unlabeled_prop_types"])
+        ),
         metrics_json=json.dumps(metrics, sort_keys=True, separators=(",", ":")),
         chronology_checks_passed=chronology_checks_passed,
         leakage_checks_passed=leakage_checks_passed,

@@ -58,6 +58,8 @@ from nflprops.state.player import PlayerStateConfig, build_player_states
 from nflprops.state.team import TeamStateConfig, build_team_states
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from nflprops.data.storage.base import StorageBackend
 
 _REQUIRED_WAREHOUSE_TABLES: tuple[str, ...] = (
@@ -300,7 +302,7 @@ def replay_games(
     player_state_config: PlayerStateConfig | None = None,
     team_state_config: TeamStateConfig | None = None,
     settlement_rules: SettlementRuleSet | None = None,
-    on_progress: object | None = None,
+    on_progress: Callable[[int, int, str], None] | None = None,
     tables: WarehouseTables | None = None,
 ) -> ReplayBatchResult:
     """Replay every row of `game_rows` (as returned by `list_final_games`).

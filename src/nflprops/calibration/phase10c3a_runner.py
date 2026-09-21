@@ -50,7 +50,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
@@ -88,6 +88,10 @@ from nflprops.calibration.joint_feature_contract import (
 from nflprops.calibration.scoring import skill_score
 from nflprops.calibration.weighted_pmf import build_weighted_first_td_simplex
 from nflprops.data.warehouse import Warehouse
+from nflprops.domain.enums import PropType
+
+if TYPE_CHECKING:
+    from nflprops.data.storage.base import StorageBackend
 
 #: The only draw count this module will accept for a `--mode production`
 #: run -- the certified live-prediction default
@@ -309,11 +313,13 @@ def compute_season_skip_accounting(
     return out
 
 
-def _per_prop_means(scores: dict) -> dict[str, float]:
+def _per_prop_means(scores: dict[PropType, list[float]]) -> dict[str, float]:
     return {p.value: float(np.mean(v)) for p, v in scores.items()}
 
 
-def _skill_by_prop(challenger: dict, baseline: dict) -> dict[str, float]:
+def _skill_by_prop(
+    challenger: dict[PropType, list[float]], baseline: dict[PropType, list[float]]
+) -> dict[str, float]:
     out: dict[str, float] = {}
     for prop, values in challenger.items():
         baseline_values = baseline.get(prop)
@@ -405,7 +411,11 @@ def check_reproducibility(
     value. Any unavoidable nondeterminism must show up here as a mismatch,
     never be hidden."""
     repro_batch = replay_games(
-        warehouse, fold0_game_rows, model_version=model_version, n_draws=n_draws, tables=tables,
+        cast("StorageBackend", warehouse),
+        fold0_game_rows,
+        model_version=model_version,
+        n_draws=n_draws,
+        tables=tables,
     )
     manifest_a = compute_training_manifest_sha256(tuple(fold0_labeled_by_id.values()))
     manifest_b = compute_training_manifest_sha256(repro_batch.labeled_games)
@@ -436,7 +446,9 @@ def run(config: RunnerConfig) -> dict[str, Any]:
     report claiming more than the evidence supports.
     """
     config.output_dir.mkdir(parents=True, exist_ok=True)
-    log = lambda msg: _log(config.output_dir, msg)  # noqa: E731
+
+    def log(msg: str) -> None:
+        _log(config.output_dir, msg)
 
     log(f"Phase 10C3A runner starting: mode={config.mode} n_draws={config.n_draws} "
         f"data_root={config.data_root} seasons=[{config.season_min},{config.season_max}]")
@@ -450,8 +462,12 @@ def run(config: RunnerConfig) -> dict[str, Any]:
         )
 
     warehouse = Warehouse(config.data_root)
-    tables = load_warehouse_tables(warehouse)
-    games = list_final_games(warehouse, season_min=config.season_min, season_max=config.season_max)
+    tables = load_warehouse_tables(cast("StorageBackend", warehouse))
+    games = list_final_games(
+        cast("StorageBackend", warehouse),
+        season_min=config.season_min,
+        season_max=config.season_max,
+    )
     log(f"total final games: {games.height}")
 
     def progress(i: int, total: int, _gid: str) -> None:
@@ -460,7 +476,7 @@ def run(config: RunnerConfig) -> dict[str, Any]:
 
     t0 = time.time()
     batch = replay_games(
-        warehouse, games, model_version=config.model_version, n_draws=config.n_draws,
+        cast("StorageBackend", warehouse), games, model_version=config.model_version, n_draws=config.n_draws,
         tables=tables, on_progress=progress,
     )
     replay_seconds = time.time() - t0
@@ -588,7 +604,7 @@ def run(config: RunnerConfig) -> dict[str, Any]:
     payload_store = _InMemoryObjectStore()
 
     registration = register_challenger(
-        dev_backend,
+        cast("StorageBackend", dev_backend),
         payload_store,
         fit=last_fold.fit,
         optimizer="L-BFGS-B",
@@ -644,7 +660,9 @@ def run(config: RunnerConfig) -> dict[str, Any]:
             "total_game_count": coverage["total_game_count"],
             "pit_faithful_game_count": coverage["pit_faithful_game_count"],
             "degraded_pit_game_count": coverage["degraded_pit_game_count"],
-            "directly_scored_prop_types": list(coverage["directly_scored_prop_types"]),
+            "directly_scored_prop_types": list(
+                cast("tuple[str, ...]", coverage["directly_scored_prop_types"])
+            ),
             "unlabeled_prop_types": sorted(UNLABELED_PROP_TYPES),
         },
         "directly_labeled_prop_types": sorted(DIRECTLY_LABELED_PROP_TYPES),
