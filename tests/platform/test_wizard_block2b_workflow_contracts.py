@@ -198,17 +198,7 @@ def test_transfer_never_touches_sibling_deployments(transfer_doc: dict) -> None:
 
 
 def test_probe_is_workflow_dispatch_only(probe_doc: dict) -> None:
-    # TEMPORARY: a scoped `push` trigger (path-filtered to this file only)
-    # is present for exactly one push, to obtain real BLOCK 2B probe
-    # results without merging main (see this file's own header comment).
-    # An immediate follow-up commit removes it -- workflow_dispatch-only
-    # is this workflow's permanent, intended shape.
-    triggers = set(probe_doc[True])
-    assert triggers <= {"workflow_dispatch", "push"}
-    assert "workflow_dispatch" in triggers
-    if "push" in triggers:
-        push = probe_doc[True]["push"]
-        assert push["paths"] == [".github/workflows/wizard-probe.yml"]
+    assert set(probe_doc[True]) == {"workflow_dispatch"}
 
 
 def test_probe_uses_wizardofodds_environment(probe_doc: dict) -> None:
