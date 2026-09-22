@@ -2,6 +2,8 @@
 .env
 *.key
 *credentials*
+deploy/systemd/*.env
+!deploy/systemd/*.env.example
 
 # --- data ------------------------------------------------------------------
 # Raw provider responses and derived parquet are large and are reproduced from
@@ -18,6 +20,10 @@ data/canonical/
 data/manifests/
 data/*.duckdb
 data/*.duckdb.*
+# BLOCK 2B: local writer-lock / warehouse-snapshot runtime state (never
+# committed -- see nflprops.platform.writer_lock / warehouse_snapshot).
+data/locks/
+data/snapshots/
 artifacts/
 !data/.gitkeep
 

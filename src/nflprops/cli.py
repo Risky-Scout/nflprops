@@ -723,15 +723,40 @@ def coverage() -> None:
 @platform_app.command("health")
 def platform_health() -> None:
     """Read-only infrastructure health report (JSON). Not a publication
-    readiness gate -- see docs/READINESS_2026.md for that."""
+    readiness gate -- see docs/READINESS_2026.md for that.
+
+    BLOCK 2B (docs/PLATFORM_AUTOMATION.md) adds the Wizard runtime's own
+    checks: the canonical warehouse's readability/writability, the writer
+    lock's status, the latest snapshot's identity/verification, disk/memory
+    headroom, and the current Alembic migration head -- alongside the
+    pre-existing database/object-store checks (unused when the locked
+    zero-cost DuckDB architecture is active, but still reported for the
+    postgres/object-store code paths this module also supports). Every
+    check is read-only and never mutates the warehouse or contends for the
+    writer lock beyond a non-blocking probe.
+    """
     import json
+    import os
+    from pathlib import Path
 
     from nflprops.data.storage.settings import StorageSettings
     from nflprops.platform.health import (
+        checkpoint_status_placeholder_check,
         collect_platform_health,
+        collector_status_placeholder_check,
         database_reachable_check,
+        disk_free_check,
+        latest_snapshot_check,
+        memory_available_check,
+        migration_storage_version_check,
         object_store_reachable_check,
+        runtime_version_check,
+        warehouse_path_check,
+        warehouse_readable_check,
+        warehouse_writable_check,
+        writer_lock_status_check,
     )
+    from nflprops.platform.writer_lock import default_lock_path
 
     settings = StorageSettings.from_env()
     checks = {"database": database_reachable_check(settings.database_url)}
@@ -749,6 +774,29 @@ def platform_health() -> None:
         )
     else:
         checks["object_store"] = lambda: (False, "object store is not configured")
+
+    # BLOCK 2B: convention -- the warehouse root's PARENT is the runtime
+    # state root (e.g. NFLPROPS_DATA_ROOT=/var/lib/nflprops/warehouse ->
+    # state root /var/lib/nflprops), matching the snapshot/lock layout
+    # documented in nflprops.platform.warehouse_snapshot / writer_lock.
+    warehouse_root = Path(settings.local_warehouse_root)
+    state_root = warehouse_root.parent
+    snapshot_root = state_root / "snapshots"
+    lock_path = default_lock_path(state_root)
+
+    checks["runtime_version"] = runtime_version_check(
+        os.environ.get("NFLPROPS_RUNTIME_VERSION_SHA")
+    )
+    checks["warehouse_path"] = warehouse_path_check(warehouse_root)
+    checks["warehouse_readable"] = warehouse_readable_check(warehouse_root)
+    checks["warehouse_writable"] = warehouse_writable_check(warehouse_root)
+    checks["writer_lock"] = writer_lock_status_check(lock_path)
+    checks["latest_snapshot"] = latest_snapshot_check(snapshot_root)
+    checks["disk_free"] = disk_free_check(state_root)
+    checks["memory_available"] = memory_available_check()
+    checks["migration_storage_version"] = migration_storage_version_check()
+    checks["collector"] = collector_status_placeholder_check()
+    checks["checkpoint"] = checkpoint_status_placeholder_check()
 
     report = collect_platform_health(checks)
     typer.echo(json.dumps(report.as_dict(), indent=2, sort_keys=True))

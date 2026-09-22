@@ -93,11 +93,22 @@ class StorageSettings:
                 "NFLPROPS_STORAGE_BACKEND=postgres requires DATABASE_URL to be set"
             )
 
-        if settings.environment == "production" and settings.backend != "postgres":
-            raise StorageConfigError(
-                "NFLPROPS_ENV=production requires NFLPROPS_STORAGE_BACKEND=postgres — "
-                "local storage must never be authoritative production truth"
-            )
+        if settings.environment == "production" and settings.backend == "duckdb":
+            # BLOCK 2B (docs/PLATFORM_AUTOMATION.md): DuckDB + versioned
+            # immutable snapshots is the locked zero-cost production
+            # architecture -- postgres is no longer required. The one
+            # remaining guard: NFLPROPS_DATA_ROOT must be an explicit
+            # absolute path. The relative DEFAULT_LOCAL_WAREHOUSE_ROOT is a
+            # throwaway dev-checkout path and must never be mistaken for
+            # durable production truth.
+            root = Path(settings.local_warehouse_root)
+            if not root.is_absolute():
+                raise StorageConfigError(
+                    "NFLPROPS_ENV=production with NFLPROPS_STORAGE_BACKEND=duckdb "
+                    "requires NFLPROPS_DATA_ROOT to be an explicit absolute path "
+                    f"(got {settings.local_warehouse_root!r}) -- the relative default "
+                    "dev path must never be authoritative production truth"
+                )
 
         return settings
 

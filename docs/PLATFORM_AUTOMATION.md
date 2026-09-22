@@ -38,6 +38,13 @@ which fails any PR that touches either boundary.
 | Operational health reporting | `src/nflprops/platform/health.py`, `nflprops platform health` |
 | WizardOfOdds deployment foundation (not yet triggered) | `.github/workflows/deploy-wizard.yml` |
 | Ordinary CI (now includes byte-compile, migration-head validation, scope guard) | `.github/workflows/ci.yml` |
+| BLOCK 2B: OS-level single-writer lock for the live warehouse | `src/nflprops/platform/writer_lock.py` |
+| BLOCK 2B: immutable manifest/atomic-publish primitive (snapshots + result bundles) | `src/nflprops/platform/immutable_bundle.py` |
+| BLOCK 2B: canonical warehouse snapshot lifecycle (create/list/verify/restore) | `src/nflprops/platform/warehouse_snapshot.py` |
+| BLOCK 2B: Wizard-host runtime CLI (`python -m nflprops.platform.wizard_runtime`) | `src/nflprops/platform/wizard_runtime.py` |
+| BLOCK 2B: GitHub <-> Wizard snapshot download / result-bundle upload (foundation, not yet triggered) | `.github/workflows/wizard-snapshot-transfer.yml` |
+| BLOCK 2B: read-only Wizard resource/collision probe | `.github/workflows/wizard-probe.yml` |
+| BLOCK 2B: `nflprops-runtime` systemd unit foundation | `deploy/systemd/nflprops-runtime.service` |
 
 ## Remote training workflow contract
 
@@ -150,20 +157,118 @@ Everything it touches is namespaced under `$RELEASE_ROOT
 WNBA deployment, the existing separate NFL game-model deployment, nginx, or
 DNS.
 
+## BLOCK 2B: zero-cost production state + Wizard runtime foundation
+
+**Architecture lock** (do not reopen without a measured production
+resource/concurrency failure): GitHub Actions remains heavy compute/CI/
+training/validation/deployment; the existing WizardOfOdds server is the
+persistent nflprops runtime (canonical state, collector, checkpoint
+scheduler-worker, a future API); DuckDB + versioned immutable files is
+durable production state. No PostgreSQL service, no Oracle, no
+DigitalOcean compute/database, no Cloudflare R2, no new subscription --
+`StorageSettings` (`nflprops.data.storage.settings`) now accepts
+`NFLPROPS_ENV=production` with `NFLPROPS_STORAGE_BACKEND=duckdb` (an
+explicit absolute `NFLPROPS_DATA_ROOT` is still required; the relative dev
+default is rejected) alongside the pre-existing postgres path, which
+remains supported but is no longer required.
+
+**Single-writer guarantee.** `nflprops.platform.writer_lock.WriterLock` is
+a bounded, OS-level (`fcntl.flock`) interprocess lock at
+`<state_root>/locks/writer.lock` (`default_lock_path`) -- the ONE
+coordination point every process that mutates the live warehouse must go
+through. Acquisition is non-blocking-polled with a bounded deadline and
+fails closed (`WriterLockTimeoutError`) rather than hanging forever;
+staleness needs no separate check because the kernel releases a held
+`flock` the instant its owning process's file descriptors close, including
+on a crash.
+
+**Immutable snapshot contract.** `nflprops.platform.warehouse_snapshot.
+create_snapshot` is the one function allowed to read the live warehouse for
+durability: under the writer lock, it `CHECKPOINT`s the ancillary DuckDB
+query-layer file if one exists, copies every warehouse file (+ the
+checkpointed `.duckdb` copy) into a staging directory, builds a
+deterministic manifest (snapshot_id, created_at, source identity incl.
+hostname + Alembic migration head, per-file SHA-256/byte-count, top-level
+manifest SHA-256 -- `nflprops.platform.immutable_bundle`), verifies it, and
+atomically renames it into `<state_root>/snapshots/<snapshot_id>/`. Never
+overwrites an existing snapshot with different content
+(`BundleConflictError`). `list_snapshots`/`verify_snapshot`/
+`restore_snapshot` round out the lifecycle; `restore_snapshot` always
+targets a fresh path and structurally refuses to target the live
+warehouse root.
+
+**GitHub <-> Wizard transfer** (`.github/workflows/wizard-snapshot-transfer.yml`,
+foundation only, `workflow_dispatch`, not yet triggered by anything):
+`download-snapshot` takes an explicit `snapshot_id` + explicit
+`expected_manifest_sha256`, SCPs the one named snapshot directory into
+`RUNNER_TEMP` over strict-known-hosts SSH, and verifies it
+(`nflprops.platform.wizard_runtime bundle-verify`) before trusting
+anything -- it never opens the live DuckDB file and never writes back to
+the Wizard host. `upload-result-bundle` builds+verifies a result bundle
+locally (run/report identity, science SHA, workflow SHA, data snapshot id,
+and whatever payload files apply) and hands it to the WIZARD RUNTIME
+OWNER's own already-deployed CLI over SSH to atomically publish into a
+staging "incoming" area under `/var/lib/nflprops/publications` --
+installing a published bundle into live state is a separate, later,
+explicit step this block does not implement (no final public prediction
+publication yet).
+
+**Wizard read-only probe** (`.github/workflows/wizard-probe.yml`,
+`workflow_dispatch`): uses the same `WIZARD_SSH_*`/`wizardofodds.com`
+mechanism to report CPU/RAM/swap/disk, candidate nflprops path
+availability, write permission, existing systemd service names, and
+listening ports -- strictly read-only (no install, no service management,
+no nginx, no writes). See the BLOCK 2B final report for what it found on
+the real host.
+
+**`nflprops-runtime` systemd foundation**
+(`deploy/systemd/nflprops-runtime.service`, not installed by anything in
+this change): one runtime-owner process (simplifies the single-writer
+guarantee -- every write already happens from inside this one unit), runs
+as the existing `wizard-deploy` SSH user, absolute paths throughout,
+`EnvironmentFile=/etc/nflprops/nflprops-runtime.env` (outside git;
+template at `deploy/systemd/nflprops-runtime.env.example`),
+`Restart=on-failure` with a bounded `RestartSec`/`StartLimitBurst`. Its
+placeholder `ExecStart` (`Type=oneshot`) only runs `nflprops platform
+health` -- continuous collection/checkpointing is a Block 3 decision, not
+started here. `deploy-wizard.yml` additively installs/updates this unit
+(via non-interactive `sudo -n`, skipping with a warning rather than
+hanging if passwordless sudo isn't configured) and extends its post-deploy
+health check/rollback to cover both `nflprops-wizard-web` and
+`nflprops-runtime` -- still main-only, still `workflow_dispatch`-only,
+still not invoked by anything in this change.
+
+**Extended health CLI** (`nflprops platform health`): now also reports
+runtime version/SHA, warehouse path, warehouse readable/writable, writer
+lock status, latest snapshot id/time/hash + verification status, disk
+free, memory available, current Alembic migration head, and explicit
+collector/checkpoint placeholders (honestly "not yet activated -- Block
+3", never a fabricated status). Every new check is read-only and never
+creates a directory or contends for the writer lock as a side effect of
+merely being asked.
+
 ## EXTERNAL_PROVISIONING_STILL_REQUIRED
 
-- Object storage (S3-compatible; MinIO or AWS S3) provisioned for
-  production, with `OBJECT_STORE_ENDPOINT`/`OBJECT_STORE_REGION`/
-  `OBJECT_STORE_BUCKET`/`OBJECT_STORE_ACCESS_KEY`/`OBJECT_STORE_SECRET_KEY`
-  added as repository (or environment) secrets consumed by
-  `remote-training.yml`.
-- Production PostgreSQL, with `DATABASE_URL` added as a secret consumed by
-  `remote-training.yml`.
-- The GitHub `wizardofodds.com` environment, with `WIZARD_SSH_HOST`,
+- Object storage (S3-compatible; MinIO or AWS S3) -- OPTIONAL as of
+  BLOCK 2B (no longer required for production). Only needed if
+  `remote-training.yml` production/smoke dispatches still want the
+  object-store-backed training-data snapshot path
+  (`nflprops.platform.data_snapshot`); provision with
+  `OBJECT_STORE_ENDPOINT`/`OBJECT_STORE_REGION`/`OBJECT_STORE_BUCKET`/
+  `OBJECT_STORE_ACCESS_KEY`/`OBJECT_STORE_SECRET_KEY` if/when needed.
+- Production PostgreSQL -- OPTIONAL as of BLOCK 2B (no longer required).
+  The locked zero-cost architecture is DuckDB + versioned immutable
+  snapshots on the Wizard host; only provision `DATABASE_URL` if a future
+  decision reopens the PostgreSQL path.
+- ~~The GitHub `wizardofodds.com` environment, with `WIZARD_SSH_*` secrets
+  populated~~ -- DONE: confirmed populated (`WIZARD_SSH_HOST`,
   `WIZARD_SSH_KNOWN_HOSTS`, `WIZARD_SSH_PORT`, `WIZARD_SSH_PRIVATE_KEY`,
-  `WIZARD_SSH_USER` (already-documented secret names, per the platform
-  brief) actually populated, and `$RELEASE_ROOT` on that host created with
-  the deploy user's write permission.
+  `WIZARD_SSH_USER`) as of BLOCK 2B's read-only probe. `$RELEASE_ROOT`
+  (`/opt/wizardofodds/nflprops-releases`) and the BLOCK 2B state root
+  (`/var/lib/nflprops`, `/var/log/nflprops`, `/etc/nflprops`) on that host
+  still need the deploy user's write permission confirmed/created before
+  `deploy-wizard.yml` or `wizard-snapshot-transfer.yml` are actually
+  dispatched -- see the BLOCK 2B final report's probe results.
 - Once Platform and Science are integrated onto the same commit: the real
   `nflprops.calibration.phase10c3a_runner` (or whatever the finalized
   entry point is named) must accept the keyword arguments

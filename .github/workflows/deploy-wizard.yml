@@ -1,14 +1,26 @@
 name: Deploy WizardOfOdds (foundation)
 
 # Deployment FOUNDATION only. This workflow is not triggered automatically
-# by any push, and nothing in this PR invokes it -- see
+# by any push, and nothing in this change invokes it -- see
 # docs/PLATFORM_AUTOMATION.md. It exists so the atomic release/rollback
 # mechanics can be reviewed before any real SSH/deploy happens.
 #
 # Never touches the existing WNBA deployment, the existing separate NFL
 # game-model deployment, nginx, or DNS: every remote path this workflow
-# writes to is namespaced under RELEASE_ROOT below, dedicated to this
+# writes to is namespaced under RELEASE_ROOT below, or under
+# /var/lib/nflprops / /var/log/nflprops (BLOCK 2B's isolated runtime state
+# root -- see deploy/systemd/nflprops-runtime.service), dedicated to this
 # service only.
+#
+# BLOCK 2B additive foundation (docs/PLATFORM_AUTOMATION.md): after the
+# existing atomic release swap, also installs/updates the
+# nflprops-runtime systemd unit from this same release and verifies it,
+# rolling back the release symlink (as before) if EITHER service fails
+# its post-deploy health check. Still does not start continuous
+# collection -- the installed unit's placeholder ExecStart is a one-shot
+# health report; activating continuous collection is Block 3's decision.
+# Still main-only, still workflow_dispatch-only, still not invoked by
+# anything in this change.
 
 on:
   workflow_dispatch:
@@ -115,6 +127,48 @@ jobs:
             ls -1t | tail -n +6 | xargs -r rm -rf --
           REMOTE_SCRIPT
 
+      - name: Install/update the nflprops-runtime systemd unit (BLOCK 2B foundation)
+        env:
+          SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+        run: |
+          REMOTE="${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}"
+          # Requires passwordless `sudo` for the deploy user, scoped to
+          # exactly these commands (not yet confirmed -- see the BLOCK 2B
+          # read-only probe results in the final report). Uses `sudo -n`
+          # (never interactive) so an unconfigured host fails fast with a
+          # clear message instead of hanging the workflow; a failure here
+          # does NOT roll back the already-succeeded release -- installing
+          # this unit is additive, the release swap above already
+          # succeeded independently of it.
+          # shellcheck disable=SC2086
+          ssh $SSH_OPTS "$REMOTE" bash -s <<REMOTE_SCRIPT
+            set -euo pipefail
+            if ! sudo -n true 2>/dev/null; then
+              echo "::warning::passwordless sudo is not configured for this deploy user -- skipping systemd unit install. Install deploy/systemd/nflprops-runtime.service manually (see its own header for the exact commands)."
+              exit 0
+            fi
+            # Isolated entirely under /var/lib, /var/log, /etc/nflprops --
+            # never any other existing unrelated workload's directory on
+            # this host (see this workflow's own header comment).
+            sudo install -d -m 750 -o "\$(whoami)" -g "\$(whoami)" /var/lib/nflprops
+            sudo install -d -m 750 -o "\$(whoami)" -g "\$(whoami)" /var/log/nflprops
+            sudo install -d -m 750 -o "\$(whoami)" -g "\$(whoami)" /etc/nflprops
+
+            # The env file is created ONLY if absent -- never overwritten,
+            # so a real deployment's secrets/config are never clobbered.
+            if [ ! -f /etc/nflprops/nflprops-runtime.env ]; then
+              sudo install -m 640 -o "\$(whoami)" -g "\$(whoami)" \
+                "$RELEASE_ROOT/current/deploy/systemd/nflprops-runtime.env.example" \
+                /etc/nflprops/nflprops-runtime.env
+            fi
+
+            sudo install -m 644 "$RELEASE_ROOT/current/deploy/systemd/nflprops-runtime.service" \
+              /etc/systemd/system/nflprops-runtime.service
+            sudo systemctl daemon-reload
+            sudo systemctl enable nflprops-runtime
+            sudo systemctl restart nflprops-runtime
+          REMOTE_SCRIPT
+
       - name: Post-deploy health check (rollback on failure)
         env:
           SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
@@ -122,7 +176,7 @@ jobs:
           REMOTE="${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}"
           # shellcheck disable=SC2086
           if ! ssh $SSH_OPTS "$REMOTE" "systemctl is-active --quiet nflprops-wizard-web 2>/dev/null || true"; then
-            echo "::error::post-deploy health check failed -- rolling back"
+            echo "::error::post-deploy health check failed (nflprops-wizard-web) -- rolling back"
             # shellcheck disable=SC2086
             ssh $SSH_OPTS "$REMOTE" bash -s <<REMOTE_SCRIPT
               set -euo pipefail

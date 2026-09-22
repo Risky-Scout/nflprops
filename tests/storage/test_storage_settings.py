@@ -48,7 +48,10 @@ def test_postgres_backend_with_database_url_is_accepted() -> None:
     assert settings.database_url == "postgresql+psycopg://user:pass@host:5432/db"
 
 
-def test_production_environment_requires_postgres_backend() -> None:
+def test_production_environment_with_default_relative_duckdb_root_is_rejected() -> None:
+    """BLOCK 2B: duckdb IS now a valid production backend, but the relative
+    DEFAULT_LOCAL_WAREHOUSE_ROOT dev path must never be mistaken for
+    authoritative production truth."""
     with pytest.raises(StorageConfigError):
         StorageSettings.from_env({"NFLPROPS_ENV": "production"})
 
@@ -62,6 +65,32 @@ def test_production_environment_with_postgres_is_accepted() -> None:
         }
     )
     assert settings.environment == "production"
+
+
+def test_production_environment_with_absolute_duckdb_root_is_accepted(tmp_path) -> None:
+    """BLOCK 2B: the locked zero-cost architecture -- DuckDB + versioned
+    immutable snapshots as production truth, no PostgreSQL required --
+    as long as NFLPROPS_DATA_ROOT is an explicit absolute path."""
+    settings = StorageSettings.from_env(
+        {
+            "NFLPROPS_ENV": "production",
+            "NFLPROPS_STORAGE_BACKEND": "duckdb",
+            "NFLPROPS_DATA_ROOT": str(tmp_path / "warehouse"),
+        }
+    )
+    assert settings.environment == "production"
+    assert settings.backend == "duckdb"
+
+
+def test_production_environment_with_relative_duckdb_root_is_rejected() -> None:
+    with pytest.raises(StorageConfigError):
+        StorageSettings.from_env(
+            {
+                "NFLPROPS_ENV": "production",
+                "NFLPROPS_STORAGE_BACKEND": "duckdb",
+                "NFLPROPS_DATA_ROOT": "./data/canonical",
+            }
+        )
 
 
 def test_object_store_configured_requires_all_five_fields() -> None:

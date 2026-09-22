@@ -1,0 +1,82 @@
+# BLOCK 2B: nflprops runtime unit (deployment FOUNDATION only -- never
+# installed by anything in this change; see docs/PLATFORM_AUTOMATION.md
+# and .github/workflows/deploy-wizard.yml). Never installed on a developer
+# machine.
+#
+# This is the ONE runtime-owner process on the Wizard host that is allowed
+# to mutate the canonical local DuckDB/Parquet warehouse (collector,
+# checkpoint scheduler-worker, snapshot creation) -- preferring one owner
+# process, rather than several independently-scheduled ones, is what makes
+# the single-writer guarantee (nflprops.platform.writer_lock) trivial to
+# reason about: every write already happens from inside this one unit.
+#
+# Continuous collection/checkpointing is NOT started by installing this
+# unit -- BLOCK 2B ships the foundation only; activating continuous
+# collection is Block 3's decision, gated on all BLOCK 2B checks being
+# green (see the ExecStart command placeholder below).
+#
+# Assumptions (adjust paths/user if your deployment target differs --
+# BLOCK 2B's read-only Wizard probe, run once, is what actually confirms
+# these; see the final report for what it found):
+#   - Ubuntu (the existing WizardOfOdds host)
+#   - Deployed release tree via the EXISTING deploy-wizard.yml foundation:
+#     $RELEASE_ROOT=/opt/wizardofodds/nflprops-releases, with a `current`
+#     symlink atomically flipped to the active release
+#     (WorkingDirectory/ExecStart below follow that symlink, never a
+#     release-specific path, so an atomic release swap needs no unit edit)
+#   - Runs as the existing SSH deploy user (wizard-deploy) -- BLOCK 2B
+#     deliberately does not introduce a second, separately-privileged
+#     system user; adjust User=/Group= here if a dedicated unprivileged
+#     account is preferred once the deploy user's actual permissions are
+#     confirmed
+#   - Durable state ISOLATED from every other service on this host:
+#       NFLPROPS_DATA_ROOT=/var/lib/nflprops/warehouse
+#       (snapshots at /var/lib/nflprops/snapshots, the writer lock at
+#       /var/lib/nflprops/locks/writer.lock -- see
+#       nflprops.platform.warehouse_snapshot / writer_lock)
+#     and logs at /var/log/nflprops/ -- never /home/wizard-deploy/
+#     nfl-production-2026 or /var/www/sportsodds, the existing unrelated
+#     workloads on this host
+#   - Secrets/environment live ONLY in /etc/nflprops/nflprops-runtime.env,
+#     never in this unit file (which is often world-readable)
+#
+# Install (not run by anything in this change):
+#   sudo cp deploy/systemd/nflprops-runtime.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now nflprops-runtime
+
+[Unit]
+Description=NFL Props Wizard Runtime (BLOCK 2B foundation)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+# BLOCK 2B foundation placeholder: a one-shot health report, not a
+# long-running daemon -- Type=oneshot + RemainAfterExit=yes lets
+# `systemctl status` show a clean "active (exited)" instead of crash-
+# looping a Type=simple unit whose ExecStart exits immediately. Block 3
+# changes this to Type=simple with the real long-running collector/
+# checkpoint-scheduler entry point once BLOCK 2B's gates are green.
+Type=oneshot
+RemainAfterExit=yes
+User=wizard-deploy
+Group=wizard-deploy
+WorkingDirectory=/opt/wizardofodds/nflprops-releases/current
+EnvironmentFile=/etc/nflprops/nflprops-runtime.env
+ExecStart=/opt/wizardofodds/nflprops-releases/current/.venv/bin/nflprops platform health
+# Bounded restart-on-failure: if the placeholder health check itself
+# reports unhealthy (exit 1), retry with a fixed delay rather than
+# hammering the host or giving up silently -- capped by the [Unit]
+# StartLimit* above so a persistently unhealthy host stops retrying
+# rather than looping forever.
+Restart=on-failure
+RestartSec=5
+
+# Hardening: this process only ever needs its own isolated state tree.
+ReadWritePaths=/var/lib/nflprops /var/log/nflprops
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
