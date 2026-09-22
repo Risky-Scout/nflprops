@@ -204,6 +204,90 @@ def test_migration_0007_creates_tables_with_constraints_and_indexes(
         engine.dispose()
 
 
+def test_migration_0009_adds_compact_pmf_payload_columns(postgres_dsn: str) -> None:
+    _alembic(postgres_dsn, "upgrade", "head")
+
+    import sqlalchemy as sa
+
+    engine = sa.create_engine(postgres_dsn)
+    try:
+        inspector = sa.inspect(engine)
+        columns = {c["name"] for c in inspector.get_columns(DISTRIBUTIONS_TABLE)}
+        assert {
+            "pmf_codec_version", "pmf_outcome_count", "pmf_payload", "pmf_payload_sha256",
+        } <= columns
+
+        dist_checks = {c["name"] for c in inspector.get_check_constraints(DISTRIBUTIONS_TABLE)}
+        assert {
+            "ck_player_prop_distributions_pmf_payload_columns_together",
+            "ck_player_prop_distributions_pmf_outcome_count_positive",
+        } <= dist_checks
+    finally:
+        engine.dispose()
+
+
+def test_pmf_payload_columns_are_nullable_together_only(postgres_dsn: str) -> None:
+    """The `_together` CHECK constraint rejects a row that populates some
+    but not all four compact-payload columns."""
+    _alembic(postgres_dsn, "upgrade", "head")
+
+    import sqlalchemy as sa
+
+    engine = sa.create_engine(postgres_dsn)
+    backend = _backend(postgres_dsn)
+    run_id = "pg-pmf-columns-together"
+    try:
+        _make_run(backend, run_id)
+        with engine.begin() as conn, pytest.raises(sa.exc.IntegrityError):
+            conn.execute(
+                sa.text(
+                    f"INSERT INTO {DISTRIBUTIONS_TABLE} (distribution_key, "
+                    "distribution_id, run_id, game_id, player_id, team_id, "
+                    "position_group, prop_type, support_min, support_max, "
+                    "n_draws, outcome_count, raw_content_sha256, "
+                    "pmf_codec_version, created_at) "
+                    "VALUES (123456789, 'did-together', :run_id, 'g', 'p', 't', "
+                    "'WR', 'receiving_yards', 0, 10, 500, 1, 'h', 1, :ts)"
+                ),
+                {"run_id": run_id, "ts": NOW},
+            )
+    finally:
+        engine.dispose()
+        backend.dispose()
+
+
+def test_persist_and_read_compact_pmf_round_trips_through_postgres(
+    postgres_dsn: str,
+) -> None:
+    """BLOCK 2A end-to-end: a NEW write's compact payload round-trips
+    through real PostgreSQL and `read_distribution_pmf` resolves it without
+    ever touching the (empty) legacy outcomes table."""
+    _alembic(postgres_dsn, "upgrade", "head")
+
+    from nflprops.orchestration.distribution_store import read_distribution_pmf
+
+    run_id = "pg-dist-compact-roundtrip"
+    backend = _backend(postgres_dsn)
+    try:
+        _make_run(backend, run_id)
+        distributions, _result, _eligible = _persist_projections_and_distributions(
+            backend, run_id
+        )
+        dists = backend.read(DISTRIBUTIONS_TABLE).filter(pl.col("run_id") == run_id)
+        target = dists.filter(pl.col("prop_type") == "receiving_yards").row(0, named=True)
+        original = distributions.filter(
+            (pl.col("player_id") == target["player_id"])
+            & (pl.col("prop_type") == "receiving_yards")
+        ).sort("outcome")
+
+        pmf = read_distribution_pmf(backend, target["distribution_id"])
+        assert pmf.source == "compact"
+        assert pmf.outcomes == tuple(int(x) for x in original["outcome"].to_list())
+        assert pmf.probabilities == tuple(float(x) for x in original["p_raw"].to_list())
+    finally:
+        backend.dispose()
+
+
 def test_downgrade_to_0006_then_reupgrade_is_isolated_and_incremental(
     postgres_dsn: str,
 ) -> None:
@@ -371,7 +455,11 @@ def test_persist_against_real_parent_is_idempotent_and_immutable(
         assert first.distribution_count == expected
         assert _table_count(engine, DISTRIBUTIONS_TABLE, run_id) == expected
         assert _table_count(engine, ARTIFACTS_TABLE, run_id) == 1
-        assert _table_count(engine, OUTCOMES_TABLE) == first.outcome_row_count
+        # BLOCK 2A: a NEW write persists the compact pmf_payload on the
+        # player_prop_distributions row itself and never writes to the
+        # legacy player_prop_distribution_outcomes table.
+        assert first.outcome_row_count > 0
+        assert _table_count(engine, OUTCOMES_TABLE) == 0
 
         from nflprops.orchestration.distribution_store import (
             persist_player_prop_distributions as persist_again,

@@ -16,23 +16,35 @@ header+rows design:
   and internally by a deterministic BIGINT ``distribution_key`` surrogate
   (`_distribution_key`, derived from ``distribution_id`` -- never a DB
   sequence, so it is identical across local Warehouse and PostgreSQL and
-  stable under retry).
+  stable under retry). BLOCK 2A (persistence optimization, migration 0009):
+  also carries the exact PMF as a compact ``pmf_payload`` blob
+  (`nflprops.distributions.pmf_codec`) -- see NEW-WRITE / OLD-READ below.
 * ``player_prop_distribution_outcomes`` -- one row per (distribution,
-  outcome) with ``p_raw > 0``.
+  outcome) with ``p_raw > 0``. BLOCK 2A: legacy-read-only -- a NEW write
+  never inserts here any more (see `_insert_local`/`_insert_postgres`);
+  every row already stored here from before BLOCK 2A remains fully
+  readable via `read_distribution_pmf`.
 * ``player_prop_prediction_distribution_links`` -- explicitly satisfies the
   public-product requirement that every Phase-9 canonical ``prediction_id``
   resolves to exactly one ``distribution_id``. Certified
   ``player_prop_prices`` rows are never altered to add a distribution
   column.
 
-This module has TWO independent persistence entry points:
+This module has THREE independent entry points:
 
-* `persist_player_prop_distributions` -- the PMF artifact/rows/outcomes.
+* `persist_player_prop_distributions` -- the PMF artifact + one
+  `player_prop_distributions` row per distribution (carrying its compact
+  `pmf_payload`; BLOCK 2A never writes `player_prop_distribution_outcomes`
+  rows for a new write).
 * `link_predictions_to_distributions` -- derives and persists the link
   table from whatever `player_prop_prices` rows already exist for a
   `run_id`. Independent because pricing is sparse (a run may have zero
   quotes) while distributions are always complete (E * 25); a zero-quote
   run has a full set of distributions and zero links, which is valid.
+* `read_distribution_pmf` (BLOCK 2A) -- the one read path: compact payload
+  if present (decoded + verified against its own stored hash), else the
+  legacy `player_prop_distribution_outcomes` rows; if a record somehow
+  carries both, they must agree exactly or the read fails closed.
 
 Immutability (LOCKED):
 
@@ -86,6 +98,14 @@ import polars as pl
 
 from nflprops.collection.resource_availability import deterministic_id
 from nflprops.distributions.pmf import ALL_PROP_TYPES, NORMALIZATION_TOLERANCE
+from nflprops.distributions.pmf_codec import (
+    CODEC_VERSION,
+    DecodedPMF,
+    PMFCodecError,
+    decode_pmf,
+    encode_pmf,
+    payload_sha256,
+)
 from nflprops.orchestration.run_store import PredictionRunRecord, get_run
 
 if TYPE_CHECKING:
@@ -161,16 +181,29 @@ _DISTRIBUTIONS_SCHEMA: dict[str, pl.DataType] = {
     "n_draws": pl.Int32(),
     "outcome_count": pl.Int32(),
     "raw_content_sha256": pl.String(),
+    #: BLOCK 2A compact PMF payload columns (additive, migration 0009).
+    #: Always populated together on a NEW write -- see
+    #: `nflprops.distributions.pmf_codec`. Legacy rows (and legacy-path
+    #: reads) never populate these; `read_distribution_pmf` falls back to
+    #: `player_prop_distribution_outcomes` when they are null.
+    "pmf_codec_version": pl.Int16(),
+    "pmf_outcome_count": pl.Int32(),
+    "pmf_payload": pl.Binary(),
+    "pmf_payload_sha256": pl.String(),
     "created_at": pl.Datetime(time_unit="us", time_zone="UTC"),
 }
 _DISTRIBUTIONS_INSERT_COLUMNS: tuple[str, ...] = tuple(_DISTRIBUTIONS_SCHEMA.keys())
 
+#: `player_prop_distribution_outcomes` is legacy-read-only as of BLOCK 2A --
+#: no code path in this module writes to it any more (see `_insert_local`/
+#: `_insert_postgres`); it remains here only to document the table's shape
+#: for `_load_legacy_outcomes` and the backfill utility
+#: (`tools/backfill_pmf_codec.py`).
 _OUTCOMES_SCHEMA: dict[str, pl.DataType] = {
     "distribution_key": pl.Int64(),
     "outcome": pl.Int64(),
     "p_raw": pl.Float64(),
 }
-_OUTCOMES_INSERT_COLUMNS: tuple[str, ...] = tuple(_OUTCOMES_SCHEMA.keys())
 
 _LINKS_SCHEMA: dict[str, pl.DataType] = {
     "prediction_id": pl.String(),
@@ -283,6 +316,33 @@ class DistributionLinkConflictError(ValueError):
         )
 
 
+class DistributionPMFEncodingError(ValueError):
+    """BLOCK 2A: the compact sparse-PMF codec
+    (`nflprops.distributions.pmf_codec`) rejected a distribution's own
+    outcome set (duplicate/unsorted outcomes, a non-finite/non-positive
+    probability, a bad normalization sum), or a fresh encode -> decode
+    round trip did not exactly reproduce the original ``(outcome,
+    probability)`` pairs. Nothing is written -- a distribution is never
+    persisted with a compact payload that does not exactly represent its
+    own scientific content."""
+
+
+class DistributionNotFoundError(ValueError):
+    """`read_distribution_pmf` was asked to read a `distribution_id` with
+    no matching `player_prop_distributions` row."""
+
+
+class DistributionPMFIntegrityError(ValueError):
+    """BLOCK 2A: a stored PMF representation failed integrity
+    verification on read -- the compact payload's recomputed SHA-256
+    disagrees with the stored `pmf_payload_sha256`, the payload fails to
+    decode, or (for a record that holds both a compact payload AND legacy
+    `player_prop_distribution_outcomes` rows) the two decoded
+    representations disagree on outcomes or probabilities. Fails closed --
+    the reader never silently prefers one representation over the other or
+    repairs a mismatch."""
+
+
 @dataclass(frozen=True)
 class DistributionArtifact:
     run_id: str
@@ -293,6 +353,13 @@ class DistributionArtifact:
     model_version: str
     n_draws: int
     distribution_count: int
+    #: The total count of positive-mass outcomes across every distribution
+    #: in this artifact -- part of the scientific-content hash domain since
+    #: PHASE 10B. BLOCK 2A: this is a LOGICAL count, not a literal
+    #: `player_prop_distribution_outcomes` row count any more -- a NEW
+    #: write persists this same number of ``(outcome, probability)`` pairs
+    #: inside compact `pmf_payload` blobs instead of as physical child
+    #: rows (see the module docstring).
     outcome_row_count: int
     scientific_content_sha256: str
     created_at: datetime
@@ -330,6 +397,13 @@ class DistributionRow:
     n_draws: int
     outcome_count: int
     raw_content_sha256: str
+    #: BLOCK 2A compact PMF payload -- always populated on a NEW write
+    #: (see `_build_rows`), never null. `pmf_outcome_count` always equals
+    #: `outcome_count`.
+    pmf_codec_version: int
+    pmf_outcome_count: int
+    pmf_payload: bytes
+    pmf_payload_sha256: str
     created_at: datetime
     outcomes: tuple[int, ...]
     probabilities: tuple[float, ...]
@@ -353,12 +427,6 @@ class DistributionRow:
 
     def as_distribution_row(self) -> dict[str, object]:
         return {name: getattr(self, name) for name in _DISTRIBUTIONS_INSERT_COLUMNS}
-
-    def as_outcome_rows(self) -> list[dict[str, object]]:
-        return [
-            {"distribution_key": self.distribution_key, "outcome": outcome, "p_raw": p}
-            for outcome, p in zip(self.outcomes, self.probabilities, strict=True)
-        ]
 
 
 @dataclass(frozen=True)
@@ -617,6 +685,30 @@ def _build_rows(
             probabilities=probabilities,
         )
 
+        # BLOCK 2A: encode the compact sparse-PMF payload for this one
+        # distribution, then immediately decode it back and require an
+        # EXACT round trip before accepting the row -- catches a codec
+        # defect at write time rather than silently persisting a payload
+        # that does not represent its own scientific content.
+        try:
+            payload = encode_pmf(outcomes, probabilities)
+        except PMFCodecError as exc:
+            raise DistributionPMFEncodingError(
+                f"distribution for player_id={player_id!r} prop_type="
+                f"{prop_type!r}: compact PMF encoding rejected the outcome "
+                f"set ({exc})"
+            ) from exc
+        round_tripped = decode_pmf(payload)
+        if (
+            round_tripped.outcomes != outcomes
+            or round_tripped.probabilities != probabilities
+        ):
+            raise DistributionPMFEncodingError(
+                f"distribution for player_id={player_id!r} prop_type="
+                f"{prop_type!r}: encode -> decode round trip did not exactly "
+                f"reproduce the original PMF"
+            )
+
         rows.append(
             DistributionRow(
                 distribution_id=distribution_id,
@@ -634,6 +726,10 @@ def _build_rows(
                 n_draws=n_draws,
                 outcome_count=len(outcomes),
                 raw_content_sha256=raw_hash,
+                pmf_codec_version=CODEC_VERSION,
+                pmf_outcome_count=len(outcomes),
+                pmf_payload=payload,
+                pmf_payload_sha256=payload_sha256(payload),
                 created_at=created_at,
                 outcomes=outcomes,
                 probabilities=probabilities,
@@ -786,6 +882,10 @@ def _insert_local(
     rows: list[DistributionRow],
     artifact: DistributionArtifact,
 ) -> None:
+    # BLOCK 2A: a NEW write persists the compact `pmf_payload` on the
+    # `player_prop_distributions` row only -- it never writes to
+    # `player_prop_distribution_outcomes` any more (that table is
+    # legacy-read-only; see `_load_legacy_outcomes`).
     if rows:
         dist_frame = pl.DataFrame(
             [row.as_distribution_row() for row in rows], schema=_DISTRIBUTIONS_SCHEMA
@@ -796,17 +896,6 @@ def _insert_local(
             key=["distribution_key"],
             keep="first",
             sort_by=["game_id", "player_id", "prop_type"],
-        )
-        outcome_records: list[dict[str, object]] = []
-        for row in rows:
-            outcome_records.extend(row.as_outcome_rows())
-        outcome_frame = pl.DataFrame(outcome_records, schema=_OUTCOMES_SCHEMA)
-        backend.append(
-            PLAYER_PROP_DISTRIBUTION_OUTCOMES_TABLE,
-            outcome_frame,
-            key=["distribution_key", "outcome"],
-            keep="first",
-            sort_by=["distribution_key", "outcome"],
         )
     header_frame = pl.DataFrame([artifact.as_row()], schema=_ARTIFACT_SCHEMA)
     backend.append(
@@ -822,6 +911,8 @@ def _insert_postgres(
 ) -> None:
     import sqlalchemy as sa
 
+    # BLOCK 2A: same NEW-write behavior as `_insert_local` -- compact
+    # payload only, no `player_prop_distribution_outcomes` child rows.
     with backend.engine.begin() as conn:
         if rows:
             dist_columns_sql = ", ".join(_DISTRIBUTIONS_INSERT_COLUMNS)
@@ -831,18 +922,6 @@ def _insert_postgres(
                 f"VALUES ({dist_params_sql}) ON CONFLICT DO NOTHING"
             )
             conn.execute(dist_stmt, [row.as_distribution_row() for row in rows])
-
-            outcome_records: list[dict[str, object]] = []
-            for row in rows:
-                outcome_records.extend(row.as_outcome_rows())
-            outcome_columns_sql = ", ".join(_OUTCOMES_INSERT_COLUMNS)
-            outcome_params_sql = ", ".join(f":{c}" for c in _OUTCOMES_INSERT_COLUMNS)
-            outcome_stmt = sa.text(
-                f"INSERT INTO {PLAYER_PROP_DISTRIBUTION_OUTCOMES_TABLE} "
-                f"({outcome_columns_sql}) VALUES ({outcome_params_sql}) "
-                f"ON CONFLICT DO NOTHING"
-            )
-            conn.execute(outcome_stmt, outcome_records)
 
         header_columns_sql = ", ".join(_ARTIFACT_INSERT_COLUMNS)
         header_params_sql = ", ".join(f":{c}" for c in _ARTIFACT_INSERT_COLUMNS)
@@ -952,6 +1031,168 @@ def persist_player_prop_distributions(
         distributions_inserted=distribution_count,
         artifact_inserted=True,
         scientific_content_sha256=content_hash,
+    )
+
+
+# --------------------------------------------------------------- PMF reads
+
+
+@dataclass(frozen=True)
+class StoredPMF:
+    """The exact ordered ``(outcome, probability)`` pairs for one
+    distribution, resolved by `read_distribution_pmf` from whichever
+    representation(s) are actually stored."""
+
+    distribution_id: str
+    outcomes: tuple[int, ...]
+    probabilities: tuple[float, ...]
+    #: ``"compact"`` if resolved from `pmf_payload`, ``"legacy"`` if
+    #: resolved from `player_prop_distribution_outcomes` rows. When BOTH
+    #: representations are present they must decode to an identical
+    #: result (verified below) and `source` is ``"compact"``.
+    source: str
+
+
+def _load_distribution_record(
+    backend: StorageBackend, distribution_id: str
+) -> dict[str, Any] | None:
+    if not backend.exists(PLAYER_PROP_DISTRIBUTIONS_TABLE):
+        return None
+    stored = backend.read(PLAYER_PROP_DISTRIBUTIONS_TABLE)
+    if stored.is_empty() or "distribution_id" not in stored.columns:
+        return None
+    match = stored.filter(pl.col("distribution_id") == distribution_id)
+    if match.is_empty():
+        return None
+    return match.row(0, named=True)
+
+
+def _decode_compact_payload(record: Mapping[str, Any]) -> DecodedPMF:
+    """Decode + verify `record["pmf_payload"]` against its own stored
+    `pmf_payload_sha256`/`pmf_outcome_count`. Fails closed
+    (`DistributionPMFIntegrityError`) on any disagreement -- a compact
+    payload is never trusted without re-verifying it against its own
+    stored hash."""
+    payload = bytes(record["pmf_payload"])
+    distribution_id = str(record["distribution_id"])
+    try:
+        decoded = decode_pmf(payload)
+    except PMFCodecError as exc:
+        raise DistributionPMFIntegrityError(
+            f"distribution_id={distribution_id!r}: compact pmf_payload failed "
+            f"to decode: {exc}"
+        ) from exc
+
+    actual_hash = payload_sha256(payload)
+    stored_hash = record.get("pmf_payload_sha256")
+    if stored_hash != actual_hash:
+        raise DistributionPMFIntegrityError(
+            f"distribution_id={distribution_id!r}: stored "
+            f"pmf_payload_sha256={stored_hash!r} does not match the recomputed "
+            f"hash={actual_hash!r} of the stored pmf_payload bytes"
+        )
+
+    stored_count = record.get("pmf_outcome_count")
+    if stored_count is not None and int(stored_count) != len(decoded.outcomes):
+        raise DistributionPMFIntegrityError(
+            f"distribution_id={distribution_id!r}: stored "
+            f"pmf_outcome_count={stored_count} does not match the decoded "
+            f"payload's outcome count={len(decoded.outcomes)}"
+        )
+    return decoded
+
+
+def _load_legacy_outcomes(
+    backend: StorageBackend, distribution_key: int
+) -> DecodedPMF | None:
+    """Reconstruct a PMF from legacy `player_prop_distribution_outcomes`
+    rows for `distribution_key`. Returns `None` when no such rows exist --
+    the caller decides whether that is an error."""
+    if not backend.exists(PLAYER_PROP_DISTRIBUTION_OUTCOMES_TABLE):
+        return None
+    stored = backend.read(PLAYER_PROP_DISTRIBUTION_OUTCOMES_TABLE)
+    if stored.is_empty() or "distribution_key" not in stored.columns:
+        return None
+    match = stored.filter(pl.col("distribution_key") == distribution_key).sort("outcome")
+    if match.is_empty():
+        return None
+    return DecodedPMF(
+        outcomes=tuple(int(x) for x in match["outcome"].to_list()),
+        probabilities=tuple(float(x) for x in match["p_raw"].to_list()),
+    )
+
+
+def read_distribution_pmf(
+    backend: StorageBackend, distribution_id: str
+) -> StoredPMF:
+    """Read the exact PMF for one `distribution_id`.
+
+    Resolution order (PHASE 10B NEW-WRITE / OLD-READ compatibility,
+    BLOCK 2A):
+
+    1. If a valid compact `pmf_payload` is stored, decode + verify it
+       (`_decode_compact_payload`) and use it.
+    2. Otherwise, read the legacy normalized
+       `player_prop_distribution_outcomes` rows.
+
+    If BOTH representations exist for the same record (e.g. a
+    backfilled/migrated row), both are decoded and must agree EXACTLY
+    (outcomes and float64 probabilities) -- any disagreement raises
+    `DistributionPMFIntegrityError` and neither representation is
+    trusted. The two are never silently merged or reconciled.
+
+    Raises `DistributionNotFoundError` if no `player_prop_distributions`
+    row exists for `distribution_id`, or `DistributionPMFIntegrityError`
+    if the record has neither a valid compact payload nor any legacy
+    outcome rows.
+    """
+    record = _load_distribution_record(backend, distribution_id)
+    if record is None:
+        raise DistributionNotFoundError(
+            f"no player_prop_distributions row for distribution_id="
+            f"{distribution_id!r}"
+        )
+
+    compact: DecodedPMF | None = None
+    if record.get("pmf_payload") is not None:
+        compact = _decode_compact_payload(record)
+
+    legacy = _load_legacy_outcomes(backend, int(record["distribution_key"]))
+
+    if compact is not None and legacy is not None:
+        if (
+            compact.outcomes != legacy.outcomes
+            or compact.probabilities != legacy.probabilities
+        ):
+            raise DistributionPMFIntegrityError(
+                f"distribution_id={distribution_id!r}: the compact pmf_payload "
+                f"and the legacy player_prop_distribution_outcomes rows decode "
+                f"to different PMFs -- refusing to silently prefer either"
+            )
+        return StoredPMF(
+            distribution_id=distribution_id,
+            outcomes=compact.outcomes,
+            probabilities=compact.probabilities,
+            source="compact",
+        )
+    if compact is not None:
+        return StoredPMF(
+            distribution_id=distribution_id,
+            outcomes=compact.outcomes,
+            probabilities=compact.probabilities,
+            source="compact",
+        )
+    if legacy is not None:
+        return StoredPMF(
+            distribution_id=distribution_id,
+            outcomes=legacy.outcomes,
+            probabilities=legacy.probabilities,
+            source="legacy",
+        )
+    raise DistributionPMFIntegrityError(
+        f"distribution_id={distribution_id!r}: record exists but has neither "
+        f"a compact pmf_payload nor any legacy player_prop_distribution_outcomes "
+        f"rows"
     )
 
 

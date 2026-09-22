@@ -34,20 +34,34 @@ from nflprops.distributions.pmf import (
     pmf_mean,
     weighted_inverse_cdf_quantile,
 )
+from nflprops.distributions.pmf_codec import (
+    CODEC_VERSION,
+    DecodedPMF,
+    PMFCodecError,
+    decode_pmf,
+    encode_pmf,
+    payload_sha256,
+)
 
 __all__ = [
     "ALL_PROP_TYPES",
     "BINARY_COUNT_COLLAPSE_PROPS",
     "BINARY_PROPS",
+    "CODEC_VERSION",
     "NORMALIZATION_TOLERANCE",
     "OUTPUT_COLUMNS",
+    "DecodedPMF",
     "LineProbabilities",
+    "PMFCodecError",
     "PMFNormalizationError",
     "RawPMF",
     "build_player_prop_distributions",
     "build_raw_pmf",
     "canonical_outcome_values",
+    "decode_pmf",
+    "encode_pmf",
     "line_probabilities",
+    "payload_sha256",
     "pmf_mean",
     "weighted_inverse_cdf_quantile",
 ]

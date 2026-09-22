@@ -24,6 +24,7 @@ from _projection_fixtures import (
 
 from nflprops.data.warehouse import Warehouse
 from nflprops.distributions import ALL_PROP_TYPES, build_player_prop_distributions
+from nflprops.distributions.pmf_codec import CODEC_VERSION, payload_sha256
 from nflprops.orchestration.distribution_store import (
     PLAYER_PROP_DISTRIBUTION_ARTIFACTS_TABLE,
     PLAYER_PROP_DISTRIBUTION_OUTCOMES_TABLE,
@@ -34,13 +35,18 @@ from nflprops.orchestration.distribution_store import (
     DistributionLinkConflictError,
     DistributionLinkMissingError,
     DistributionNormalizationError,
+    DistributionNotFoundError,
+    DistributionPMFEncodingError,
+    DistributionPMFIntegrityError,
     DistributionProvenanceError,
     DistributionRunMissingError,
     DistributionSchemaError,
+    StoredPMF,
     compute_distribution_id,
     compute_scientific_content_hash,
     link_predictions_to_distributions,
     persist_player_prop_distributions,
+    read_distribution_pmf,
 )
 from nflprops.orchestration.projection_store import (
     PLAYER_GAME_PROJECTIONS_TABLE,
@@ -149,9 +155,16 @@ def test_first_write_inserts_exact_e_times_25(tmp_path: Path) -> None:
     stored = _stored_distributions(backend)
     assert stored.height == len(eligible) * 25 == 9 * 25 == 225
 
+    # BLOCK 2A: a NEW write persists the compact pmf_payload on every
+    # distribution row and never touches the legacy outcomes table.
+    assert stored["pmf_payload"].null_count() == 0
+    assert stored["pmf_codec_version"].unique().to_list() == [CODEC_VERSION]
+    assert stored["pmf_outcome_count"].to_list() == stored["outcome_count"].to_list()
+    for record in stored.iter_rows(named=True):
+        assert record["pmf_payload_sha256"] == payload_sha256(record["pmf_payload"])
+
     outcomes = _stored_outcomes(backend)
-    assert outcomes.height == result.outcome_row_count
-    assert outcomes.height > 0
+    assert outcomes.is_empty()
 
     artifact = _stored_artifact(backend)
     assert artifact["distribution_count"] == 225
@@ -162,7 +175,8 @@ def test_first_write_inserts_exact_e_times_25(tmp_path: Path) -> None:
 def test_stored_schema_has_no_forbidden_derived_summary_columns(tmp_path: Path) -> None:
     """PMF_IS_ONLY_SOURCE_FOR_DERIVED_SUMMARIES: mean/median/percentiles/
     over/under/push/fair-odds must never be persisted in the source-of-truth
-    tables."""
+    tables. `pmf_payload` IS the raw PMF (not a derived summary), so it is
+    expected/required, not forbidden."""
     backend, distributions, _eligible = _setup(tmp_path)
     persist_player_prop_distributions(
         backend, distributions, run_id="RUN-A", season=SEASON, week=WEEK, created_at=NOW
@@ -179,9 +193,12 @@ def test_stored_schema_has_no_forbidden_derived_summary_columns(tmp_path: Path) 
     assert dist_cols == {
         "distribution_key", "distribution_id", "run_id", "game_id", "player_id",
         "team_id", "position_group", "prop_type", "support_min", "support_max",
-        "n_draws", "outcome_count", "raw_content_sha256", "created_at",
+        "n_draws", "outcome_count", "raw_content_sha256",
+        "pmf_codec_version", "pmf_outcome_count", "pmf_payload",
+        "pmf_payload_sha256", "created_at",
     }
-    assert outcome_cols == {"distribution_key", "outcome", "p_raw"}
+    # BLOCK 2A: a NEW write never populates the legacy outcomes table.
+    assert outcome_cols == set()
 
 
 def test_persisted_player_universe_matches_phase7_projections(tmp_path: Path) -> None:
@@ -259,12 +276,13 @@ def test_negative_support_persists_correctly(tmp_path: Path) -> None:
     assert yardage.height == 1
     row = yardage.row(0, named=True)
     assert isinstance(row["support_min"], int)
-    # sanity: support columns are signed and round-trip exactly
-    outcomes = _stored_outcomes(backend).filter(
-        pl.col("distribution_key") == row["distribution_key"]
-    )
-    assert outcomes["outcome"].min() == row["support_min"]
-    assert outcomes["outcome"].max() <= row["support_max"]
+    # sanity: support columns are signed and round-trip exactly through the
+    # compact codec (BLOCK 2A never writes legacy outcome rows for a new
+    # write, so read back via read_distribution_pmf instead).
+    pmf = read_distribution_pmf(backend, row["distribution_id"])
+    assert pmf.source == "compact"
+    assert min(pmf.outcomes) == row["support_min"]
+    assert max(pmf.outcomes) <= row["support_max"]
 
 
 # --------------------------------------------------------------- idempotency
@@ -276,7 +294,7 @@ def test_exact_retry_same_created_at_is_a_noop(tmp_path: Path) -> None:
         backend, distributions, run_id="RUN-A", season=SEASON, week=WEEK, created_at=NOW
     )
     before = _stored_distributions(backend).sort("distribution_id")
-    before_outcomes = _stored_outcomes(backend).sort(["distribution_key", "outcome"])
+    assert _stored_outcomes(backend).is_empty()
 
     result = persist_player_prop_distributions(
         backend, distributions, run_id="RUN-A", season=SEASON, week=WEEK, created_at=NOW
@@ -286,9 +304,8 @@ def test_exact_retry_same_created_at_is_a_noop(tmp_path: Path) -> None:
     assert result.distribution_count == len(eligible) * 25
 
     after = _stored_distributions(backend).sort("distribution_id")
-    after_outcomes = _stored_outcomes(backend).sort(["distribution_key", "outcome"])
     assert after.equals(before)
-    assert after_outcomes.equals(before_outcomes)
+    assert _stored_outcomes(backend).is_empty()
 
 
 def test_exact_retry_different_created_at_is_a_noop_stored_stamp_untouched(
@@ -544,6 +561,261 @@ def test_order_independent_hash(tmp_path: Path) -> None:
     assert result3.scientific_content_sha256 == result.scientific_content_sha256
     assert result3.artifact_inserted is False
     assert result2.distribution_count == result.distribution_count
+
+
+# ------------------------------------------------- BLOCK 2A compact PMF
+
+
+def _write_legacy_distribution_and_outcomes(
+    backend: Warehouse,
+    *,
+    run_id: str,
+    player_id: str,
+    prop_type: str,
+    outcomes: list[int],
+    probabilities: list[float],
+) -> str:
+    """Simulate a pre-BLOCK-2A record: a `player_prop_distributions` row
+    with no compact payload, plus its `player_prop_distribution_outcomes`
+    child rows -- exactly PHASE 10B's original (migration 0007) shape."""
+    import hashlib
+
+    distribution_id = compute_distribution_id(
+        run_id=run_id, player_id=player_id, prop_type=prop_type
+    )
+    distribution_key = int(
+        hashlib.sha256(distribution_id.encode("utf-8")).hexdigest()[:15], 16
+    )
+    dist_row = {
+        "distribution_key": distribution_key,
+        "distribution_id": distribution_id,
+        "run_id": run_id,
+        "game_id": GAME_ID,
+        "player_id": player_id,
+        "team_id": "T",
+        "position_group": "WR",
+        "prop_type": prop_type,
+        "support_min": min(outcomes),
+        "support_max": max(outcomes),
+        "n_draws": N_DRAWS,
+        "outcome_count": len(outcomes),
+        "raw_content_sha256": "legacy-fixture-hash",
+        "created_at": NOW,
+    }
+    backend.append(
+        PLAYER_PROP_DISTRIBUTIONS_TABLE, pl.DataFrame([dist_row]), key=["distribution_key"]
+    )
+    outcome_rows = [
+        {"distribution_key": distribution_key, "outcome": o, "p_raw": p}
+        for o, p in zip(outcomes, probabilities, strict=True)
+    ]
+    backend.append(
+        PLAYER_PROP_DISTRIBUTION_OUTCOMES_TABLE,
+        pl.DataFrame(outcome_rows),
+        key=["distribution_key", "outcome"],
+    )
+    return distribution_id
+
+
+def test_read_distribution_pmf_uses_compact_payload_for_a_new_write(
+    tmp_path: Path,
+) -> None:
+    backend, distributions, _eligible = _setup(tmp_path)
+    persist_player_prop_distributions(
+        backend, distributions, run_id="RUN-A", season=SEASON, week=WEEK, created_at=NOW
+    )
+    row = _stored_distributions(backend).filter(
+        (pl.col("player_id") == HOME_WR1) & (pl.col("prop_type") == "receiving_yards")
+    ).row(0, named=True)
+    original = distributions.filter(
+        (pl.col("player_id") == HOME_WR1) & (pl.col("prop_type") == "receiving_yards")
+    ).sort("outcome")
+
+    pmf = read_distribution_pmf(backend, row["distribution_id"])
+    assert isinstance(pmf, StoredPMF)
+    assert pmf.source == "compact"
+    assert pmf.outcomes == tuple(int(x) for x in original["outcome"].to_list())
+    assert pmf.probabilities == tuple(float(x) for x in original["p_raw"].to_list())
+
+
+def test_read_distribution_pmf_raises_when_distribution_id_unknown(
+    tmp_path: Path,
+) -> None:
+    backend, distributions, _eligible = _setup(tmp_path)
+    persist_player_prop_distributions(
+        backend, distributions, run_id="RUN-A", season=SEASON, week=WEEK, created_at=NOW
+    )
+    with pytest.raises(DistributionNotFoundError):
+        read_distribution_pmf(backend, "no-such-distribution-id")
+
+
+def test_read_distribution_pmf_falls_back_to_legacy_outcome_rows(
+    tmp_path: Path,
+) -> None:
+    """OLD-READ compatibility: a record with no compact payload (as every
+    pre-BLOCK-2A row is) must still be readable from
+    `player_prop_distribution_outcomes`."""
+    backend = _backend(tmp_path)
+    run_id = "RUN-LEGACY"
+    _make_run(backend, run_id)
+    distribution_id = _write_legacy_distribution_and_outcomes(
+        backend,
+        run_id=run_id,
+        player_id="legacy-player-1",
+        prop_type="receptions",
+        outcomes=[0, 1, 2],
+        probabilities=[0.5, 0.3, 0.2],
+    )
+    pmf = read_distribution_pmf(backend, distribution_id)
+    assert pmf.source == "legacy"
+    assert pmf.outcomes == (0, 1, 2)
+    assert pmf.probabilities == (0.5, 0.3, 0.2)
+
+
+def test_read_distribution_pmf_agrees_when_both_representations_present(
+    tmp_path: Path,
+) -> None:
+    """A migrated/backfilled record that carries BOTH a compact payload and
+    the legacy outcome rows must resolve to the compact representation once
+    the two are proven to agree exactly."""
+    backend, distributions, _eligible = _setup(tmp_path)
+    persist_player_prop_distributions(
+        backend, distributions, run_id="RUN-A", season=SEASON, week=WEEK, created_at=NOW
+    )
+    row = _stored_distributions(backend).filter(
+        (pl.col("player_id") == HOME_WR1) & (pl.col("prop_type") == "receiving_yards")
+    ).row(0, named=True)
+    original = distributions.filter(
+        (pl.col("player_id") == HOME_WR1) & (pl.col("prop_type") == "receiving_yards")
+    ).sort("outcome")
+
+    outcome_rows = [
+        {"distribution_key": row["distribution_key"], "outcome": int(o), "p_raw": float(p)}
+        for o, p in zip(
+            original["outcome"].to_list(), original["p_raw"].to_list(), strict=True
+        )
+    ]
+    backend.append(
+        PLAYER_PROP_DISTRIBUTION_OUTCOMES_TABLE,
+        pl.DataFrame(outcome_rows),
+        key=["distribution_key", "outcome"],
+    )
+
+    pmf = read_distribution_pmf(backend, row["distribution_id"])
+    assert pmf.source == "compact"
+    assert pmf.outcomes == tuple(int(x) for x in original["outcome"].to_list())
+    assert pmf.probabilities == tuple(float(x) for x in original["p_raw"].to_list())
+
+
+def test_read_distribution_pmf_fails_closed_on_representation_mismatch(
+    tmp_path: Path,
+) -> None:
+    backend, distributions, _eligible = _setup(tmp_path)
+    persist_player_prop_distributions(
+        backend, distributions, run_id="RUN-A", season=SEASON, week=WEEK, created_at=NOW
+    )
+    row = _stored_distributions(backend).filter(
+        (pl.col("player_id") == HOME_WR1) & (pl.col("prop_type") == "receiving_yards")
+    ).row(0, named=True)
+    assert row["outcome_count"] > 1
+
+    # A single legacy outcome row that disagrees with the stored compact
+    # payload -- must never be silently preferred or merged.
+    bad_outcome_rows = [
+        {"distribution_key": row["distribution_key"], "outcome": row["support_min"], "p_raw": 0.123456}
+    ]
+    backend.append(
+        PLAYER_PROP_DISTRIBUTION_OUTCOMES_TABLE,
+        pl.DataFrame(bad_outcome_rows),
+        key=["distribution_key", "outcome"],
+    )
+    with pytest.raises(DistributionPMFIntegrityError):
+        read_distribution_pmf(backend, row["distribution_id"])
+
+
+def test_read_distribution_pmf_fails_closed_on_corrupted_payload_hash(
+    tmp_path: Path,
+) -> None:
+    backend, distributions, _eligible = _setup(tmp_path)
+    persist_player_prop_distributions(
+        backend, distributions, run_id="RUN-A", season=SEASON, week=WEEK, created_at=NOW
+    )
+    stored = _stored_distributions(backend)
+    row = stored.filter(
+        (pl.col("player_id") == HOME_WR1) & (pl.col("prop_type") == "receiving_yards")
+    ).row(0, named=True)
+
+    corrupted = stored.with_columns(
+        pl.when(pl.col("distribution_id") == row["distribution_id"])
+        .then(pl.lit("0" * 64))
+        .otherwise(pl.col("pmf_payload_sha256"))
+        .alias("pmf_payload_sha256")
+    )
+    backend.write(PLAYER_PROP_DISTRIBUTIONS_TABLE, corrupted)
+    with pytest.raises(DistributionPMFIntegrityError):
+        read_distribution_pmf(backend, row["distribution_id"])
+
+
+def test_read_distribution_pmf_fails_closed_on_corrupted_payload_bytes(
+    tmp_path: Path,
+) -> None:
+    backend, distributions, _eligible = _setup(tmp_path)
+    persist_player_prop_distributions(
+        backend, distributions, run_id="RUN-A", season=SEASON, week=WEEK, created_at=NOW
+    )
+    stored = _stored_distributions(backend)
+    row = stored.filter(
+        (pl.col("player_id") == HOME_WR1) & (pl.col("prop_type") == "receiving_yards")
+    ).row(0, named=True)
+    truncated_payload = bytes(row["pmf_payload"])[:-1]
+
+    corrupted = stored.with_columns(
+        pl.when(pl.col("distribution_id") == row["distribution_id"])
+        .then(pl.lit(truncated_payload))
+        .otherwise(pl.col("pmf_payload"))
+        .alias("pmf_payload")
+    )
+    backend.write(PLAYER_PROP_DISTRIBUTIONS_TABLE, corrupted)
+    with pytest.raises(DistributionPMFIntegrityError):
+        read_distribution_pmf(backend, row["distribution_id"])
+
+
+def test_duplicate_outcome_in_incoming_batch_is_a_pmf_encoding_error(
+    tmp_path: Path,
+) -> None:
+    """The compact codec's strict-increasing-outcome gate rejects a
+    duplicate outcome row for the same distribution even though its own
+    (halved) probabilities still sum to 1.0 -- a data-integrity failure
+    the pre-BLOCK-2A code path had no equivalent explicit check for."""
+    backend, distributions, _eligible = _setup(tmp_path)
+    target = distributions.filter(
+        (pl.col("player_id") == HOME_WR1) & (pl.col("prop_type") == "receiving_yards")
+    ).sort("outcome")
+    assert target.height >= 2
+    dup_outcome = target["outcome"][0]
+
+    halved = distributions.with_columns(
+        pl.when(
+            (pl.col("player_id") == HOME_WR1)
+            & (pl.col("prop_type") == "receiving_yards")
+            & (pl.col("outcome") == dup_outcome)
+        )
+        .then(pl.col("p_raw") / 2.0)
+        .otherwise(pl.col("p_raw"))
+        .alias("p_raw")
+    )
+    extra_row = halved.filter(
+        (pl.col("player_id") == HOME_WR1)
+        & (pl.col("prop_type") == "receiving_yards")
+        & (pl.col("outcome") == dup_outcome)
+    )
+    duplicated = pl.concat([halved, extra_row])
+
+    with pytest.raises(DistributionPMFEncodingError):
+        persist_player_prop_distributions(
+            backend, duplicated, run_id="RUN-A", season=SEASON, week=WEEK, created_at=NOW
+        )
+    assert _stored_distributions(backend).is_empty()
 
 
 # ---------------------------------------------------------------- linkage
