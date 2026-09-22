@@ -54,13 +54,9 @@ concurrency:
 jobs:
   train:
     name: Remote training (${{ inputs.mode }})
-    # EXTERNAL PROVISIONING REQUIRED: this label is not yet registered to
-    # any machine. See docs/PLATFORM_AUTOMATION.md
-    # #external-provisioning-still-required. Never falls back to a
-    # GitHub-hosted runner or to Joseph's Mac -- an unregistered label
-    # simply leaves the job queued rather than silently running production
-    # training somewhere unapproved.
-    runs-on: [self-hosted, nflprops-training]
+    # GitHub-hosted Ubuntu runner -- never Joseph's Mac, never the
+    # WizardOfOdds serving host. See docs/PLATFORM_AUTOMATION.md.
+    runs-on: ubuntu-24.04
     timeout-minutes: 480
 
     steps:

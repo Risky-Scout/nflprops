@@ -108,15 +108,22 @@ def test_remote_training_cleans_up_workspace_unconditionally(
     assert cleanup_steps[0]["if"] == "always()"
 
 
-def test_remote_training_runs_on_dedicated_self_hosted_label(
+def test_remote_training_runs_on_github_hosted_ubuntu_runner(
     remote_training_doc: dict,
 ) -> None:
+    # BLOCK 1 GITHUB EXECUTION: the self-hosted `nflprops-training` label
+    # requirement is removed -- training now runs on a standard GitHub-hosted
+    # Ubuntu runner. Never Joseph's Mac.
     runs_on = remote_training_doc["jobs"]["train"]["runs-on"]
-    assert "self-hosted" in runs_on
-    # Never a GitHub-hosted runner and never Joseph's Mac -- production
-    # training must land on dedicated remote compute only.
-    assert "ubuntu-latest" not in runs_on
-    assert "macos" not in " ".join(runs_on).lower()
+    assert runs_on == "ubuntu-24.04"
+
+
+def test_remote_training_no_longer_references_self_hosted_label(
+    remote_training_text: str,
+) -> None:
+    assert "self-hosted" not in remote_training_text
+    assert "nflprops-training" not in remote_training_text
+    assert "macos" not in remote_training_text.lower()
 
 
 def test_remote_training_rejects_non_sha_science_ref_before_checkout(

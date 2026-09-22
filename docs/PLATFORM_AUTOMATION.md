@@ -30,7 +30,9 @@ which fails any PR that touches either boundary.
 
 | Component | Where |
 |---|---|
-| Remote training workflow | `.github/workflows/remote-training.yml` |
+| Remote training workflow (manual dispatch; GitHub-hosted `ubuntu-24.04`) | `.github/workflows/remote-training.yml` |
+| Remote training smoke workflow (push-triggered; GitHub-hosted `ubuntu-24.04`; synthetic fixture data only) | `.github/workflows/remote-training-smoke.yml` |
+| Synthetic fixture-warehouse generator for the smoke workflow | `tools/generate_smoke_warehouse.py` |
 | Remote training harness (inputs, SHA verification, entry-point resolution, run report) | `src/nflprops/platform/remote_training.py` |
 | Training-data snapshot manifest + verified download | `src/nflprops/platform/data_snapshot.py` |
 | Operational health reporting | `src/nflprops/platform/health.py`, `nflprops platform health` |
@@ -74,6 +76,40 @@ Production runs serialize against each other via a fixed concurrency group
 (`remote-training-production`, `cancel-in-progress: false`); smoke runs
 never block or get blocked by production.
 
+Runs on the GitHub-hosted `ubuntu-24.04` runner -- no self-hosted machine is
+required. Real production/smoke dispatches still require the object-store
+and `DATABASE_URL` secrets listed under EXTERNAL_PROVISIONING_STILL_REQUIRED
+below.
+
+## GitHub-hosted execution proof (`remote-training-smoke.yml`)
+
+Because `workflow_dispatch` for `remote-training.yml` is only reachable from
+the GitHub UI/API once the workflow file exists on the default branch
+(`main`), `.github/workflows/remote-training-smoke.yml` proves the same
+GitHub-hosted Platform -> Science execution path on every push to
+`dev/nflprops-production`, ahead of that merge:
+
+1. Checks out at `github.sha` and re-verifies `git rev-parse HEAD` matches.
+2. Generates a small synthetic 2-season warehouse in-repo
+   (`tools/generate_smoke_warehouse.py`) -- never the real historical
+   snapshot, never an object-store download. No `OBJECT_STORE_*` or
+   `DATABASE_URL` secret is read by this workflow.
+3. Invokes `nflprops.platform.remote_training run --mode smoke` against that
+   fixture directly via `--data-dir`, exercising the identical Platform ->
+   Science handoff `remote-training.yml` uses.
+4. Asserts the resulting report has `mode=smoke`,
+   `promotion_evidence_eligible=false`, and `n_draws` within
+   `MAX_SMOKE_N_DRAWS` before declaring success.
+5. Records runner OS/CPU/RAM, disk before/after, elapsed time, max RSS
+   (via `/usr/bin/time -v` where available), and exit status alongside the
+   run report as an uploaded artifact, `if: always()`.
+
+`--mode` is hardcoded to `smoke` in this workflow file -- there is no input
+that could escalate it to `production` from a push -- and
+`nflprops.platform.remote_training` independently forces
+`promotion_evidence_eligible=False` for any non-production mode regardless
+of what the Science entry point itself reports.
+
 This module never imports or calls
 `nflprops.calibration.registry.promote_calibration_champion` (or any other
 promotion function) -- champion promotion stays a separate, explicit,
@@ -116,11 +152,6 @@ DNS.
 
 ## EXTERNAL_PROVISIONING_STILL_REQUIRED
 
-- A self-hosted GitHub Actions runner registered with labels
-  `[self-hosted, nflprops-training]`, on a dedicated remote Linux machine
-  capable of multi-hour CPU workloads -- not Joseph's Mac, not the
-  WizardOfOdds 1-vCPU/~2GB host. `remote-training.yml`'s job simply queues
-  (never silently falls back elsewhere) until this exists.
 - Object storage (S3-compatible; MinIO or AWS S3) provisioned for
   production, with `OBJECT_STORE_ENDPOINT`/`OBJECT_STORE_REGION`/
   `OBJECT_STORE_BUCKET`/`OBJECT_STORE_ACCESS_KEY`/`OBJECT_STORE_SECRET_KEY`
