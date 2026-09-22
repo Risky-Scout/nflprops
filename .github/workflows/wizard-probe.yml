@@ -3,8 +3,16 @@ name: Wizard Read-Only Probe (BLOCK 2B foundation)
 # BLOCK 2B §13: a strictly READ-ONLY resource/collision probe against the
 # real Wizard host, using the existing WIZARD_SSH_* secrets/mechanism
 # (same wizardofodds.com environment, same key-based SSH with strict
-# known_hosts checking as deploy-wizard.yml). Nothing in this repository
-# triggers this workflow automatically -- workflow_dispatch only.
+# known_hosts checking as deploy-wizard.yml).
+#
+# TEMPORARY push trigger: GitHub only allows workflow_dispatch to be
+# invoked via API/CLI once a workflow file exists on the repository's
+# default branch (main) -- the exact same limitation
+# remote-training-smoke.yml works around for remote-training.yml. BLOCK 2B
+# must not merge main, so this workflow is dispatched ONCE via a push
+# trigger to obtain the real probe results for the BLOCK 2B final report,
+# then the push trigger is removed in an immediate follow-up commit,
+# reverting to workflow_dispatch-only (its permanent, intended shape).
 #
 # Every remote command below is read-only: uname/nproc/free/swapon/df/ls/
 # du/systemctl list-units/ss. It never installs a package, never creates
@@ -15,6 +23,10 @@ name: Wizard Read-Only Probe (BLOCK 2B foundation)
 
 on:
   workflow_dispatch:
+  push:
+    branches: [dev/nflprops-production]
+    paths:
+      - .github/workflows/wizard-probe.yml
 
 permissions:
   contents: read
