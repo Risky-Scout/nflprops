@@ -743,6 +743,7 @@ def platform_health() -> None:
 
     from nflprops.data.storage.settings import StorageSettings
     from nflprops.platform.health import (
+        HealthCheck,
         checkpoint_status_placeholder_check,
         collect_platform_health,
         collector_status_placeholder_check,
@@ -767,7 +768,9 @@ def platform_health() -> None:
     settings = StorageSettings.from_env()
     if settings.backend == "duckdb" and not settings.database_url:
         # The locked zero-cost architecture needs no database server.
-        checks = {"database": lambda: (True, "not required (duckdb backend)")}
+        checks: dict[str, HealthCheck] = {
+            "database": lambda: (True, "not required (duckdb backend)")
+        }
     else:
         checks = {"database": database_reachable_check(settings.database_url)}
     if settings.object_store_configured():
