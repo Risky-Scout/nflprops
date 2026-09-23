@@ -7,10 +7,12 @@ name: Deploy WizardOfOdds (foundation)
 #
 # Never touches the existing WNBA deployment, the existing separate NFL
 # game-model deployment, nginx, or DNS: every remote path this workflow
-# writes to is namespaced under RELEASE_ROOT below, or under
-# /var/lib/nflprops / /var/log/nflprops (BLOCK 2B's isolated runtime state
-# root -- see deploy/systemd/nflprops-runtime.service), dedicated to this
-# service only.
+# writes to is namespaced under RELEASE_ROOT below
+# (/home/wizard-deploy/nflprops -- the isolated runtime root measured and
+# approved by BLOCK 2B's read-only Wizard probe, since wizard-deploy cannot
+# write /var/lib, /var/log, /opt/wizardofodds, or /etc), dedicated to this
+# service only. Never /home/wizard-deploy/nfl-production-2026 or
+# /var/www/sportsodds.
 #
 # BLOCK 2B additive foundation (docs/PLATFORM_AUTOMATION.md): after the
 # existing atomic release swap, also installs/updates the
@@ -34,7 +36,7 @@ permissions:
   contents: read
 
 env:
-  RELEASE_ROOT: /opt/wizardofodds/nflprops-releases
+  RELEASE_ROOT: /home/wizard-deploy/nflprops
 
 jobs:
   guard:
@@ -110,6 +112,11 @@ jobs:
           ssh $SSH_OPTS "$REMOTE" bash -s <<REMOTE_SCRIPT
             set -euo pipefail
             RELEASE_DIR="$RELEASE_DIR"
+            # The probe-approved isolated layout -- created as wizard-deploy,
+            # no root needed. Never touches anything outside $RELEASE_ROOT.
+            for d in releases state snapshots publications backups logs locks; do
+              install -d -m 750 "$RELEASE_ROOT/\$d"
+            done
             PREVIOUS="\$(readlink -f "$RELEASE_ROOT/current" || true)"
             echo "\$PREVIOUS" > "$RELEASE_ROOT/previous_release" || true
 
@@ -121,10 +128,18 @@ jobs:
             ln -sfn "\$RELEASE_DIR" "$RELEASE_ROOT/current.new"
             mv -T "$RELEASE_ROOT/current.new" "$RELEASE_ROOT/current"
 
-            # Keep the last 5 releases for rollback; nothing outside
-            # $RELEASE_ROOT/releases is ever pruned.
+            # Keep the last 3 releases for rollback (bounded disk: ~11 GB
+            # free at probe time); nothing outside $RELEASE_ROOT/releases
+            # is ever pruned.
             cd "$RELEASE_ROOT/releases"
-            ls -1t | tail -n +6 | xargs -r rm -rf --
+            ls -1t | tail -n +4 | xargs -r rm -rf --
+
+            # The env file is created ONLY if absent -- never overwritten,
+            # so a real deployment's secrets/config are never clobbered.
+            if [ ! -f "$RELEASE_ROOT/nflprops-runtime.env" ]; then
+              install -m 600 "$RELEASE_ROOT/current/deploy/systemd/nflprops-runtime.env.example" \
+                "$RELEASE_ROOT/nflprops-runtime.env"
+            fi
           REMOTE_SCRIPT
 
       - name: Install/update the nflprops-runtime systemd unit (BLOCK 2B foundation)
@@ -132,36 +147,22 @@ jobs:
           SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
         run: |
           REMOTE="${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}"
-          # Requires passwordless `sudo` for the deploy user, scoped to
-          # exactly these commands (not yet confirmed -- see the BLOCK 2B
-          # read-only probe results in the final report). Uses `sudo -n`
+          # Installing the unit into /etc/systemd/system is the ONLY step
+          # that needs root (the probe confirmed wizard-deploy cannot write
+          # /etc). It requires passwordless `sudo` for the deploy user,
+          # scoped to exactly these commands -- a one-time root setup that
+          # is acceptable later but not yet configured. Uses `sudo -n`
           # (never interactive) so an unconfigured host fails fast with a
-          # clear message instead of hanging the workflow; a failure here
-          # does NOT roll back the already-succeeded release -- installing
-          # this unit is additive, the release swap above already
-          # succeeded independently of it.
+          # clear message instead of hanging the workflow; a skip here does
+          # NOT roll back the already-succeeded release -- installing this
+          # unit is additive.
           # shellcheck disable=SC2086
           ssh $SSH_OPTS "$REMOTE" bash -s <<REMOTE_SCRIPT
             set -euo pipefail
             if ! sudo -n true 2>/dev/null; then
-              echo "::warning::passwordless sudo is not configured for this deploy user -- skipping systemd unit install. Install deploy/systemd/nflprops-runtime.service manually (see its own header for the exact commands)."
+              echo "::warning::passwordless sudo is not configured for this deploy user -- skipping systemd unit install. Install deploy/systemd/nflprops-runtime.service manually (see its own header for the one-time root setup)."
               exit 0
             fi
-            # Isolated entirely under /var/lib, /var/log, /etc/nflprops --
-            # never any other existing unrelated workload's directory on
-            # this host (see this workflow's own header comment).
-            sudo install -d -m 750 -o "\$(whoami)" -g "\$(whoami)" /var/lib/nflprops
-            sudo install -d -m 750 -o "\$(whoami)" -g "\$(whoami)" /var/log/nflprops
-            sudo install -d -m 750 -o "\$(whoami)" -g "\$(whoami)" /etc/nflprops
-
-            # The env file is created ONLY if absent -- never overwritten,
-            # so a real deployment's secrets/config are never clobbered.
-            if [ ! -f /etc/nflprops/nflprops-runtime.env ]; then
-              sudo install -m 640 -o "\$(whoami)" -g "\$(whoami)" \
-                "$RELEASE_ROOT/current/deploy/systemd/nflprops-runtime.env.example" \
-                /etc/nflprops/nflprops-runtime.env
-            fi
-
             sudo install -m 644 "$RELEASE_ROOT/current/deploy/systemd/nflprops-runtime.service" \
               /etc/systemd/system/nflprops-runtime.service
             sudo systemctl daemon-reload

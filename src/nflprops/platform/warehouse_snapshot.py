@@ -141,7 +141,10 @@ def create_snapshot(
     id, this is a no-op (the existing snapshot is returned); if a
     same-named snapshot exists with different content, `BundleConflictError`
     is raised and nothing is overwritten (structurally rare, since the id
-    embeds a content fingerprint, but never silently allowed).
+    embeds a content fingerprint, but never silently allowed). If the
+    warehouse's files and migration head are unchanged since the latest
+    snapshot, no new snapshot is written and the latest one is returned --
+    see `prune_snapshots` for the matching bounded-retention half.
     """
     resolved_created_at = created_at or datetime.now(UTC)
     resolved_lock_path = lock_path or default_lock_path(snapshot_root.parent)
@@ -186,6 +189,12 @@ def create_snapshot(
                 schema_version=SNAPSHOT_SCHEMA_VERSION,
                 files=probe_manifest.files,
             )
+            duplicate = _identical_to_latest(snapshot_root, manifest)
+            if duplicate is not None:
+                # Bounded disk (BLOCK 2B probe: ~11 GB free on the Wizard
+                # host): an unchanged warehouse never produces a second,
+                # byte-identical copy -- the existing snapshot is returned.
+                return duplicate
             write_manifest(manifest, staging)
             verify_directory_against_manifest(staging, manifest)
 
@@ -203,6 +212,53 @@ def create_snapshot(
         total_bytes=manifest.total_bytes,
         source_identity=manifest.source_identity,
     )
+
+
+def _file_fingerprint(manifest: BundleManifest) -> tuple[tuple[str, int, str], ...]:
+    return tuple(
+        sorted((f.relative_path, f.byte_count, f.sha256) for f in manifest.files)
+    )
+
+
+def _identical_to_latest(
+    snapshot_root: Path, manifest: BundleManifest
+) -> SnapshotInfo | None:
+    """The latest published snapshot, if its files AND migration head are
+    identical to `manifest`'s (i.e. the warehouse has not changed since)."""
+    snapshots = list_snapshots(snapshot_root)
+    if not snapshots:
+        return None
+    latest = snapshots[-1]
+    try:
+        latest_manifest = read_manifest(snapshot_root / latest.snapshot_id)
+    except BundleIntegrityError:
+        return None
+    same_files = _file_fingerprint(latest_manifest) == _file_fingerprint(manifest)
+    same_head = latest.source_identity.get("migration_head") == manifest.source_identity.get(
+        "migration_head"
+    )
+    return latest if same_files and same_head else None
+
+
+def prune_snapshots(
+    snapshot_root: Path,
+    *,
+    keep: int,
+    lock_path: Path | None = None,
+    lock_timeout_seconds: float = DEFAULT_SNAPSHOT_LOCK_TIMEOUT_SECONDS,
+) -> list[str]:
+    """Bounded retention: delete all but the newest `keep` snapshots,
+    under the writer lock. Returns the pruned snapshot_ids, oldest first.
+    Refuses `keep < 1` -- the latest snapshot is never pruned."""
+    if keep < 1:
+        raise WarehouseSnapshotError("prune_snapshots requires keep >= 1")
+    resolved_lock_path = lock_path or default_lock_path(snapshot_root.parent)
+    with WriterLock(resolved_lock_path, timeout_seconds=lock_timeout_seconds):
+        snapshots = list_snapshots(snapshot_root)
+        doomed = snapshots[:-keep] if len(snapshots) > keep else []
+        for info in doomed:
+            shutil.rmtree(snapshot_root / info.snapshot_id)
+    return [info.snapshot_id for info in doomed]
 
 
 def list_snapshots(snapshot_root: Path) -> list[SnapshotInfo]:

@@ -180,3 +180,59 @@ def test_result_bundle_publish_never_overwrites_different_content(tmp_path: Path
     assert second.exit_code == 1
     assert "FAILED" in second.output
     assert (final / "report.json").read_text() == '{"v": 1}'
+
+
+# ------------------------------- probe-approved layout + bounded retention
+
+
+def test_runtime_root_env_places_snapshots_and_lock_under_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "nflprops"
+    warehouse_root = runtime_root / "state" / "warehouse"
+    warehouse_root.mkdir(parents=True)
+    pl.DataFrame({"a": [1]}).write_parquet(warehouse_root / "t.parquet")
+    monkeypatch.setenv("NFLPROPS_DATA_ROOT", str(warehouse_root))
+    monkeypatch.setenv("NFLPROPS_RUNTIME_ROOT", str(runtime_root))
+    monkeypatch.setenv("NFLPROPS_ENV", "development")
+    monkeypatch.setenv("NFLPROPS_STORAGE_BACKEND", "duckdb")
+
+    create = runner.invoke(
+        app, ["snapshot", "create", "--migration-head", "0009_compact_pmf_payload"]
+    )
+    assert create.exit_code == 0, create.output
+    snapshot_id = create.output.split("snapshot_id=")[1].split(" ")[0]
+    assert (runtime_root / "snapshots" / snapshot_id / "manifest.json").exists()
+    assert (runtime_root / "locks" / "writer.lock").exists()
+    assert not (runtime_root / "state" / "snapshots").exists()
+
+    status = runner.invoke(app, ["lock-status"])
+    assert str(runtime_root / "locks" / "writer.lock") in status.output
+
+
+def test_snapshot_create_enforces_bounded_retention(
+    warehouse_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("NFLPROPS_SNAPSHOT_RETENTION", "2")
+    for value in range(4):
+        pl.DataFrame({"a": [value]}).write_parquet(warehouse_env / "t.parquet")
+        result = runner.invoke(
+            app, ["snapshot", "create", "--migration-head", "0009_compact_pmf_payload"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "retained=2" in result.output
+    listing = runner.invoke(app, ["snapshot", "list"])
+    assert len([line for line in listing.output.splitlines() if line.strip()]) == 2
+
+
+def test_snapshot_prune_command(warehouse_env: Path) -> None:
+    for value in range(3):
+        pl.DataFrame({"a": [value]}).write_parquet(warehouse_env / "t.parquet")
+        runner.invoke(
+            app,
+            ["snapshot", "create", "--migration-head", "0009_compact_pmf_payload",
+             "--keep", "10"],
+        )
+    result = runner.invoke(app, ["snapshot", "prune", "--keep", "1"])
+    assert result.exit_code == 0, result.output
+    assert "pruned=2" in result.output

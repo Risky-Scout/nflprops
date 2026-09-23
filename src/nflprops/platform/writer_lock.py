@@ -66,7 +66,7 @@ class WriterLockTimeoutError(WriterLockError):
 
 def default_lock_path(state_root: Path) -> Path:
     """The deterministic, conventional lock file path for a given
-    production state root (e.g. `/var/lib/nflprops`): always
+    production runtime root (e.g. `/home/wizard-deploy/nflprops`): always
     `<state_root>/locks/writer.lock`, so every process on the host that
     was given the same `state_root` contends on exactly the same file."""
     return state_root / "locks" / "writer.lock"

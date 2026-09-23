@@ -3,10 +3,10 @@ transfer commands, invoked via `python -m nflprops.platform.wizard_runtime
 <command>` by systemd, cron, or a GitHub Actions SSH step (mirroring
 `nflprops.platform.remote_training`'s `python -m` invocation convention).
 
-Reads warehouse/snapshot/lock paths from `NFLPROPS_DATA_ROOT` (via
-`StorageSettings.from_env`) and the BLOCK 2B convention that the warehouse
-root's PARENT is the runtime state root -- see
-`nflprops.platform.warehouse_snapshot` / `nflprops.platform.writer_lock`.
+Reads the warehouse path from `NFLPROPS_DATA_ROOT` (via
+`StorageSettings.from_env`) and the snapshot/lock paths from the
+probe-approved runtime layout (`NFLPROPS_RUNTIME_ROOT`, e.g.
+`/home/wizard-deploy/nflprops`) -- see `nflprops.platform.runtime_layout`.
 
 This module never imports Science code, never trains, never recalibrates,
 and never runs on GitHub-hosted runners for anything other than the
@@ -32,14 +32,20 @@ from nflprops.platform.immutable_bundle import (
     verify_directory_against_manifest,
     write_manifest,
 )
+from nflprops.platform.runtime_layout import (
+    RuntimeLayout,
+    resolve_runtime_layout,
+    snapshot_retention,
+)
 from nflprops.platform.warehouse_snapshot import (
     WarehouseSnapshotError,
     create_snapshot,
     list_snapshots,
+    prune_snapshots,
     restore_snapshot,
     verify_snapshot,
 )
-from nflprops.platform.writer_lock import default_lock_path
+from nflprops.platform.writer_lock import WriterLockError
 
 app = typer.Typer(
     name="wizard-runtime",
@@ -53,11 +59,14 @@ app.add_typer(snapshot_app, name="snapshot")
 app.add_typer(result_bundle_app, name="result-bundle")
 
 
-def _warehouse_and_snapshot_roots() -> tuple[Path, Path]:
+def _layout() -> RuntimeLayout:
     settings = StorageSettings.from_env()
-    warehouse_root = Path(settings.local_warehouse_root)
-    snapshot_root = warehouse_root.parent / "snapshots"
-    return warehouse_root, snapshot_root
+    return resolve_runtime_layout(Path(settings.local_warehouse_root))
+
+
+def _warehouse_and_snapshot_roots() -> tuple[Path, Path]:
+    layout = _layout()
+    return layout.warehouse_root, layout.snapshots
 
 
 @snapshot_app.command("create")
@@ -68,26 +77,61 @@ def snapshot_create(
     lock_timeout_seconds: float = typer.Option(
         60.0, help="Bounded wait for the writer lock before failing closed."
     ),
+    keep: int = typer.Option(
+        0,
+        help="Snapshots to retain after creating this one (0 = "
+        "NFLPROPS_SNAPSHOT_RETENTION, default 7). Retention is never unlimited.",
+    ),
 ) -> None:
-    """Checkpoint + copy the live warehouse into a new immutable snapshot.
-    The ONE command that reads the live warehouse for durability purposes."""
-    warehouse_root, snapshot_root = _warehouse_and_snapshot_roots()
+    """Checkpoint + copy the live warehouse into a new immutable snapshot,
+    then enforce bounded retention. The ONE command that reads the live
+    warehouse for durability purposes."""
+    layout = _layout()
+    retain = keep or snapshot_retention()
     try:
         info = create_snapshot(
-            warehouse_root=warehouse_root,
-            snapshot_root=snapshot_root,
+            warehouse_root=layout.warehouse_root,
+            snapshot_root=layout.snapshots,
+            lock_path=layout.writer_lock,
             lock_timeout_seconds=lock_timeout_seconds,
             migration_head=migration_head,
             hostname=socket.gethostname(),
         )
-    except WarehouseSnapshotError as exc:
+        pruned = prune_snapshots(
+            layout.snapshots,
+            keep=retain,
+            lock_path=layout.writer_lock,
+            lock_timeout_seconds=lock_timeout_seconds,
+        )
+    except (WarehouseSnapshotError, WriterLockError) as exc:
         typer.echo(f"FAILED: {exc}", err=True)
         raise typer.Exit(1) from exc
 
     typer.echo(
         f"SUCCEEDED: snapshot_id={info.snapshot_id} files={info.file_count} "
-        f"bytes={info.total_bytes} manifest_sha256={info.manifest_sha256}"
+        f"bytes={info.total_bytes} manifest_sha256={info.manifest_sha256} "
+        f"retained={retain} pruned={len(pruned)}"
     )
+
+
+@snapshot_app.command("prune")
+def snapshot_prune(
+    keep: int = typer.Option(
+        0, help="Snapshots to retain (0 = NFLPROPS_SNAPSHOT_RETENTION, default 7)."
+    ),
+) -> None:
+    """Delete all but the newest `keep` snapshots (bounded retention)."""
+    layout = _layout()
+    try:
+        pruned = prune_snapshots(
+            layout.snapshots, keep=keep or snapshot_retention(), lock_path=layout.writer_lock
+        )
+    except (WarehouseSnapshotError, WriterLockError) as exc:
+        typer.echo(f"FAILED: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    for snapshot_id in pruned:
+        typer.echo(f"PRUNED: {snapshot_id}")
+    typer.echo(f"SUCCEEDED: pruned={len(pruned)}")
 
 
 @snapshot_app.command("list")
@@ -140,8 +184,7 @@ def lock_status() -> None:
     """Non-blocking report of whether the writer lock is currently held."""
     from nflprops.platform.writer_lock import WriterLock
 
-    _warehouse_root, snapshot_root = _warehouse_and_snapshot_roots()
-    lock_path = default_lock_path(snapshot_root.parent)
+    lock_path = _layout().writer_lock
     held = WriterLock(lock_path).is_locked_by_other()
     typer.echo(f"lock_path={lock_path} held_by_other={held}")
 

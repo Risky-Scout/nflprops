@@ -264,6 +264,166 @@ def memory_available_check(*, minimum_available_mb: float = 128.0) -> HealthChec
     return _check
 
 
+def _read_meminfo(meminfo_path: str) -> dict[str, int]:
+    fields: dict[str, int] = {}
+    with open(meminfo_path) as handle:
+        for line in handle:
+            key, _, rest = line.partition(":")
+            parts = rest.split()
+            if parts:
+                fields[key.strip()] = int(parts[0])  # kB
+    return fields
+
+
+def _read_psi_full_avg60(pressure_path: str) -> float | None:
+    """`full avg60` from Linux PSI (`/proc/pressure/memory`), or None if
+    the kernel doesn't expose it."""
+    try:
+        with open(pressure_path) as handle:
+            for line in handle:
+                if line.startswith("full"):
+                    for token in line.split():
+                        if token.startswith("avg60="):
+                            return float(token.split("=", 1)[1])
+    except (FileNotFoundError, PermissionError, ValueError):
+        return None
+    return None
+
+
+def memory_pressure_check(
+    *,
+    minimum_available_mb: float = 256.0,
+    saturated_swap_fraction: float = 0.90,
+    minimum_available_mb_when_swap_saturated: float = 512.0,
+    maximum_psi_full_avg60: float = 10.0,
+    meminfo_path: str = "/proc/meminfo",
+    pressure_path: str = "/proc/pressure/memory",
+) -> HealthCheck:
+    """RAM + swap + (if available) PSI memory pressure. The BLOCK 2B probe
+    measured ~1.9 GiB RAM with swap effectively fully used, so swap
+    saturation is always reported and becomes UNHEALTHY once it coincides
+    with low available RAM -- the runtime alerts on material memory
+    pressure rather than ever falling back to heavy local compute.
+    Unhealthy when ANY of:
+
+    - MemAvailable < `minimum_available_mb`;
+    - swap used >= `saturated_swap_fraction` AND MemAvailable <
+      `minimum_available_mb_when_swap_saturated`;
+    - PSI `full avg60` > `maximum_psi_full_avg60` (percent of time all
+      non-idle tasks were stalled on memory).
+
+    Linux-only; reports unavailable (healthy) on a host with no
+    /proc/meminfo rather than guessing."""
+
+    def _check() -> tuple[bool, str | None]:
+        try:
+            fields = _read_meminfo(meminfo_path)
+        except FileNotFoundError:
+            return True, "unavailable on this platform (no /proc/meminfo)"
+        available_mb = fields["MemAvailable"] / 1024
+        total_mb = fields.get("MemTotal", 0) / 1024
+        swap_total_mb = fields.get("SwapTotal", 0) / 1024
+        swap_used_mb = swap_total_mb - fields.get("SwapFree", 0) / 1024
+        swap_fraction = swap_used_mb / swap_total_mb if swap_total_mb > 0 else 0.0
+        psi = _read_psi_full_avg60(pressure_path)
+
+        problems: list[str] = []
+        if available_mb < minimum_available_mb:
+            problems.append(f"MemAvailable below {minimum_available_mb:.0f} MiB")
+        swap_saturated = swap_total_mb > 0 and swap_fraction >= saturated_swap_fraction
+        if swap_saturated and available_mb < minimum_available_mb_when_swap_saturated:
+            problems.append(
+                "swap saturated with MemAvailable below "
+                f"{minimum_available_mb_when_swap_saturated:.0f} MiB"
+            )
+        if psi is not None and psi > maximum_psi_full_avg60:
+            problems.append(f"PSI full avg60 {psi:.2f} > {maximum_psi_full_avg60:.2f}")
+
+        detail = (
+            f"mem_available={available_mb:.0f}MiB mem_total={total_mb:.0f}MiB "
+            f"swap_used={swap_used_mb:.0f}/{swap_total_mb:.0f}MiB "
+            f"({swap_fraction:.0%})"
+            + (f" psi_full_avg60={psi:.2f}" if psi is not None else "")
+            + (" WARNING: swap saturated" if swap_saturated else "")
+        )
+        if problems:
+            return False, f"MEMORY PRESSURE: {'; '.join(problems)} -- {detail}"
+        return True, detail
+
+    return _check
+
+
+def _tree_bytes(root: Any) -> int:
+    from pathlib import Path
+
+    base = Path(root)
+    if not base.exists():
+        return 0
+    return sum(p.stat().st_size for p in base.rglob("*") if p.is_file())
+
+
+def storage_growth_check(
+    *,
+    warehouse_root: Any,
+    snapshot_root: Any,
+    publications_root: Any,
+    retention_limit: int,
+    minimum_free_gb: float = 2.0,
+) -> HealthCheck:
+    """Live DuckDB/Parquet warehouse size, snapshot count/size, publication
+    size, and MEASURED growth between the oldest and newest retained
+    snapshot. Only ~11 GB was free at probe time, so this never
+    extrapolates a season-long capacity claim -- it reports only what has
+    actually been measured. Unhealthy if retention is exceeded or free
+    space falls below `minimum_free_gb`. Read-only; never creates a
+    directory. Snapshot sizes come from their manifests (no disk walk)."""
+
+    def _check() -> tuple[bool, str | None]:
+        import shutil as _shutil
+        from datetime import datetime as _dt
+        from pathlib import Path
+
+        from nflprops.platform.warehouse_snapshot import list_snapshots
+
+        warehouse = Path(warehouse_root)
+        live_bytes = _tree_bytes(warehouse)
+        query_cache = warehouse.parent / "nflprops.duckdb"
+        if query_cache.exists():
+            live_bytes += query_cache.stat().st_size
+        snapshots = list_snapshots(Path(snapshot_root))
+        snapshot_bytes = sum(info.total_bytes for info in snapshots)
+        publication_bytes = _tree_bytes(publications_root)
+        free_gb = _shutil.disk_usage(_nearest_existing_ancestor(warehouse)).free / (1024**3)
+
+        growth = "unmeasured (need >= 2 snapshots)"
+        if len(snapshots) >= 2:
+            first, last = snapshots[0], snapshots[-1]
+            elapsed_days = (
+                _dt.fromisoformat(last.created_at) - _dt.fromisoformat(first.created_at)
+            ).total_seconds() / 86400
+            if elapsed_days > 0:
+                per_day = (last.total_bytes - first.total_bytes) / elapsed_days
+                growth = f"{per_day / (1024**2):.2f}MiB/day over {elapsed_days:.1f}d"
+
+        problems: list[str] = []
+        if len(snapshots) > retention_limit:
+            problems.append(f"{len(snapshots)} snapshots exceed retention {retention_limit}")
+        if free_gb < minimum_free_gb:
+            problems.append(f"free {free_gb:.2f} GiB below {minimum_free_gb:.2f} GiB")
+        mib = 1024**2
+        detail = (
+            f"live_warehouse={live_bytes / mib:.1f}MiB "
+            f"snapshots={len(snapshots)}/{retention_limit} ({snapshot_bytes / mib:.1f}MiB) "
+            f"publications={publication_bytes / mib:.1f}MiB free={free_gb:.2f}GiB "
+            f"snapshot_growth={growth}"
+        )
+        if problems:
+            return False, f"{'; '.join(problems)} -- {detail}"
+        return True, detail
+
+    return _check
+
+
 def migration_storage_version_check() -> HealthCheck:
     """Reports the repository's current Alembic migration head (never
     connects to a database -- `alembic heads` only inspects

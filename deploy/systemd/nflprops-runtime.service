@@ -15,35 +15,41 @@
 # collection is Block 3's decision, gated on all BLOCK 2B checks being
 # green (see the ExecStart command placeholder below).
 #
-# Assumptions (adjust paths/user if your deployment target differs --
-# BLOCK 2B's read-only Wizard probe, run once, is what actually confirms
-# these; see the final report for what it found):
-#   - Ubuntu (the existing WizardOfOdds host)
-#   - Deployed release tree via the EXISTING deploy-wizard.yml foundation:
-#     $RELEASE_ROOT=/opt/wizardofodds/nflprops-releases, with a `current`
-#     symlink atomically flipped to the active release
-#     (WorkingDirectory/ExecStart below follow that symlink, never a
-#     release-specific path, so an atomic release swap needs no unit edit)
-#   - Runs as the existing SSH deploy user (wizard-deploy) -- BLOCK 2B
-#     deliberately does not introduce a second, separately-privileged
-#     system user; adjust User=/Group= here if a dedicated unprivileged
-#     account is preferred once the deploy user's actual permissions are
-#     confirmed
-#   - Durable state ISOLATED from every other service on this host:
-#       NFLPROPS_DATA_ROOT=/var/lib/nflprops/warehouse
-#       (snapshots at /var/lib/nflprops/snapshots, the writer lock at
-#       /var/lib/nflprops/locks/writer.lock -- see
-#       nflprops.platform.warehouse_snapshot / writer_lock)
-#     and logs at /var/log/nflprops/ -- never /home/wizard-deploy/
-#     nfl-production-2026 or /var/www/sportsodds, the existing unrelated
-#     workloads on this host
-#   - Secrets/environment live ONLY in /etc/nflprops/nflprops-runtime.env,
-#     never in this unit file (which is often world-readable)
+# Layout (MEASURED by BLOCK 2B's read-only Wizard probe -- see the BLOCK
+# 2B final report in docs/PLATFORM_AUTOMATION.md): the wizard-deploy user
+# can write ONLY under /home/wizard-deploy (not /var/lib, /var/log,
+# /opt/wizardofodds, or /etc), so every nflprops path lives under one
+# isolated root:
 #
-# Install (not run by anything in this change):
+#   /home/wizard-deploy/nflprops/
+#       current/  releases/  state/  snapshots/  publications/
+#       backups/  logs/  locks/
+#       nflprops-runtime.env   (mode 600, outside git, never overwritten)
+#
+#   - Ubuntu (the existing WizardOfOdds host), 1 CPU / 1.9 GiB RAM with
+#     swap already saturated at probe time -> exactly ONE lightweight
+#     process, hard memory/task caps below, no heavy compute ever (20k-draw
+#     simulation, replay, training, calibration stay on GitHub Actions)
+#   - Release tree: $RELEASE_ROOT=/home/wizard-deploy/nflprops, `current`
+#     symlink atomically flipped by deploy-wizard.yml (WorkingDirectory/
+#     ExecStart follow that symlink, so a release swap needs no unit edit)
+#   - Runs as the existing SSH deploy user (wizard-deploy) -- no second,
+#     separately-privileged system user
+#   - NFLPROPS_DATA_ROOT=/home/wizard-deploy/nflprops/state/warehouse,
+#     NFLPROPS_RUNTIME_ROOT=/home/wizard-deploy/nflprops (snapshots/,
+#     publications/, locks/writer.lock) -- never /home/wizard-deploy/
+#     nfl-production-2026 or /var/www/sportsodds, the existing unrelated
+#     workloads on this host (nflprops.platform.runtime_layout refuses any
+#     overlap)
+#   - Secrets/environment live ONLY in the env file above, never in this
+#     unit file (which is often world-readable)
+#
+# One-time root setup (acceptable later, NOT run by anything in BLOCK 2B;
+# the directories themselves need no root -- deploy-wizard.yml creates
+# them as wizard-deploy):
 #   sudo cp deploy/systemd/nflprops-runtime.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
-#   sudo systemctl enable --now nflprops-runtime
+#   sudo systemctl enable nflprops-runtime
 
 [Unit]
 Description=NFL Props Wizard Runtime (BLOCK 2B foundation)
@@ -63,20 +69,31 @@ Type=oneshot
 RemainAfterExit=yes
 User=wizard-deploy
 Group=wizard-deploy
-WorkingDirectory=/opt/wizardofodds/nflprops-releases/current
-EnvironmentFile=/etc/nflprops/nflprops-runtime.env
-ExecStart=/opt/wizardofodds/nflprops-releases/current/.venv/bin/nflprops platform health
+WorkingDirectory=/home/wizard-deploy/nflprops/current
+EnvironmentFile=/home/wizard-deploy/nflprops/nflprops-runtime.env
+ExecStart=/home/wizard-deploy/nflprops/current/.venv/bin/nflprops platform health
 # Bounded restart-on-failure: if the placeholder health check itself
 # reports unhealthy (exit 1), retry with a fixed delay rather than
 # hammering the host or giving up silently -- capped by the [Unit]
 # StartLimit* above so a persistently unhealthy host stops retrying
 # rather than looping forever.
 Restart=on-failure
-RestartSec=5
+RestartSec=30
+
+# Lightweight-runtime caps (probe: 1 CPU, 1.9 GiB RAM, swap saturated).
+# Exceeding them is an alert condition, never a reason to grow.
+MemoryHigh=384M
+MemoryMax=512M
+MemorySwapMax=0
+TasksMax=16
+CPUQuota=50%
+Nice=10
 
 # Hardening: this process only ever needs its own isolated state tree.
-ReadWritePaths=/var/lib/nflprops /var/log/nflprops
+ProtectSystem=strict
+ReadWritePaths=/home/wizard-deploy/nflprops
 NoNewPrivileges=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

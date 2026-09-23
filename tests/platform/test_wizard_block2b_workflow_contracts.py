@@ -247,7 +247,12 @@ def test_probe_reports_cpu_ram_swap_disk_and_collisions(probe_text: str) -> None
 
 
 def test_probe_checks_candidate_nflprops_paths(probe_text: str) -> None:
-    for path in ("/var/lib/nflprops", "/var/log/nflprops", "/opt/wizardofodds/nflprops-releases"):
+    for path in (
+        "/home/wizard-deploy/nflprops",
+        "/var/lib/nflprops",
+        "/var/log/nflprops",
+        "/opt/wizardofodds/nflprops-releases",
+    ):
         assert path in probe_text
 
 
@@ -294,7 +299,7 @@ def test_deploy_wizard_runtime_unit_install_is_non_interactive_and_optional(
 
 
 def test_deploy_wizard_env_file_never_overwritten(deploy_wizard_text: str) -> None:
-    assert "if [ ! -f /etc/nflprops/nflprops-runtime.env ]" in deploy_wizard_text
+    assert 'if [ ! -f "$RELEASE_ROOT/nflprops-runtime.env" ]' in deploy_wizard_text
 
 
 def test_deploy_wizard_health_check_covers_both_services(deploy_wizard_text: str) -> None:
@@ -332,7 +337,9 @@ def test_runtime_unit_uses_environment_file_outside_git() -> None:
     match = re.search(r"^EnvironmentFile=(.+)$", text, re.MULTILINE)
     assert match is not None
     env_path = match.group(1).strip()
-    assert env_path.startswith("/etc/")
+    # The probe found wizard-deploy cannot write /etc: the env file lives
+    # inside the isolated runtime root instead.
+    assert env_path == "/home/wizard-deploy/nflprops/nflprops-runtime.env"
     assert not (REPO_ROOT / env_path.lstrip("/")).exists()
 
 
@@ -355,6 +362,71 @@ def test_runtime_unit_uses_absolute_paths() -> None:
             if line.startswith(key):
                 value = line[len(key):].split()[0]
                 assert value.startswith("/"), f"{key} must be an absolute path, got {value!r}"
+
+
+# ------------------------------------ probe-approved layout (BLOCK 2B final)
+
+_APPROVED_ROOT = "/home/wizard-deploy/nflprops"
+_UNWRITABLE_BY_DEPLOY_USER = ("/var/lib/", "/var/log/", "/opt/wizardofodds", "/etc/nflprops")
+_RUNTIME_FILES = [
+    SNAPSHOT_TRANSFER,
+    DEPLOY_WIZARD,
+    RUNTIME_UNIT,
+    REPO_ROOT / "deploy" / "systemd" / "nflprops-runtime.env.example",
+]
+
+
+@pytest.mark.parametrize("path", _RUNTIME_FILES, ids=lambda p: p.name)
+def test_runtime_files_use_only_the_probe_approved_root(path: Path) -> None:
+    content = _non_comment_content(path)
+    assert _APPROVED_ROOT in content
+    for forbidden in _UNWRITABLE_BY_DEPLOY_USER:
+        assert forbidden not in content, f"{path.name} still targets {forbidden}"
+
+
+def test_deploy_wizard_release_root_is_the_approved_root(deploy_wizard_doc: dict) -> None:
+    assert deploy_wizard_doc["env"]["RELEASE_ROOT"] == _APPROVED_ROOT
+
+
+def test_deploy_wizard_creates_the_approved_layout_without_root(
+    deploy_wizard_text: str,
+) -> None:
+    assert "for d in releases state snapshots publications backups logs locks" in (
+        deploy_wizard_text
+    )
+    # Directory creation happens BEFORE (and independent of) the sudo check.
+    assert deploy_wizard_text.index("for d in releases") < deploy_wizard_text.index(
+        "sudo -n true"
+    )
+    assert "sudo install -d" not in deploy_wizard_text
+
+
+def test_transfer_roots_are_under_the_approved_root(transfer_doc: dict) -> None:
+    env = transfer_doc["env"]
+    assert env["SNAPSHOT_ROOT"] == f"{_APPROVED_ROOT}/snapshots"
+    assert env["RESULT_BUNDLE_ROOT"] == f"{_APPROVED_ROOT}/publications"
+    assert env["WIZARD_RELEASE_PYTHON"].startswith(f"{_APPROVED_ROOT}/current/")
+
+
+def test_runtime_unit_is_memory_and_task_capped() -> None:
+    text = RUNTIME_UNIT.read_text()
+    assert re.search(r"^MemoryMax=\d+M$", text, re.MULTILINE)
+    assert re.search(r"^MemoryHigh=\d+M$", text, re.MULTILINE)
+    assert re.search(r"^TasksMax=\d+$", text, re.MULTILINE)
+    assert f"ReadWritePaths={_APPROVED_ROOT}" in text
+
+
+def test_env_example_sets_runtime_root_and_bounded_retention() -> None:
+    text = (REPO_ROOT / "deploy" / "systemd" / "nflprops-runtime.env.example").read_text()
+    assert f"NFLPROPS_RUNTIME_ROOT={_APPROVED_ROOT}\n" in text
+    assert f"NFLPROPS_DATA_ROOT={_APPROVED_ROOT}/state/warehouse\n" in text
+    assert re.search(r"^NFLPROPS_SNAPSHOT_RETENTION=\d+$", text, re.MULTILINE)
+
+
+@pytest.mark.parametrize("path", _RUNTIME_FILES, ids=lambda p: p.name)
+def test_runtime_files_never_bind_occupied_ports(path: Path) -> None:
+    content = _non_comment_content(path)
+    assert not re.search(r"[:= ](8000|8080)\b", content)
 
 
 # ------------------------------------------- no external paid infra reintroduced

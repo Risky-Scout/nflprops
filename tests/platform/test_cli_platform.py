@@ -33,8 +33,21 @@ def test_platform_health_reports_json_and_exits_nonzero_when_unhealthy() -> None
     assert result.exit_code == 1
     payload = json.loads(result.output)
     assert payload["healthy"] is False
-    names = {check["name"] for check in payload["checks"]}
-    assert {"database", "object_store"} <= names
+    checks = {check["name"]: check for check in payload["checks"]}
+    assert {"database", "object_store", "memory_pressure", "storage_growth"} <= set(checks)
+    # Locked zero-cost architecture: no database server or object store is
+    # required, so neither is what makes this report unhealthy.
+    assert checks["database"]["healthy"] is True
+    assert "not required" in checks["database"]["detail"]
+    assert checks["object_store"]["healthy"] is True
+
+
+def test_platform_health_refuses_a_runtime_root_overlapping_unrelated_workloads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NFLPROPS_DATA_ROOT", "/var/www/sportsodds/warehouse")
+    result = runner.invoke(app, ["platform", "health"])
+    assert result.exit_code != 0
 
 
 def test_platform_health_never_raises_out_of_the_cli(

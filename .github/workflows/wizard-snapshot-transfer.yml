@@ -22,7 +22,8 @@ name: Wizard Snapshot Transfer (foundation)
 #
 # Everything this workflow touches on the Wizard host is namespaced
 # under $SNAPSHOT_ROOT / $RESULT_BUNDLE_ROOT (both under
-# /var/lib/nflprops, BLOCK 2B's isolated nflprops state root) -- it never
+# /home/wizard-deploy/nflprops, the isolated runtime root approved by
+# BLOCK 2B's read-only Wizard probe) -- it never
 # writes to the existing WNBA deployment, the existing separate NFL
 # game-model deployment, /home/wizard-deploy/nfl-production-2026,
 # /var/www/sportsodds, nginx, or DNS.
@@ -62,11 +63,12 @@ permissions:
   contents: read
 
 env:
-  # Isolated entirely under /var/lib/nflprops -- BLOCK 2B's own state
-  # root, never a path any other Wizard service uses.
-  SNAPSHOT_ROOT: /var/lib/nflprops/snapshots
-  RESULT_BUNDLE_ROOT: /var/lib/nflprops/publications
-  WIZARD_RELEASE_PYTHON: /opt/wizardofodds/nflprops-releases/current/.venv/bin/python
+  # Isolated entirely under /home/wizard-deploy/nflprops -- the
+  # probe-approved runtime root (wizard-deploy cannot write /var/lib or
+  # /opt/wizardofodds), never a path any other Wizard service uses.
+  SNAPSHOT_ROOT: /home/wizard-deploy/nflprops/snapshots
+  RESULT_BUNDLE_ROOT: /home/wizard-deploy/nflprops/publications
+  WIZARD_RELEASE_PYTHON: /home/wizard-deploy/nflprops/current/.venv/bin/python
 
 jobs:
   download-snapshot:

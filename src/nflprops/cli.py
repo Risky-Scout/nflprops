@@ -727,11 +727,13 @@ def platform_health() -> None:
 
     BLOCK 2B (docs/PLATFORM_AUTOMATION.md) adds the Wizard runtime's own
     checks: the canonical warehouse's readability/writability, the writer
-    lock's status, the latest snapshot's identity/verification, disk/memory
-    headroom, and the current Alembic migration head -- alongside the
-    pre-existing database/object-store checks (unused when the locked
-    zero-cost DuckDB architecture is active, but still reported for the
-    postgres/object-store code paths this module also supports). Every
+    lock's status, the latest snapshot's identity/verification, disk free,
+    live warehouse/snapshot growth against bounded retention, RAM/swap/PSI
+    memory pressure, and the current Alembic migration head -- alongside
+    the pre-existing database/object-store checks (reported as not
+    required/optional under the locked zero-cost DuckDB architecture, but
+    still exercised for the postgres/object-store paths this module also
+    supports). Every
     check is read-only and never mutates the warehouse or contends for the
     writer lock beyond a non-blocking probe.
     """
@@ -747,19 +749,27 @@ def platform_health() -> None:
         database_reachable_check,
         disk_free_check,
         latest_snapshot_check,
-        memory_available_check,
+        memory_pressure_check,
         migration_storage_version_check,
         object_store_reachable_check,
         runtime_version_check,
+        storage_growth_check,
         warehouse_path_check,
         warehouse_readable_check,
         warehouse_writable_check,
         writer_lock_status_check,
     )
-    from nflprops.platform.writer_lock import default_lock_path
+    from nflprops.platform.runtime_layout import (
+        resolve_runtime_layout,
+        snapshot_retention,
+    )
 
     settings = StorageSettings.from_env()
-    checks = {"database": database_reachable_check(settings.database_url)}
+    if settings.backend == "duckdb" and not settings.database_url:
+        # The locked zero-cost architecture needs no database server.
+        checks = {"database": lambda: (True, "not required (duckdb backend)")}
+    else:
+        checks = {"database": database_reachable_check(settings.database_url)}
     if settings.object_store_configured():
         from nflprops.data.storage.object_store import ObjectStoreSettings
 
@@ -773,27 +783,31 @@ def platform_health() -> None:
             )
         )
     else:
-        checks["object_store"] = lambda: (False, "object store is not configured")
+        checks["object_store"] = lambda: (True, "not configured (optional as of BLOCK 2B)")
 
-    # BLOCK 2B: convention -- the warehouse root's PARENT is the runtime
-    # state root (e.g. NFLPROPS_DATA_ROOT=/var/lib/nflprops/warehouse ->
-    # state root /var/lib/nflprops), matching the snapshot/lock layout
-    # documented in nflprops.platform.warehouse_snapshot / writer_lock.
-    warehouse_root = Path(settings.local_warehouse_root)
-    state_root = warehouse_root.parent
-    snapshot_root = state_root / "snapshots"
-    lock_path = default_lock_path(state_root)
+    # BLOCK 2B: snapshot/lock/publication paths come from the probe-approved
+    # runtime layout (NFLPROPS_RUNTIME_ROOT, e.g. /home/wizard-deploy/nflprops;
+    # falls back to the warehouse root's parent) -- see
+    # nflprops.platform.runtime_layout.
+    layout = resolve_runtime_layout(Path(settings.local_warehouse_root))
+    retention = snapshot_retention()
 
     checks["runtime_version"] = runtime_version_check(
         os.environ.get("NFLPROPS_RUNTIME_VERSION_SHA")
     )
-    checks["warehouse_path"] = warehouse_path_check(warehouse_root)
-    checks["warehouse_readable"] = warehouse_readable_check(warehouse_root)
-    checks["warehouse_writable"] = warehouse_writable_check(warehouse_root)
-    checks["writer_lock"] = writer_lock_status_check(lock_path)
-    checks["latest_snapshot"] = latest_snapshot_check(snapshot_root)
-    checks["disk_free"] = disk_free_check(state_root)
-    checks["memory_available"] = memory_available_check()
+    checks["warehouse_path"] = warehouse_path_check(layout.warehouse_root)
+    checks["warehouse_readable"] = warehouse_readable_check(layout.warehouse_root)
+    checks["warehouse_writable"] = warehouse_writable_check(layout.warehouse_root)
+    checks["writer_lock"] = writer_lock_status_check(layout.writer_lock)
+    checks["latest_snapshot"] = latest_snapshot_check(layout.snapshots)
+    checks["disk_free"] = disk_free_check(layout.root, minimum_free_gb=2.0)
+    checks["storage_growth"] = storage_growth_check(
+        warehouse_root=layout.warehouse_root,
+        snapshot_root=layout.snapshots,
+        publications_root=layout.publications,
+        retention_limit=retention,
+    )
+    checks["memory_pressure"] = memory_pressure_check()
     checks["migration_storage_version"] = migration_storage_version_check()
     checks["collector"] = collector_status_placeholder_check()
     checks["checkpoint"] = checkpoint_status_placeholder_check()

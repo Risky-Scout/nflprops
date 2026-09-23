@@ -18,6 +18,13 @@ name: Wizard Read-Only Probe (BLOCK 2B foundation)
 # branch policy is deliberately changed by whoever administers it) --
 # BLOCK 2B does not do either on its own authority.
 #
+# RESULT: real probe output was obtained once via a temporary push trigger
+# (eb0de38, reverted in dc9db13). Measured: 1 CPU, 1.9 GiB RAM (~1.4 GiB
+# available), 496 MiB swap effectively fully used, ~11 GB free of 49 GB
+# (79% used); wizard-deploy can write only /home/wizard-deploy. Decision
+# and the resulting /home/wizard-deploy/nflprops layout: see "BLOCK 2B
+# final report" in docs/PLATFORM_AUTOMATION.md.
+#
 # Every remote command below is read-only: uname/nproc/free/swapon/df/ls/
 # du/systemctl list-units/ss. It never installs a package, never creates
 # or starts a system service, never restarts anything, never touches

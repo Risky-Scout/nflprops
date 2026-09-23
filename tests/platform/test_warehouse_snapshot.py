@@ -258,3 +258,92 @@ def test_verify_live_warehouse_reports_unhealthy_for_corrupt_parquet(tmp_path: P
     (warehouse_root / "broken.parquet").write_bytes(b"not a parquet file")
     healthy, _detail = verify_live_warehouse(warehouse_root)
     assert healthy is False
+
+
+# ------------------------------------------ bounded retention (BLOCK 2B probe)
+
+
+def test_unchanged_warehouse_never_produces_a_duplicate_snapshot(tmp_path: Path) -> None:
+    warehouse_root = _warehouse_with_data(tmp_path)
+    snapshot_root = tmp_path / "snapshots"
+    first = create_snapshot(
+        warehouse_root=warehouse_root, snapshot_root=snapshot_root,
+        migration_head=MIGRATION_HEAD, hostname="h",
+        created_at=datetime(2026, 9, 20, tzinfo=UTC),
+    )
+    second = create_snapshot(
+        warehouse_root=warehouse_root, snapshot_root=snapshot_root,
+        migration_head=MIGRATION_HEAD, hostname="h",
+        created_at=datetime(2026, 9, 21, tzinfo=UTC),
+    )
+    assert second.snapshot_id == first.snapshot_id
+    assert len(list_snapshots(snapshot_root)) == 1
+    assert not (snapshot_root / "_pending").exists() or not any(
+        (snapshot_root / "_pending").iterdir()
+    )
+
+
+def test_changed_migration_head_is_not_treated_as_a_duplicate(tmp_path: Path) -> None:
+    warehouse_root = _warehouse_with_data(tmp_path)
+    snapshot_root = tmp_path / "snapshots"
+    create_snapshot(
+        warehouse_root=warehouse_root, snapshot_root=snapshot_root,
+        migration_head=MIGRATION_HEAD, hostname="h",
+        created_at=datetime(2026, 9, 20, tzinfo=UTC),
+    )
+    create_snapshot(
+        warehouse_root=warehouse_root, snapshot_root=snapshot_root,
+        migration_head="0010_future", hostname="h",
+        created_at=datetime(2026, 9, 21, tzinfo=UTC),
+    )
+    assert len(list_snapshots(snapshot_root)) == 2
+
+
+def _snapshots_on_distinct_days(tmp_path: Path, count: int) -> tuple[Path, Path]:
+    warehouse_root = _warehouse_with_data(tmp_path)
+    snapshot_root = tmp_path / "snapshots"
+    for day in range(count):
+        pl.DataFrame({"d": [day]}).write_parquet(warehouse_root / "growing.parquet")
+        create_snapshot(
+            warehouse_root=warehouse_root, snapshot_root=snapshot_root,
+            migration_head=MIGRATION_HEAD, hostname="h",
+            created_at=datetime(2026, 9, 1 + day, tzinfo=UTC),
+        )
+    return warehouse_root, snapshot_root
+
+
+def test_prune_snapshots_keeps_only_the_newest(tmp_path: Path) -> None:
+    from nflprops.platform.warehouse_snapshot import prune_snapshots
+
+    _warehouse_root, snapshot_root = _snapshots_on_distinct_days(tmp_path, 4)
+    before = list_snapshots(snapshot_root)
+    pruned = prune_snapshots(snapshot_root, keep=2)
+    after = list_snapshots(snapshot_root)
+    assert pruned == [s.snapshot_id for s in before[:2]]
+    assert [s.snapshot_id for s in after] == [s.snapshot_id for s in before[2:]]
+
+
+def test_prune_snapshots_refuses_to_delete_everything(tmp_path: Path) -> None:
+    from nflprops.platform.warehouse_snapshot import (
+        WarehouseSnapshotError,
+        prune_snapshots,
+    )
+
+    _warehouse_root, snapshot_root = _snapshots_on_distinct_days(tmp_path, 2)
+    with pytest.raises(WarehouseSnapshotError):
+        prune_snapshots(snapshot_root, keep=0)
+    assert len(list_snapshots(snapshot_root)) == 2
+
+
+def test_prune_snapshots_fails_closed_while_a_writer_holds_the_lock(tmp_path: Path) -> None:
+    from nflprops.platform.warehouse_snapshot import prune_snapshots
+
+    _warehouse_root, snapshot_root = _snapshots_on_distinct_days(tmp_path, 3)
+    holder = WriterLock(default_lock_path(snapshot_root.parent), timeout_seconds=1.0)
+    holder.acquire()
+    try:
+        with pytest.raises(WriterLockTimeoutError):
+            prune_snapshots(snapshot_root, keep=1, lock_timeout_seconds=0.2)
+    finally:
+        holder.release()
+    assert len(list_snapshots(snapshot_root)) == 3
