@@ -65,6 +65,14 @@ storage = [
 orchestration = [
   "prefect>=3,<4",
 ]
+# BLOCK 2B: the lightweight Wizard runtime release venv installs
+# `.[orchestration,runtime]` (deploy/wizard/prepare_release.sh). `runtime`
+# adds only what `nflprops platform health` needs beyond the core
+# dependencies (alembic, to report the migration head) -- no database
+# driver, no object-store client, no training-only challenger packages.
+runtime = [
+  "alembic>=1.13",
+]
 
 [project.scripts]
 nflprops = "nflprops.cli:app"

@@ -288,23 +288,21 @@ def test_deploy_wizard_still_main_only_and_dispatch_only(deploy_wizard_text: str
     assert "refs/heads/main" in deploy_wizard_text
 
 
-def test_deploy_wizard_runtime_unit_install_is_non_interactive_and_optional(
+def test_deploy_wizard_streams_the_prepare_then_activate_scripts(
+    deploy_wizard_doc: dict,
+) -> None:
+    steps = deploy_wizard_doc["jobs"]["deploy"]["steps"]
+    runs = [s.get("run", "") for s in steps]
+    prepare = next(i for i, r in enumerate(runs) if "prepare_release.sh" in r)
+    activate = next(i for i, r in enumerate(runs) if "activate_release.sh" in r)
+    assert prepare < activate
+
+
+def test_deploy_wizard_health_gate_targets_the_real_runtime_service(
     deploy_wizard_text: str,
 ) -> None:
-    # `sudo -n` (never interactive) with an explicit skip-and-warn path if
-    # unconfigured -- never blocks/hangs the whole deployment on an
-    # unconfirmed permission.
-    assert "sudo -n true" in deploy_wizard_text
-    assert "::warning::" in deploy_wizard_text
-
-
-def test_deploy_wizard_env_file_never_overwritten(deploy_wizard_text: str) -> None:
-    assert 'if [ ! -f "$RELEASE_ROOT/nflprops-runtime.env" ]' in deploy_wizard_text
-
-
-def test_deploy_wizard_health_check_covers_both_services(deploy_wizard_text: str) -> None:
-    assert "nflprops-wizard-web" in deploy_wizard_text
-    assert "nflprops-runtime" in deploy_wizard_text
+    assert "nflprops-wizard-web" not in deploy_wizard_text
+    assert "nflprops-runtime.service" in deploy_wizard_text
 
 
 def test_deploy_wizard_still_never_touches_sibling_deployments(
@@ -386,19 +384,6 @@ def test_runtime_files_use_only_the_probe_approved_root(path: Path) -> None:
 
 def test_deploy_wizard_release_root_is_the_approved_root(deploy_wizard_doc: dict) -> None:
     assert deploy_wizard_doc["env"]["RELEASE_ROOT"] == _APPROVED_ROOT
-
-
-def test_deploy_wizard_creates_the_approved_layout_without_root(
-    deploy_wizard_text: str,
-) -> None:
-    assert "for d in releases state snapshots publications backups logs locks" in (
-        deploy_wizard_text
-    )
-    # Directory creation happens BEFORE (and independent of) the sudo check.
-    assert deploy_wizard_text.index("for d in releases") < deploy_wizard_text.index(
-        "sudo -n true"
-    )
-    assert "sudo install -d" not in deploy_wizard_text
 
 
 def test_transfer_roots_are_under_the_approved_root(transfer_doc: dict) -> None:

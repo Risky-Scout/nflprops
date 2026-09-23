@@ -720,8 +720,38 @@ def coverage() -> None:
         typer.echo(f"{table}: {frame.height} rows")
 
 
+def _running_release_sha() -> str | None:
+    """The deployed release's git SHA: NFLPROPS_RUNTIME_VERSION_SHA if set,
+    else the RELEASE_SHA file deploy/wizard/prepare_release.sh writes into
+    each immutable release directory."""
+    import os
+
+    from nflprops.paths import repository_root
+
+    configured = os.environ.get("NFLPROPS_RUNTIME_VERSION_SHA") or None
+    if configured:
+        return configured
+    root = repository_root()
+    marker = root / "RELEASE_SHA" if root is not None else None
+    if marker is not None and marker.is_file():
+        return marker.read_text().strip() or None
+    return None
+
+
 @platform_app.command("health")
-def platform_health() -> None:
+def platform_health(
+    deploy_gate: bool = typer.Option(
+        False,
+        "--deploy-gate",
+        help="Exit status reflects only deployment-critical checks "
+        "(everything except platform.health.DEPLOY_GATE_NONCRITICAL).",
+    ),
+    expect_version: str = typer.Option(
+        "",
+        "--expect-version",
+        help="Require the running release SHA to equal this value (deployment-critical).",
+    ),
+) -> None:
     """Read-only infrastructure health report (JSON). Not a publication
     readiness gate -- see docs/READINESS_2026.md for that.
 
@@ -738,21 +768,23 @@ def platform_health() -> None:
     writer lock beyond a non-blocking probe.
     """
     import json
-    import os
     from pathlib import Path
 
     from nflprops.data.storage.settings import StorageSettings
     from nflprops.platform.health import (
+        DEPLOY_GATE_NONCRITICAL,
         HealthCheck,
         checkpoint_status_placeholder_check,
         collect_platform_health,
         collector_status_placeholder_check,
         database_reachable_check,
+        deploy_gate_passed,
         disk_free_check,
         latest_snapshot_check,
         memory_pressure_check,
         migration_storage_version_check,
         object_store_reachable_check,
+        release_version_check,
         runtime_version_check,
         storage_growth_check,
         warehouse_path_check,
@@ -795,9 +827,10 @@ def platform_health() -> None:
     layout = resolve_runtime_layout(Path(settings.local_warehouse_root))
     retention = snapshot_retention()
 
-    checks["runtime_version"] = runtime_version_check(
-        os.environ.get("NFLPROPS_RUNTIME_VERSION_SHA")
-    )
+    running_sha = _running_release_sha()
+    checks["runtime_version"] = runtime_version_check(running_sha)
+    if expect_version:
+        checks["release_version"] = release_version_check(expect_version, running_sha)
     checks["warehouse_path"] = warehouse_path_check(layout.warehouse_root)
     checks["warehouse_readable"] = warehouse_readable_check(layout.warehouse_root)
     checks["warehouse_writable"] = warehouse_writable_check(layout.warehouse_root)
@@ -816,7 +849,18 @@ def platform_health() -> None:
     checks["checkpoint"] = checkpoint_status_placeholder_check()
 
     report = collect_platform_health(checks)
-    typer.echo(json.dumps(report.as_dict(), indent=2, sort_keys=True))
+    payload = report.as_dict()
+    if deploy_gate:
+        passed = deploy_gate_passed(report)
+        payload["deploy_gate"] = {
+            "passed": passed,
+            "noncritical": sorted(DEPLOY_GATE_NONCRITICAL),
+        }
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        if not passed:
+            raise typer.Exit(1)
+        return
+    typer.echo(json.dumps(payload, indent=2, sort_keys=True))
     if not report.healthy:
         raise typer.Exit(1)
 

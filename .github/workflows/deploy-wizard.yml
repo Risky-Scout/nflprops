@@ -2,27 +2,32 @@ name: Deploy WizardOfOdds (foundation)
 
 # Deployment FOUNDATION only. This workflow is not triggered automatically
 # by any push, and nothing in this change invokes it -- see
-# docs/PLATFORM_AUTOMATION.md. It exists so the atomic release/rollback
-# mechanics can be reviewed before any real SSH/deploy happens.
+# docs/PLATFORM_AUTOMATION.md. Main-only, workflow_dispatch-only.
 #
 # Never touches the existing WNBA deployment, the existing separate NFL
-# game-model deployment, nginx, or DNS: every remote path this workflow
-# writes to is namespaced under RELEASE_ROOT below
-# (/home/wizard-deploy/nflprops -- the isolated runtime root measured and
-# approved by BLOCK 2B's read-only Wizard probe, since wizard-deploy cannot
-# write /var/lib, /var/log, /opt/wizardofodds, or /etc), dedicated to this
-# service only. Never /home/wizard-deploy/nfl-production-2026 or
-# /var/www/sportsodds.
+# game-model deployment, any other systemd service, nginx, or DNS: every
+# remote path this workflow writes to is under RELEASE_ROOT
+# (/home/wizard-deploy/nflprops -- the isolated runtime root approved by
+# BLOCK 2B's Wizard probe). Never /home/wizard-deploy/nfl-production-2026
+# or /var/www/sportsodds.
 #
-# BLOCK 2B additive foundation (docs/PLATFORM_AUTOMATION.md): after the
-# existing atomic release swap, also installs/updates the
-# nflprops-runtime systemd unit from this same release and verifies it,
-# rolling back the release symlink (as before) if EITHER service fails
-# its post-deploy health check. Still does not start continuous
-# collection -- the installed unit's placeholder ExecStart is a one-shot
-# health report; activating continuous collection is Block 3's decision.
-# Still main-only, still workflow_dispatch-only, still not invoked by
-# anything in this change.
+# BLOCK 2B release contract (deploy/wizard/*.sh, streamed over SSH):
+#   1. upload the release archive to releases/<release-id>.tar.gz
+#   2. prepare_release.sh -- entirely BEFORE activation: extract into the
+#      immutable releases/<release-id>/, build ITS OWN .venv
+#      (`.[orchestration,runtime]`), and run the pre-activation checks from
+#      that venv. Any failure deletes the partial release; `current` is
+#      never touched.
+#   3. activate_release.sh -- atomically switch `current`, restart
+#      nflprops-runtime.service, require it ACTIVE, require the versioned
+#      deploy-gate health from current/.venv to PASS. On failure: restore
+#      the previous `current`, restart, re-verify health, and FAIL the
+#      workflow either way (hard fail if the rollback itself fails).
+# No step masks a failure. Does not start continuous collection -- the
+# unit's ExecStart is the read-only health gate; collection is Block 3.
+#
+# Requires the one-time root setup first (unit installed + scoped sudoers
+# rule); until then, prepare_release.sh's preflight fails closed.
 
 on:
   workflow_dispatch:
@@ -91,101 +96,60 @@ jobs:
           printf '%s\n' "${{ secrets.WIZARD_SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
+      - name: Resolve release identity
+        run: |
+          RELEASE_SHA="$(git rev-parse HEAD)"
+          {
+            echo "RELEASE_SHA=$RELEASE_SHA"
+            echo "RELEASE_ID=$RELEASE_SHA-${{ github.run_id }}-${{ github.run_attempt }}"
+            echo "UNIT_SHA256=$(sha256sum deploy/systemd/nflprops-runtime.service | cut -d' ' -f1)"
+          } >> "$GITHUB_ENV"
+
       - name: Build release archive
         run: |
-          tar --exclude='.git' -czf "$RUNNER_TEMP/release.tar.gz" .
+          tar --exclude='.git' --exclude='.venv' -czf "$RUNNER_TEMP/release.tar.gz" .
 
-      - name: Atomic release (upload, extract, switch symlink, prune)
-        env:
-          SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
-        run: |
-          RELEASE_DIR="$RELEASE_ROOT/releases/${{ inputs.release_ref }}"
-          REMOTE="${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}"
-
-          # Namespaced entirely under $RELEASE_ROOT: never touches any
-          # other service's deployment path, nginx, or DNS.
-          # shellcheck disable=SC2086
-          ssh $SSH_OPTS "$REMOTE" "mkdir -p '$RELEASE_DIR'"
-          # shellcheck disable=SC2086
-          scp $SSH_OPTS "$RUNNER_TEMP/release.tar.gz" "$REMOTE:$RELEASE_DIR/release.tar.gz"
-          # shellcheck disable=SC2086
-          ssh $SSH_OPTS "$REMOTE" bash -s <<REMOTE_SCRIPT
-            set -euo pipefail
-            RELEASE_DIR="$RELEASE_DIR"
-            # The probe-approved isolated layout -- created as wizard-deploy,
-            # no root needed. Never touches anything outside $RELEASE_ROOT.
-            for d in releases state snapshots publications backups logs locks; do
-              install -d -m 750 "$RELEASE_ROOT/\$d"
-            done
-            PREVIOUS="\$(readlink -f "$RELEASE_ROOT/current" || true)"
-            echo "\$PREVIOUS" > "$RELEASE_ROOT/previous_release" || true
-
-            tar -xzf "\$RELEASE_DIR/release.tar.gz" -C "\$RELEASE_DIR"
-            rm -f "\$RELEASE_DIR/release.tar.gz"
-
-            # Atomic switch: symlink flip, never an in-place overwrite of
-            # the currently-served tree.
-            ln -sfn "\$RELEASE_DIR" "$RELEASE_ROOT/current.new"
-            mv -T "$RELEASE_ROOT/current.new" "$RELEASE_ROOT/current"
-
-            # Keep the last 3 releases for rollback (bounded disk: ~11 GB
-            # free at probe time); nothing outside $RELEASE_ROOT/releases
-            # is ever pruned.
-            cd "$RELEASE_ROOT/releases"
-            ls -1t | tail -n +4 | xargs -r rm -rf --
-
-            # The env file is created ONLY if absent -- never overwritten,
-            # so a real deployment's secrets/config are never clobbered.
-            if [ ! -f "$RELEASE_ROOT/nflprops-runtime.env" ]; then
-              install -m 600 "$RELEASE_ROOT/current/deploy/systemd/nflprops-runtime.env.example" \
-                "$RELEASE_ROOT/nflprops-runtime.env"
-            fi
-          REMOTE_SCRIPT
-
-      - name: Install/update the nflprops-runtime systemd unit (BLOCK 2B foundation)
+      - name: Upload release archive
         env:
           SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
         run: |
           REMOTE="${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}"
-          # Installing the unit into /etc/systemd/system is the ONLY step
-          # that needs root (the probe confirmed wizard-deploy cannot write
-          # /etc). It requires passwordless `sudo` for the deploy user,
-          # scoped to exactly these commands -- a one-time root setup that
-          # is acceptable later but not yet configured. Uses `sudo -n`
-          # (never interactive) so an unconfigured host fails fast with a
-          # clear message instead of hanging the workflow; a skip here does
-          # NOT roll back the already-succeeded release -- installing this
-          # unit is additive.
+          # shellcheck disable=SC2086,SC2029
+          ssh $SSH_OPTS "$REMOTE" "install -d -m 750 '$RELEASE_ROOT' '$RELEASE_ROOT/releases'"
           # shellcheck disable=SC2086
-          ssh $SSH_OPTS "$REMOTE" bash -s <<REMOTE_SCRIPT
-            set -euo pipefail
-            if ! sudo -n true 2>/dev/null; then
-              echo "::warning::passwordless sudo is not configured for this deploy user -- skipping systemd unit install. Install deploy/systemd/nflprops-runtime.service manually (see its own header for the one-time root setup)."
-              exit 0
-            fi
-            sudo install -m 644 "$RELEASE_ROOT/current/deploy/systemd/nflprops-runtime.service" \
-              /etc/systemd/system/nflprops-runtime.service
-            sudo systemctl daemon-reload
-            sudo systemctl enable nflprops-runtime
-            sudo systemctl restart nflprops-runtime
-          REMOTE_SCRIPT
+          scp $SSH_OPTS "$RUNNER_TEMP/release.tar.gz" "$REMOTE:$RELEASE_ROOT/releases/$RELEASE_ID.tar.gz"
 
-      - name: Post-deploy health check (rollback on failure)
+      - name: Prepare release (own .venv + pre-activation checks; current untouched)
         env:
           SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
         run: |
           REMOTE="${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}"
           # shellcheck disable=SC2086
-          if ! ssh $SSH_OPTS "$REMOTE" "systemctl is-active --quiet nflprops-wizard-web 2>/dev/null || true"; then
-            echo "::error::post-deploy health check failed (nflprops-wizard-web) -- rolling back"
-            # shellcheck disable=SC2086
-            ssh $SSH_OPTS "$REMOTE" bash -s <<REMOTE_SCRIPT
-              set -euo pipefail
-              PREVIOUS="\$(cat "$RELEASE_ROOT/previous_release" 2>/dev/null || true)"
-              if [ -n "\$PREVIOUS" ] && [ -d "\$PREVIOUS" ]; then
-                ln -sfn "\$PREVIOUS" "$RELEASE_ROOT/current.new"
-                mv -T "$RELEASE_ROOT/current.new" "$RELEASE_ROOT/current"
-              fi
-          REMOTE_SCRIPT
-            exit 1
-          fi
+          ssh $SSH_OPTS "$REMOTE" bash -s -- \
+            "$RELEASE_ROOT" "$RELEASE_ID" "$RELEASE_SHA" "$UNIT_SHA256" \
+            < deploy/wizard/prepare_release.sh
+
+      - name: Activate + runtime health gate (rollback on failure)
+        env:
+          SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+        run: |
+          REMOTE="${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}"
+          set +e
+          # shellcheck disable=SC2086
+          ssh $SSH_OPTS "$REMOTE" bash -s -- \
+            "$RELEASE_ROOT" "$RELEASE_ID" "$RELEASE_SHA" \
+            < deploy/wizard/activate_release.sh
+          STATUS=$?
+          set -e
+          case "$STATUS" in
+            0) echo "DEPLOYED: $RELEASE_ID" ;;
+            1) echo "::error::DEPLOYMENT FAILED: $RELEASE_ID failed its runtime health gate; rolled back to the previous release (rollback health verified)" ;;
+            2) echo "::error::HARD FAIL: $RELEASE_ID failed AND the rollback failed its health gate -- manual intervention required" ;;
+            3) echo "::error::HARD FAIL: $RELEASE_ID failed and there is no previous release to roll back to" ;;
+            *) echo "::error::DEPLOYMENT FAILED: activation refused or errored (status $STATUS); see log" ;;
+          esac
+          exit "$STATUS"
+
+      - name: Cleanup SSH material
+        if: always()
+        run: rm -f ~/.ssh/wizard_deploy_key ~/.ssh/known_hosts

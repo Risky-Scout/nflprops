@@ -233,17 +233,75 @@ as the existing `wizard-deploy` SSH user, absolute paths throughout,
 `deploy/systemd/nflprops-runtime.env.example`), `Restart=on-failure` with
 a bounded `RestartSec`/`StartLimitBurst`, and hard lightweight-runtime
 caps (`MemoryHigh=384M`, `MemoryMax=512M`, `MemorySwapMax=0`,
-`TasksMax=16`, `CPUQuota=50%`). Its
-placeholder `ExecStart` (`Type=oneshot`) only runs `nflprops platform
-health` -- continuous collection/checkpointing is a Block 3 decision, not
-started here. `deploy-wizard.yml` additively installs/updates this unit
-(creating the directory layout itself as `wizard-deploy`, no root; only
-the `/etc/systemd/system` unit install uses non-interactive `sudo -n`,
-skipping with a warning rather than hanging if passwordless sudo isn't
-configured) and extends its post-deploy
-health check/rollback to cover both `nflprops-wizard-web` and
-`nflprops-runtime` -- still main-only, still `workflow_dispatch`-only,
-still not invoked by anything in this change.
+`TasksMax=16`, `CPUQuota=50%`). Its placeholder `ExecStart`
+(`Type=oneshot`) is
+`/home/wizard-deploy/nflprops/current/.venv/bin/python -m nflprops.cli
+platform health --deploy-gate`, the read-only health gate and nothing
+else. Continuous collection/checkpointing is a Block 3 decision and is
+not started here. The unit is installed once by root (see "One-time root
+setup" below); `deploy-wizard.yml` never writes `/etc` and never uses
+root beyond the scoped `sudo -n systemctl restart
+nflprops-runtime.service`.
+
+**Release contract** (`deploy-wizard.yml` + `deploy/wizard/*.sh`,
+streamed over SSH, main-only, `workflow_dispatch`-only, not invoked by
+anything yet):
+
+1. Upload the archive to `releases/<release-id>.tar.gz`, where
+   `<release-id>` is `<sha>-<run_id>-<run_attempt>`, unique per deploy.
+2. `prepare_release.sh` runs entirely **before** activation:
+   - Preflight: Python ≥ 3.11 with `venv`, the installed unit matches
+     this release's unit file byte for byte (SHA-256), the scoped sudo
+     rule exists, and ≥ 3 GiB is free.
+   - Extract into the immutable `releases/<release-id>/` and write
+     `RELEASE_SHA`.
+   - Build that release's **own** `.venv` and install
+     `-e .[orchestration,runtime]`. The core dependencies plus Prefect and
+     alembic only; no `challenger` (lightgbm/shap), no database driver,
+     no object-store client.
+   - Run the pre-activation checks from the candidate venv: `import
+     nflprops`, `platform health --help`, `wizard_runtime --help`,
+     `wizard_runtime snapshot --help`, a read-only `snapshot list`, and
+     `platform health --deploy-gate --expect-version <sha>`.
+   - Mark the release `.prepared`. Any failure deletes the partial
+     release, and `current` is never touched.
+3. `activate_release.sh` refuses a release that is not `.prepared`. It
+   then switches `current` atomically (a new symlink plus `rename(2)`)
+   and runs the **health gate**:
+   - `sudo -n systemctl restart nflprops-runtime.service`
+   - `systemctl is-active nflprops-runtime.service`
+   - `current/.venv/bin/python -m nflprops.cli platform health
+     --deploy-gate --expect-version <sha>`
+
+   All three must pass. On failure it restores the previous `current`,
+   restarts the service on it, and runs the same gate against the
+   previous SHA. The exit status is always propagated:
+   - 0: deployed
+   - 1: rolled back, with rollback health verified (the workflow fails)
+   - 2: **rollback failed** (hard fail)
+   - 3: first deploy failed with no previous release, and `current` was
+     removed (hard fail)
+   - 4: refused before switching
+
+   On success, only the active release and its rollback target are kept.
+   Nothing in the deploy path uses `|| true`, and nothing references
+   `nflprops-wizard-web` (no such service exists).
+
+**Deploy gate.** `platform health --deploy-gate` bases its exit status on
+every check except `latest_snapshot`. No snapshot exists until Block 3's
+checkpointing starts, but the check is still reported.
+`--expect-version` adds a critical `release_version` check. The running
+SHA comes from `<release>/RELEASE_SHA` unless
+`NFLPROPS_RUNTIME_VERSION_SHA` overrides it, so leave that variable unset
+in the env file.
+
+**Measured locally (not on Wizard):** I ran a real `prepare_release.sh`
+followed by `activate_release.sh` against a scratch runtime root, with a
+real venv, a real `pip install`, the real health gate and only systemctl
+faked. Both succeeded. The venv took **~894 MiB** and about 50 s to
+install. With two releases kept, venvs use ~1.8 GiB of the ~11 GB free.
+This must be re-measured on the Wizard host during the first real
+deploy.
 
 **Extended health CLI** (`nflprops platform health`): now also reports
 runtime version/SHA, warehouse path, warehouse readable/writable, writer
@@ -260,9 +318,11 @@ merely being asked.
 
 ## BLOCK 2B final report: measured Wizard probe
 
-`wizard-probe.yml` was run once against the real host through a
-temporary push trigger (`eb0de38`, reverted in `dc9db13`). The results
-are below.
+The measurements below were supplied by the operator from a read-only
+probe of the real host. The GitHub-hosted attempt through a temporary
+push trigger (`eb0de38`, reverted in `dc9db13`; run 35765851043) was
+**rejected** by the `wizardofodds.com` environment's branch protection
+before it connected, so these figures do not come from that run.
 
 **Measured resources**
 
@@ -296,7 +356,7 @@ other workload:
 ```
 /home/wizard-deploy/nflprops/
     current/        -> releases/<sha> (atomic symlink flip)
-    releases/       last 3 release trees
+    releases/       <sha>-<run>-<attempt>/ with its own .venv; active + previous kept
     state/          NFLPROPS_DATA_ROOT=state/warehouse (+ state/nflprops.duckdb)
     snapshots/      immutable warehouse snapshots, bounded retention
     publications/   immutable GitHub result bundles
@@ -329,7 +389,8 @@ overlaps `/home/wizard-deploy/nfl-production-2026` or
   writer lock, and `snapshot prune` enforces it on demand.
 - If the warehouse files and migration head have not changed since the
   latest snapshot, no duplicate snapshot is written.
-- Release retention drops from 5 to 3.
+- Release retention drops from 5 to 2: the active release and its
+  rollback target. Each release carries its own ~894 MiB venv.
 - The `storage_growth` health check reports live DuckDB/Parquet size,
   snapshot count and size against retention, publication size, and
   measured growth between the oldest and newest retained snapshot. It
@@ -352,21 +413,60 @@ could never pass on the locked architecture.
 **Not done in BLOCK 2B (by design)**
 - No deploy was dispatched, no production collection was started, and
   nothing was installed on the host.
-- The one-time root setup (copying the unit into `/etc/systemd/system`,
-  `daemon-reload`, `enable`) is acceptable later. It is the only step
-  that needs root, since the directories are created as `wizard-deploy`.
+- The one-time root setup (below) has not been run.
 - Block 3 has not started. `main` was not merged.
 
-**Known gaps before the first real `deploy-wizard.yml` dispatch**
-(pre-existing and unchanged here):
-- The release step never builds `current/.venv`, but the unit's
-  `ExecStart` and the transfer workflow's `WIZARD_RELEASE_PYTHON` both
-  expect it.
-- The post-deploy health step checks only `nflprops-wizard-web`, a
-  service the probe found does not exist. It also ends in `|| true`, so
-  it can never trigger a rollback. It should run
-  `current/.venv/bin/nflprops platform health` against the installed
-  runtime instead.
+**Previously known deploy blockers, now fixed in the closeout**
+- Each release now builds its own `.venv` before activation (step 2
+  above).
+- The deploy health check no longer targets the nonexistent
+  `nflprops-wizard-web` or ends in `|| true`. The gate is the real
+  `nflprops-runtime.service` plus the versioned deploy-gate health, with
+  verified rollback.
+
+## One-time root setup (Block 3; NOT performed in BLOCK 2B)
+
+GitHub's SSH user (`wizard-deploy`) has no root, and the deploy workflow
+never asks for it. Until an operator with root runs the steps below,
+`prepare_release.sh`'s preflight fails closed ("not installed" or
+"sudoers"). All production files and state stay under
+`/home/wizard-deploy/nflprops/`. Root owns only the unit file and one
+sudoers line.
+
+The installed unit must match the unit file of the release being deployed
+**byte for byte**, because prepare checks its SHA-256. Copy it from the
+exact commit you will deploy:
+
+```bash
+# 1. From a checkout of the SHA to be deployed, as wizard-deploy (no root):
+scp -P "$WIZARD_SSH_PORT" deploy/systemd/nflprops-runtime.service \
+  wizard-deploy@"$WIZARD_SSH_HOST":/home/wizard-deploy/nflprops-runtime.service.pending
+
+# 2. On the Wizard host, as an administrator with root:
+sudo install -m 644 -o root -g root \
+  /home/wizard-deploy/nflprops-runtime.service.pending \
+  /etc/systemd/system/nflprops-runtime.service
+sudo systemctl daemon-reload
+
+# Scoped rule: wizard-deploy may restart ONLY this unit, nothing else.
+echo 'wizard-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart nflprops-runtime.service' \
+  | sudo tee /etc/sudoers.d/nflprops-runtime >/dev/null
+sudo chmod 440 /etc/sudoers.d/nflprops-runtime
+sudo visudo -cf /etc/sudoers.d/nflprops-runtime
+
+# 3. Verify, as wizard-deploy (must list the command, no password prompt):
+sudo -n -l /usr/bin/systemctl restart nflprops-runtime.service
+rm /home/wizard-deploy/nflprops-runtime.service.pending
+
+# 4. Only AFTER the first successful deploy-wizard.yml run (so `current`
+#    exists), enable start-at-boot:
+sudo systemctl enable nflprops-runtime.service
+```
+
+Any later change to `deploy/systemd/nflprops-runtime.service` needs step
+2's `install` and `daemon-reload` again. Until then, deploys fail closed
+with "installed nflprops-runtime.service differs". The sudoers rule
+never needs to change.
 
 ## EXTERNAL_PROVISIONING_STILL_REQUIRED
 
@@ -389,10 +489,9 @@ could never pass on the locked architecture.
   probe. `wizard-deploy` cannot write `/var/lib`, `/var/log`,
   `/opt/wizardofodds`, or `/etc`, so every nflprops path moved to
   `/home/wizard-deploy/nflprops/`, which it can write without root.
-- One-time root setup on the Wizard host (acceptable later, not yet
-  done): install `deploy/systemd/nflprops-runtime.service` into
-  `/etc/systemd/system`, then run `daemon-reload` and `enable`, or grant
-  a `sudo -n` rule scoped to exactly those commands.
+- One-time root setup on the Wizard host (Block 3, not yet done). See
+  "One-time root setup" above for the exact commands: the unit file plus
+  one scoped sudoers line.
 - Once Platform and Science are integrated onto the same commit: the real
   `nflprops.calibration.phase10c3a_runner` (or whatever the finalized
   entry point is named) must accept the keyword arguments

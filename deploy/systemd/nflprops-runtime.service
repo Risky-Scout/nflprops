@@ -44,12 +44,18 @@
 #   - Secrets/environment live ONLY in the env file above, never in this
 #     unit file (which is often world-readable)
 #
-# One-time root setup (acceptable later, NOT run by anything in BLOCK 2B;
-# the directories themselves need no root -- deploy-wizard.yml creates
-# them as wizard-deploy):
-#   sudo cp deploy/systemd/nflprops-runtime.service /etc/systemd/system/
-#   sudo systemctl daemon-reload
-#   sudo systemctl enable nflprops-runtime
+# Executable: the ACTIVE release's own venv, via the `current` symlink --
+# /home/wizard-deploy/nflprops/current/.venv/bin/python, built per release
+# by deploy/wizard/prepare_release.sh. ExecStart may ONLY run the read-only
+# deployment health gate: never training, historical replay, the 20k-draw
+# simulation, or calibration optimization -- that heavy work stays on
+# GitHub Actions (enforced by tests/platform/test_wizard_deploy_release.py).
+#
+# One-time root setup (Block 3; NOT run by anything in BLOCK 2B, never by
+# GitHub, which has no root): see "One-time root setup" in
+# docs/PLATFORM_AUTOMATION.md for the exact commands -- install this unit
+# and a sudoers drop-in allowing wizard-deploy ONLY
+# `/usr/bin/systemctl restart nflprops-runtime.service`.
 
 [Unit]
 Description=NFL Props Wizard Runtime (BLOCK 2B foundation)
@@ -71,7 +77,7 @@ User=wizard-deploy
 Group=wizard-deploy
 WorkingDirectory=/home/wizard-deploy/nflprops/current
 EnvironmentFile=/home/wizard-deploy/nflprops/nflprops-runtime.env
-ExecStart=/home/wizard-deploy/nflprops/current/.venv/bin/nflprops platform health
+ExecStart=/home/wizard-deploy/nflprops/current/.venv/bin/python -m nflprops.cli platform health --deploy-gate
 # Bounded restart-on-failure: if the placeholder health check itself
 # reports unhealthy (exit 1), retry with a fixed delay rather than
 # hammering the host or giving up silently -- capped by the [Unit]

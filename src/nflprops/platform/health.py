@@ -127,6 +127,32 @@ def runtime_version_check(version_sha: str | None) -> HealthCheck:
     return _check
 
 
+#: Checks EXCLUDED from the deployment-critical gate
+#: (`nflprops platform health --deploy-gate`). `latest_snapshot` is
+#: legitimately unhealthy until the first snapshot exists (snapshots begin
+#: with Block 3's checkpointing), so it is still reported but cannot block
+#: a release. Every other check is deployment-critical.
+DEPLOY_GATE_NONCRITICAL: frozenset[str] = frozenset({"latest_snapshot"})
+
+
+def deploy_gate_passed(report: PlatformHealthReport) -> bool:
+    return all(
+        c.healthy for c in report.checks if c.name not in DEPLOY_GATE_NONCRITICAL
+    )
+
+
+def release_version_check(expected_sha: str, actual_sha: str | None) -> HealthCheck:
+    """Deployment-critical: the health command actually running is the
+    release the deploy workflow just activated (or rolled back to)."""
+
+    def _check() -> tuple[bool, str | None]:
+        if actual_sha == expected_sha:
+            return True, actual_sha
+        return False, f"expected release {expected_sha}, running {actual_sha or 'unknown'}"
+
+    return _check
+
+
 def warehouse_path_check(warehouse_root: Any) -> HealthCheck:
     """Purely informational -- the configured warehouse path, reported
     alongside (not instead of) `warehouse_readable_check`'s pass/fail."""
@@ -431,11 +457,14 @@ def migration_storage_version_check() -> HealthCheck:
 
     def _check() -> tuple[bool, str | None]:
         import subprocess
+        import sys
 
         from nflprops.paths import repository_root
 
+        # `sys.executable -m alembic`, never a bare `alembic` on PATH: under
+        # systemd the release venv's bin/ is not on PATH.
         result = subprocess.run(
-            ["alembic", "heads"],
+            [sys.executable, "-m", "alembic", "heads"],
             cwd=str(repository_root()),
             capture_output=True,
             text=True,
