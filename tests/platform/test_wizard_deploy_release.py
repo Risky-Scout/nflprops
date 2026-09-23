@@ -165,6 +165,12 @@ echo "query $* -> $sha" >> "{log}"
 ! grep -qx "$sha" "{inactive}"
 """,
     )
+    # What deploy-wizard.yml's first-install step leaves behind.
+    env_file = root / "nflprops-runtime.env"
+    env_file.write_text(
+        ENV_EXAMPLE.read_text().replace("BDL_API_KEY=\n", "BDL_API_KEY=test-key\n")
+    )
+    env_file.chmod(0o600)
     env = {
         "PATH": os.environ["PATH"],
         "HOME": str(tmp_path),
@@ -173,6 +179,9 @@ echo "query $* -> $sha" >> "{log}"
         "NFLPROPS_CONTROL_PREFLIGHT": "true",
         "NFLPROPS_SYSTEMCTL_CONTROL": str(control),
         "NFLPROPS_SYSTEMCTL_QUERY": str(query),
+        "NFLPROPS_HEALTH_ATTEMPTS": "4",
+        "NFLPROPS_HEALTH_INTERVAL_SECONDS": "0",
+        "NFLPROPS_HEALTH_REQUIRED_PASSES": "2",
     }
     return Host(root, bin_dir, unit_dir, log, unhealthy, inactive, env)
 
@@ -218,7 +227,9 @@ def test_prepare_runs_every_pre_activation_check_from_the_candidate_venv(host: H
         "-m nflprops.platform.wizard_runtime --help",
         "-m nflprops.platform.wizard_runtime snapshot --help",
         "-m nflprops.platform.wizard_runtime snapshot list",
-        f"-m nflprops.cli platform health --deploy-gate --expect-version {SHA_A}",
+        "-m nflprops.platform.wizard_runtime run --help",
+        "-m nflprops.platform.wizard_runtime status",
+        f"-m nflprops.cli platform health --deploy-gate --pre-activation --expect-version {SHA_A}",
     ]
     assert calls[-len(expected):] == expected
     assert all(line.startswith(f"python {SHA_A} ") for line in host.log_lines())
@@ -286,17 +297,29 @@ def test_prepare_refuses_to_overwrite_an_existing_release(host: Host) -> None:
     assert (host.release_dir(SHA_A) / ".prepared").is_file()  # untouched
 
 
-def test_prepare_never_overwrites_an_existing_env_file(host: Host) -> None:
+def test_prepare_never_modifies_the_existing_env_file(host: Host) -> None:
     env_file = host.root / "nflprops-runtime.env"
-    env_file.write_text("NFLPROPS_ENV=production\nREAL_SECRET=keep-me\n")
+    before = env_file.read_bytes()
     assert host.prepare(SHA_A).returncode == 0
-    assert "keep-me" in env_file.read_text()
+    assert env_file.read_bytes() == before
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
 
 
-def test_prepare_creates_env_file_owner_only(host: Host) -> None:
-    assert host.prepare(SHA_A).returncode == 0
-    mode = stat.S_IMODE((host.root / "nflprops-runtime.env").stat().st_mode)
-    assert mode == 0o600
+def test_prepare_refuses_a_missing_env_file_and_never_creates_one(host: Host) -> None:
+    env_file = host.root / "nflprops-runtime.env"
+    env_file.unlink()
+    result = host.prepare(SHA_A)
+    assert result.returncode != 0
+    assert "is missing" in result.stderr
+    assert not env_file.exists()  # never a template with an empty credential
+    assert not host.release_dir(SHA_A).exists()
+
+
+def test_prepare_refuses_an_env_file_readable_by_others(host: Host) -> None:
+    (host.root / "nflprops-runtime.env").chmod(0o644)
+    result = host.prepare(SHA_A)
+    assert result.returncode != 0
+    assert "mode 600" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -322,9 +345,26 @@ def test_first_deploy_activates_after_the_health_gate(host: Host) -> None:
     log = host.log_lines()
     assert f"control restart nflprops-runtime.service -> {SHA_A}" in log
     assert f"query is-active --quiet nflprops-runtime.service -> {SHA_A}" in log
-    assert log[-1] == (
-        f"python {SHA_A} -m nflprops.cli platform health --deploy-gate --expect-version {SHA_A}"
+    gate = f"python {SHA_A} -m nflprops.cli platform health --deploy-gate --expect-version {SHA_A}"
+    assert log[-1] == gate
+    assert log.count(gate) == 2  # two consecutive passing probes required
+
+
+def test_health_gate_needs_consecutive_passes_not_one_lucky_probe(host: Host) -> None:
+    assert host.prepare(SHA_A).returncode == 0
+    flaky = host.root.parent / "probe-count"
+    python = host.release_dir(SHA_A) / ".venv" / "bin" / "python"
+    python.write_text(
+        python.read_text().replace(
+            '*"platform health --deploy-gate"*) ! grep -qx "$sha" "',
+            f'*"platform health --deploy-gate"*) n=$(( $(cat "{flaky}" 2>/dev/null || echo 0) + 1 )); '
+            f'echo $n > "{flaky}"; [ $((n % 2)) -eq 1 ] && ! grep -qx "$sha" "',
+        )
     )
+    result = host.activate(SHA_A)
+    # pass/fail alternates: never two in a row -> gate fails -> hard fail
+    assert result.returncode == 3, result.stdout + result.stderr
+    assert host.current is None
 
 
 def test_activation_requires_a_prepared_release(host: Host) -> None:
@@ -401,7 +441,9 @@ def test_failed_first_deploy_is_a_hard_fail_with_no_current(host: Host) -> None:
 
 # ============================================================ static contract
 
-_DEPLOY_FILES = [PREPARE, ACTIVATE, DEPLOY_WIZARD]
+OPS = REPO_ROOT / "deploy" / "wizard" / "ops.sh"
+WIZARD_OPS = REPO_ROOT / ".github" / "workflows" / "wizard-ops.yml"
+_DEPLOY_FILES = [PREPARE, ACTIVATE, DEPLOY_WIZARD, OPS, WIZARD_OPS]
 
 
 def _code_lines(path: Path) -> list[str]:
@@ -442,6 +484,26 @@ def test_workflow_never_sets_the_script_test_hooks() -> None:
 
 def test_workflow_has_no_root_or_sudo_steps() -> None:
     assert "sudo" not in "\n".join(_code_lines(DEPLOY_WIZARD))
+    assert "sudo" not in "\n".join(_code_lines(WIZARD_OPS))
+
+
+def test_ops_only_privileged_action_is_the_scoped_runtime_restart() -> None:
+    sudo_lines = [line for line in _code_lines(OPS) if "sudo" in line]
+    assert sudo_lines == [
+        '  sudo -n /usr/bin/systemctl restart "$UNIT" || die "restart $UNIT failed"'
+    ]
+    assert "UNIT=nflprops-runtime.service" in OPS.read_text()
+
+
+def test_ops_workflow_is_main_only_fixed_menu() -> None:
+    doc = yaml.safe_load(WIZARD_OPS.read_text())
+    assert set(doc[True]) == {"workflow_dispatch"}
+    options = doc[True]["workflow_dispatch"]["inputs"]["operation"]["options"]
+    assert options == [
+        "status", "report", "collect-once", "manual-checkpoint", "verify-snapshot", "restart",
+    ]
+    assert "refs/heads/main" in WIZARD_OPS.read_text()
+    assert doc["jobs"]["ops"]["environment"] == "wizardofodds.com"
 
 
 def test_scripts_only_ever_control_the_nflprops_runtime_unit() -> None:
@@ -466,7 +528,11 @@ def test_deploy_path_never_touches_unrelated_workloads(path: Path) -> None:
     for unrelated in ("nfl-production-2026", "sportsodds"):
         for line in code.splitlines():
             if unrelated in line:
-                # the only permitted mention is prepare's refusal pattern
+                if path == OPS:
+                    # read-only `stat` reporting only (never written)
+                    assert line.strip().startswith("for p in /home/wizard-deploy/nfl-production-2026")
+                    continue
+                # otherwise the only permitted mention is prepare's refusal pattern
                 assert path == PREPARE and "overlaps an unrelated workload" in code
                 assert line.strip().startswith(("/home/wizard-deploy/nfl-production-2026*",))
 
@@ -516,11 +582,21 @@ def test_systemd_unit_paths_are_consistent_with_the_release_layout() -> None:
     assert _unit_value("ExecStart").split()[0] == f"{APPROVED_ROOT}/current/.venv/bin/python"
 
 
-def test_systemd_unit_can_only_run_the_read_only_health_gate() -> None:
+def test_systemd_unit_can_only_run_the_lightweight_runtime() -> None:
     assert _unit_value("ExecStart") == (
-        f"{APPROVED_ROOT}/current/.venv/bin/python -m nflprops.cli platform health --deploy-gate"
+        f"{APPROVED_ROOT}/current/.venv/bin/python -m nflprops.platform.wizard_runtime run"
     )
     assert len(re.findall(r"^Exec", RUNTIME_UNIT.read_text(), re.MULTILINE)) == 1
+
+
+def test_systemd_unit_is_a_long_running_service_with_bounded_restarts() -> None:
+    assert _unit_value("Type") == "simple"
+    assert "RemainAfterExit" not in "\n".join(_code_lines(RUNTIME_UNIT))
+    assert _unit_value("Restart") == "on-failure"
+    assert int(_unit_value("RestartSec")) >= 10
+    assert int(_unit_value("StartLimitBurst")) <= 5
+    assert _unit_value("KillSignal") == "SIGTERM"
+    assert int(_unit_value("TimeoutStopSec")) >= 60
 
 
 def test_systemd_unit_keeps_the_lightweight_limits() -> None:

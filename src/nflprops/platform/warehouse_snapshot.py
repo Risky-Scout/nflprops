@@ -244,17 +244,24 @@ def prune_snapshots(
     snapshot_root: Path,
     *,
     keep: int,
+    protected: frozenset[str] = frozenset(),
     lock_path: Path | None = None,
     lock_timeout_seconds: float = DEFAULT_SNAPSHOT_LOCK_TIMEOUT_SECONDS,
 ) -> list[str]:
     """Bounded retention: delete all but the newest `keep` snapshots,
     under the writer lock. Returns the pruned snapshot_ids, oldest first.
-    Refuses `keep < 1` -- the latest snapshot is never pruned."""
+    Refuses `keep < 1` -- the latest snapshot is never pruned.
+
+    `protected` snapshot_ids (those a checkpoint request still pending
+    GitHub execution references -- `nflprops.platform.checkpoint_prepare`)
+    are never pruned and do not count against `keep`."""
     if keep < 1:
         raise WarehouseSnapshotError("prune_snapshots requires keep >= 1")
     resolved_lock_path = lock_path or default_lock_path(snapshot_root.parent)
     with WriterLock(resolved_lock_path, timeout_seconds=lock_timeout_seconds):
-        snapshots = list_snapshots(snapshot_root)
+        snapshots = [
+            s for s in list_snapshots(snapshot_root) if s.snapshot_id not in protected
+        ]
         doomed = snapshots[:-keep] if len(snapshots) > keep else []
         for info in doomed:
             shutil.rmtree(snapshot_root / info.snapshot_id)

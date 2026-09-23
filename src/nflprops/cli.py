@@ -45,6 +45,15 @@ app.add_typer(checkpoint_app, name="checkpoint")
 app.add_typer(platform_app, name="platform")
 
 
+def _mount_wizard_runtime() -> None:
+    from nflprops.platform.wizard_runtime import app as wizard_runtime_app
+
+    app.add_typer(wizard_runtime_app, name="wizard-runtime")
+
+
+_mount_wizard_runtime()
+
+
 # --- provider ---------------------------------------------------------------
 @provider_app.command("pin")
 def provider_pin(provider: str, url: str = DEFAULT_SPEC_URL) -> None:
@@ -721,21 +730,9 @@ def coverage() -> None:
 
 
 def _running_release_sha() -> str | None:
-    """The deployed release's git SHA: NFLPROPS_RUNTIME_VERSION_SHA if set,
-    else the RELEASE_SHA file deploy/wizard/prepare_release.sh writes into
-    each immutable release directory."""
-    import os
+    from nflprops.platform.runtime_layout import running_release_sha
 
-    from nflprops.paths import repository_root
-
-    configured = os.environ.get("NFLPROPS_RUNTIME_VERSION_SHA") or None
-    if configured:
-        return configured
-    root = repository_root()
-    marker = root / "RELEASE_SHA" if root is not None else None
-    if marker is not None and marker.is_file():
-        return marker.read_text().strip() or None
-    return None
+    return running_release_sha()
 
 
 @platform_app.command("health")
@@ -750,6 +747,12 @@ def platform_health(
         "",
         "--expect-version",
         help="Require the running release SHA to equal this value (deployment-critical).",
+    ),
+    pre_activation: bool = typer.Option(
+        False,
+        "--pre-activation",
+        help="With --deploy-gate: the candidate release's runtime is not running yet, "
+        "so `runtime_loop` is reported but not gated.",
     ),
 ) -> None:
     """Read-only infrastructure health report (JSON). Not a publication
@@ -768,15 +771,15 @@ def platform_health(
     writer lock beyond a non-blocking probe.
     """
     import json
-    from pathlib import Path
 
     from nflprops.data.storage.settings import StorageSettings
     from nflprops.platform.health import (
         DEPLOY_GATE_NONCRITICAL,
+        PRE_ACTIVATION_NONCRITICAL,
         HealthCheck,
-        checkpoint_status_placeholder_check,
+        clock_sync_check,
         collect_platform_health,
-        collector_status_placeholder_check,
+        collection_freshness_check,
         database_reachable_check,
         deploy_gate_passed,
         disk_free_check,
@@ -784,7 +787,9 @@ def platform_health(
         memory_pressure_check,
         migration_storage_version_check,
         object_store_reachable_check,
+        provider_config_check,
         release_version_check,
+        runtime_loop_check,
         runtime_version_check,
         storage_growth_check,
         warehouse_path_check,
@@ -793,7 +798,7 @@ def platform_health(
         writer_lock_status_check,
     )
     from nflprops.platform.runtime_layout import (
-        resolve_runtime_layout,
+        resolve_layout_from_config,
         snapshot_retention,
     )
 
@@ -820,21 +825,41 @@ def platform_health(
     else:
         checks["object_store"] = lambda: (True, "not configured (optional as of BLOCK 2B)")
 
-    # BLOCK 2B: snapshot/lock/publication paths come from the probe-approved
-    # runtime layout (NFLPROPS_RUNTIME_ROOT, e.g. /home/wizard-deploy/nflprops;
-    # falls back to the warehouse root's parent) -- see
+    # Paths: the warehouse is the collector's own `<run.data_root>/canonical`
+    # (NFLPROPS_DATA_ROOT); snapshot/lock/publication/status paths come from
+    # the probe-approved runtime layout (NFLPROPS_RUNTIME_ROOT) -- see
     # nflprops.platform.runtime_layout.
-    layout = resolve_runtime_layout(Path(settings.local_warehouse_root))
+    from nflprops.config import load as load_config
+
+    cfg = load_config()
+    layout = resolve_layout_from_config(cfg)
     retention = snapshot_retention()
+    requests_path = layout.warehouse_root / "remote_checkpoint_requests.parquet"
+    protected: frozenset[str] = frozenset()
+    if requests_path.is_file():
+        import polars as pl
+
+        pending = pl.read_parquet(requests_path).filter(
+            pl.col("state") == "PENDING_REMOTE_EXECUTION"
+        )
+        protected = frozenset(v for v in pending["snapshot_id"].drop_nulls().to_list() if v)
 
     running_sha = _running_release_sha()
     checks["runtime_version"] = runtime_version_check(running_sha)
     if expect_version:
         checks["release_version"] = release_version_check(expect_version, running_sha)
+    checks["provider_config"] = provider_config_check(
+        str(cfg.get_path("provider.bdl.api_key_env", "BDL_API_KEY"))
+    )
+    checks["clock_sync"] = clock_sync_check()
     checks["warehouse_path"] = warehouse_path_check(layout.warehouse_root)
     checks["warehouse_readable"] = warehouse_readable_check(layout.warehouse_root)
     checks["warehouse_writable"] = warehouse_writable_check(layout.warehouse_root)
     checks["writer_lock"] = writer_lock_status_check(layout.writer_lock)
+    checks["runtime_loop"] = runtime_loop_check(
+        layout.runtime_status, expected_release_sha=expect_version or None
+    )
+    checks["collection_freshness"] = collection_freshness_check(layout.warehouse_root, config=cfg)
     checks["latest_snapshot"] = latest_snapshot_check(layout.snapshots)
     checks["disk_free"] = disk_free_check(layout.root, minimum_free_gb=2.0)
     checks["storage_growth"] = storage_growth_check(
@@ -842,19 +867,23 @@ def platform_health(
         snapshot_root=layout.snapshots,
         publications_root=layout.publications,
         retention_limit=retention,
+        raw_root=layout.raw_root,
+        protected_snapshot_ids=protected,
     )
     checks["memory_pressure"] = memory_pressure_check()
     checks["migration_storage_version"] = migration_storage_version_check()
-    checks["collector"] = collector_status_placeholder_check()
-    checks["checkpoint"] = checkpoint_status_placeholder_check()
 
     report = collect_platform_health(checks)
     payload = report.as_dict()
     if deploy_gate:
-        passed = deploy_gate_passed(report)
+        passed = deploy_gate_passed(report, pre_activation=pre_activation)
+        noncritical = set(DEPLOY_GATE_NONCRITICAL)
+        if pre_activation:
+            noncritical |= PRE_ACTIVATION_NONCRITICAL
         payload["deploy_gate"] = {
             "passed": passed,
-            "noncritical": sorted(DEPLOY_GATE_NONCRITICAL),
+            "pre_activation": pre_activation,
+            "noncritical": sorted(noncritical),
         }
         typer.echo(json.dumps(payload, indent=2, sort_keys=True))
         if not passed:

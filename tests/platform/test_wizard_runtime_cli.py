@@ -18,10 +18,14 @@ runner = CliRunner()
 
 @pytest.fixture()
 def warehouse_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    warehouse_root = tmp_path / "warehouse"
-    warehouse_root.mkdir()
+    # NFLPROPS_DATA_ROOT is the collector's run.data_root; the warehouse
+    # tables live in <data_root>/canonical (nflprops.pipelines.lean).
+    data_root = tmp_path / "data"
+    warehouse_root = data_root / "canonical"
+    warehouse_root.mkdir(parents=True)
     pl.DataFrame({"a": [1, 2, 3]}).write_parquet(warehouse_root / "t.parquet")
-    monkeypatch.setenv("NFLPROPS_DATA_ROOT", str(warehouse_root))
+    monkeypatch.setenv("NFLPROPS_DATA_ROOT", str(data_root))
+    monkeypatch.delenv("NFLPROPS_RUNTIME_ROOT", raising=False)
     monkeypatch.setenv("NFLPROPS_ENV", "development")
     monkeypatch.setenv("NFLPROPS_STORAGE_BACKEND", "duckdb")
     return warehouse_root
@@ -189,10 +193,10 @@ def test_runtime_root_env_places_snapshots_and_lock_under_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime_root = tmp_path / "nflprops"
-    warehouse_root = runtime_root / "state" / "warehouse"
+    warehouse_root = runtime_root / "state" / "canonical"
     warehouse_root.mkdir(parents=True)
     pl.DataFrame({"a": [1]}).write_parquet(warehouse_root / "t.parquet")
-    monkeypatch.setenv("NFLPROPS_DATA_ROOT", str(warehouse_root))
+    monkeypatch.setenv("NFLPROPS_DATA_ROOT", str(runtime_root / "state"))
     monkeypatch.setenv("NFLPROPS_RUNTIME_ROOT", str(runtime_root))
     monkeypatch.setenv("NFLPROPS_ENV", "development")
     monkeypatch.setenv("NFLPROPS_STORAGE_BACKEND", "duckdb")

@@ -17,7 +17,7 @@
 #
 # Runs as wizard-deploy, no root. Touches nothing outside RUNTIME_ROOT.
 # Never runs training, replay, simulation, or calibration -- only imports,
-# --help, a read-only snapshot listing, and the read-only health gate.
+# --help, read-only snapshot/status listings, and the read-only health gate.
 #
 # Test hooks (never set by the workflow): NFLPROPS_BOOTSTRAP_PYTHON,
 # NFLPROPS_UNIT_DIR, NFLPROPS_CONTROL_PREFLIGHT.
@@ -104,10 +104,14 @@ main() {
     -e "${release_dir}[orchestration,runtime]" \
     || fail "dependency installation failed"
 
-  # The env file is created ONLY if absent -- never overwritten.
-  if [ ! -f "$env_file" ]; then
-    install -m 600 "$release_dir/deploy/systemd/nflprops-runtime.env.example" "$env_file"
-  fi
+  # The env file is installed (only if absent, never overwritten) by the
+  # workflow's first-install step from GitHub environment secrets. Prepare
+  # never creates it -- a template with an empty credential must never
+  # become production config -- and refuses one readable by anyone else.
+  [ -f "$env_file" ] || fail "$env_file is missing (deploy-wizard.yml installs it from the wizardofodds.com secrets on first install)"
+  local env_mode
+  env_mode="$("$bootstrap_python" -c 'import os, sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$env_file")"
+  [ "$env_mode" = "0o600" ] || fail "$env_file must be mode 600 (is $env_mode)"
 
   # ---- pre-activation checks, all from the CANDIDATE release's venv --
   (
@@ -121,7 +125,10 @@ main() {
     "$vpy" -m nflprops.platform.wizard_runtime --help >/dev/null || fail "runtime entrypoint does not run"
     "$vpy" -m nflprops.platform.wizard_runtime snapshot --help >/dev/null || fail "snapshot CLI does not run"
     "$vpy" -m nflprops.platform.wizard_runtime snapshot list >/dev/null || fail "snapshot list (read-only) failed"
-    "$vpy" -m nflprops.cli platform health --deploy-gate --expect-version "$release_sha" \
+    "$vpy" -m nflprops.platform.wizard_runtime run --help >/dev/null || fail "runtime run entrypoint does not import"
+    "$vpy" -m nflprops.platform.wizard_runtime status >/dev/null || fail "runtime status (read-only) failed"
+    "$vpy" -m nflprops.cli platform health --deploy-gate --pre-activation \
+      --expect-version "$release_sha" \
       || fail "candidate release failed the deployment-critical health gate"
   )
 

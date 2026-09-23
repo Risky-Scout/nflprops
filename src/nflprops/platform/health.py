@@ -132,13 +132,31 @@ def runtime_version_check(version_sha: str | None) -> HealthCheck:
 #: legitimately unhealthy until the first snapshot exists (snapshots begin
 #: with Block 3's checkpointing), so it is still reported but cannot block
 #: a release. Every other check is deployment-critical.
-DEPLOY_GATE_NONCRITICAL: frozenset[str] = frozenset({"latest_snapshot"})
+DEPLOY_GATE_NONCRITICAL: frozenset[str] = frozenset(
+    {
+        "latest_snapshot",
+        # BLOCK 3: the first collection cycle of a freshly (re)started
+        # runtime can legitimately take longer than the deploy gate's
+        # window (reference bootstrap + a full cycle); liveness is gated by
+        # the critical `runtime_loop` check instead. Freshness stays
+        # critical for ordinary (non-gate) health.
+        "collection_freshness",
+    }
+)
+
+#: Additionally excluded BEFORE activation (prepare_release.sh): the
+#: candidate release's runtime is not running yet, so its heartbeat cannot
+#: exist -- it is gated after activation instead.
+PRE_ACTIVATION_NONCRITICAL: frozenset[str] = frozenset({"runtime_loop"})
 
 
-def deploy_gate_passed(report: PlatformHealthReport) -> bool:
-    return all(
-        c.healthy for c in report.checks if c.name not in DEPLOY_GATE_NONCRITICAL
+def deploy_gate_passed(
+    report: PlatformHealthReport, *, pre_activation: bool = False
+) -> bool:
+    excluded = DEPLOY_GATE_NONCRITICAL | (
+        PRE_ACTIVATION_NONCRITICAL if pre_activation else frozenset()
     )
+    return all(c.healthy for c in report.checks if c.name not in excluded)
 
 
 def release_version_check(expected_sha: str, actual_sha: str | None) -> HealthCheck:
@@ -395,6 +413,8 @@ def storage_growth_check(
     publications_root: Any,
     retention_limit: int,
     minimum_free_gb: float = 2.0,
+    raw_root: Any | None = None,
+    protected_snapshot_ids: frozenset[str] = frozenset(),
 ) -> HealthCheck:
     """Live DuckDB/Parquet warehouse size, snapshot count/size, publication
     size, and MEASURED growth between the oldest and newest retained
@@ -418,6 +438,8 @@ def storage_growth_check(
             live_bytes += query_cache.stat().st_size
         snapshots = list_snapshots(Path(snapshot_root))
         snapshot_bytes = sum(info.total_bytes for info in snapshots)
+        retained = [s for s in snapshots if s.snapshot_id not in protected_snapshot_ids]
+        raw_bytes = _tree_bytes(raw_root) if raw_root is not None else 0
         publication_bytes = _tree_bytes(publications_root)
         free_gb = _shutil.disk_usage(_nearest_existing_ancestor(warehouse)).free / (1024**3)
 
@@ -432,20 +454,178 @@ def storage_growth_check(
                 growth = f"{per_day / (1024**2):.2f}MiB/day over {elapsed_days:.1f}d"
 
         problems: list[str] = []
-        if len(snapshots) > retention_limit:
-            problems.append(f"{len(snapshots)} snapshots exceed retention {retention_limit}")
+        if len(retained) > retention_limit:
+            problems.append(f"{len(retained)} snapshots exceed retention {retention_limit}")
         if free_gb < minimum_free_gb:
             problems.append(f"free {free_gb:.2f} GiB below {minimum_free_gb:.2f} GiB")
         mib = 1024**2
         detail = (
-            f"live_warehouse={live_bytes / mib:.1f}MiB "
-            f"snapshots={len(snapshots)}/{retention_limit} ({snapshot_bytes / mib:.1f}MiB) "
+            f"live_warehouse={live_bytes / mib:.1f}MiB raw_payloads={raw_bytes / mib:.1f}MiB "
+            f"snapshots={len(retained)}/{retention_limit} "
+            f"(+{len(snapshots) - len(retained)} pending-protected, "
+            f"{snapshot_bytes / mib:.1f}MiB) "
             f"publications={publication_bytes / mib:.1f}MiB free={free_gb:.2f}GiB "
             f"snapshot_growth={growth}"
         )
         if problems:
             return False, f"{'; '.join(problems)} -- {detail}"
         return True, detail
+
+    return _check
+
+
+def clock_sync_check(
+    *, runner: Callable[[list[str]], tuple[int, str]] | None = None
+) -> HealthCheck:
+    """Read-only host clock synchronization (`timedatectl show -p
+    NTPSynchronized --value`). UNHEALTHY iff the host demonstrably reports
+    it is NOT synchronized; reported unavailable (healthy) where
+    `timedatectl` does not exist (dev machines) rather than guessing.
+    Scientific timestamps are UTC, and PIT correctness depends on this."""
+
+    def _default_runner(cmd: list[str]) -> tuple[int, str]:
+        import subprocess
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return result.returncode, result.stdout.strip()
+
+    run = runner or _default_runner
+
+    def _check() -> tuple[bool, str | None]:
+        try:
+            code, out = run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"])
+        except FileNotFoundError:
+            return True, "unavailable on this platform (no timedatectl)"
+        if code != 0:
+            return True, f"unavailable (timedatectl exit {code})"
+        value = out.strip().lower()
+        if value == "yes":
+            return True, "NTPSynchronized=yes"
+        if value == "no":
+            return False, "CLOCK NOT SYNCHRONIZED: NTPSynchronized=no"
+        return True, f"unavailable (NTPSynchronized={value!r})"
+
+    return _check
+
+
+def runtime_loop_check(
+    status_path: Any,
+    *,
+    expected_release_sha: str | None = None,
+    max_heartbeat_age_seconds: float = 180.0,
+    now: Callable[[], datetime] | None = None,
+) -> HealthCheck:
+    """The long-running runtime is alive: its status file exists, says
+    `running`, its heartbeat is fresh, its PID exists, and (when given)
+    it is running the expected release."""
+
+    def _check() -> tuple[bool, str | None]:
+        import json
+        import os
+        from pathlib import Path
+
+        path = Path(status_path)
+        if not path.is_file():
+            return False, f"runtime has not written {path} (not started)"
+        status = json.loads(path.read_text())
+        heartbeat = datetime.fromisoformat(str(status["heartbeat_at"]))
+        age = ((now or (lambda: datetime.now(UTC)))() - heartbeat).total_seconds()
+        pid = int(status.get("pid") or 0)
+        alive = False
+        if pid > 0:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except PermissionError:
+                alive = True
+            except ProcessLookupError:
+                alive = False
+        problems = []
+        if status.get("state") != "running":
+            problems.append(f"state={status.get('state')}")
+        if age > max_heartbeat_age_seconds:
+            problems.append(f"heartbeat {age:.0f}s old")
+        if not alive:
+            problems.append(f"pid {pid} not alive")
+        if expected_release_sha and status.get("release_sha") != expected_release_sha:
+            problems.append(
+                f"running release {status.get('release_sha')} != expected {expected_release_sha}"
+            )
+        detail = (
+            f"pid={pid} heartbeat_age={age:.0f}s release={status.get('release_sha')} "
+            f"season={status.get('season')} week={status.get('week')} "
+            f"next_collection_due_at={status.get('next_collection_due_at')}"
+        )
+        if problems:
+            return False, f"{'; '.join(problems)} -- {detail}"
+        return True, detail
+
+    return _check
+
+
+def collection_freshness_check(
+    warehouse_root: Any,
+    *,
+    config: Any,
+    now: Callable[[], datetime] | None = None,
+    grace_seconds: float = 300.0,
+) -> HealthCheck:
+    """The latest collection cycle is no older than twice the CURRENT
+    locked cadence plus a grace period. A never-collected warehouse is
+    unhealthy ("never checked" is never the same as a healthy zero-row
+    reading). Read-only."""
+
+    def _check() -> tuple[bool, str | None]:
+        from pathlib import Path
+
+        import polars as pl
+
+        from nflprops.collection.cadence import cadence_for_games
+        from nflprops.collection.models import RUNS_TABLE
+        from nflprops.collection.service import _cadence_config_from_toml
+
+        root = Path(warehouse_root)
+        runs_path = root / f"{RUNS_TABLE}.parquet"
+        if not runs_path.is_file():
+            return False, "never collected (no collector_runs yet)"
+        runs = pl.read_parquet(runs_path)
+        if runs.is_empty():
+            return False, "never collected (collector_runs is empty)"
+        latest = runs.sort("started_at").row(-1, named=True)
+        current = (now or (lambda: datetime.now(UTC)))()
+        games_path = root / "games.parquet"
+        games = pl.read_parquet(games_path) if games_path.is_file() else pl.DataFrame()
+        if not games.is_empty():
+            games = games.filter(
+                (pl.col("season") == latest["season"]) & (pl.col("week") == latest["week"])
+            )
+        cadence, kickoff = cadence_for_games(
+            games, now=current, config=_cadence_config_from_toml(config)
+        )
+        age = (current - latest["started_at"]).total_seconds()
+        limit = 2 * cadence + grace_seconds
+        detail = (
+            f"latest={latest['collector_run_id'][:12]} status={latest['status']} "
+            f"started_at={latest['started_at'].isoformat()} age={age:.0f}s "
+            f"cadence={cadence}s nearest_kickoff={kickoff.isoformat() if kickoff else None}"
+        )
+        if age > limit:
+            return False, f"STALE: older than {limit:.0f}s -- {detail}"
+        return True, detail
+
+    return _check
+
+
+def provider_config_check(api_key_env: str, *, env: dict[str, str] | None = None) -> HealthCheck:
+    """The live provider credential is PRESENT (the value is never read
+    into the report). Critical: the collector fails closed without it."""
+
+    def _check() -> tuple[bool, str | None]:
+        import os
+
+        source = os.environ if env is None else env
+        present = bool(source.get(api_key_env))
+        return present, f"{api_key_env} {'present' if present else 'MISSING'}"
 
     return _check
 

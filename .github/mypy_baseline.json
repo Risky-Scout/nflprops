@@ -284,12 +284,6 @@
     },
     {
       "code": "arg-type",
-      "count": 1,
-      "message": "Argument 1 to \"checkpoint_satisfied\" has incompatible type \"Warehouse\"; expected \"StorageBackend\"",
-      "path": "src/nflprops/orchestration/flows/checkpoints.py"
-    },
-    {
-      "code": "arg-type",
       "count": 2,
       "message": "Argument 1 to \"claim_checkpoint\" has incompatible type \"Warehouse\"; expected \"StorageBackend\"",
       "path": "src/nflprops/orchestration/flows/checkpoints.py"
@@ -323,12 +317,6 @@
       "count": 1,
       "message": "Function is missing a type annotation for one or more parameters",
       "path": "src/nflprops/orchestration/flows/checkpoints.py"
-    },
-    {
-      "code": "return-value",
-      "count": 1,
-      "message": "Incompatible return value type (got \"int | float | Decimal | date | time | timedelta | str | bytes | ndarray[Any, Any] | list[Any] | None\", expected \"datetime | None\")",
-      "path": "src/nflprops/orchestration/flows/collection.py"
     },
     {
       "code": "arg-type",
@@ -729,6 +717,6 @@
   ],
   "mypy_target_python": "3.11",
   "mypy_version": "mypy 2.3.1 (compiled: yes)",
-  "total_findings": 177,
+  "total_findings": 175,
   "version": 1
 }

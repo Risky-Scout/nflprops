@@ -18,10 +18,13 @@
 #
 # The health gate for a release, after `current` points at it:
 #   1. sudo -n systemctl restart nflprops-runtime.service
-#   2. systemctl is-active nflprops-runtime.service
-#   3. current/.venv/bin/python -m nflprops.cli platform health
-#        --deploy-gate --expect-version <that release's SHA>
-# All three must succeed; nothing here masks a failure.
+#   2. within a bounded window (16 probes x 15 s), 2 CONSECUTIVE probes of:
+#        systemctl is-active nflprops-runtime.service   AND
+#        current/.venv/bin/python -m nflprops.cli platform health
+#          --deploy-gate --expect-version <that release's SHA>
+#      (the gate includes the critical runtime_loop check: fresh heartbeat,
+#      live PID, running exactly that release)
+# All must succeed; nothing here masks a failure.
 #
 # Runs as wizard-deploy. The only privileged action is the scoped
 # `sudo -n systemctl restart nflprops-runtime.service` installed by the
@@ -29,7 +32,9 @@
 # outside RUNTIME_ROOT.
 #
 # Test hooks (never set by the workflow): NFLPROPS_BOOTSTRAP_PYTHON,
-# NFLPROPS_SYSTEMCTL_CONTROL, NFLPROPS_SYSTEMCTL_QUERY.
+# NFLPROPS_SYSTEMCTL_CONTROL, NFLPROPS_SYSTEMCTL_QUERY,
+# NFLPROPS_HEALTH_ATTEMPTS, NFLPROPS_HEALTH_INTERVAL_SECONDS,
+# NFLPROPS_HEALTH_REQUIRED_PASSES.
 
 set -euo pipefail
 
@@ -47,6 +52,9 @@ main() {
   BOOTSTRAP_PYTHON="${NFLPROPS_BOOTSTRAP_PYTHON:-python3}"
   SYSTEMCTL_CONTROL="${NFLPROPS_SYSTEMCTL_CONTROL:-sudo -n /usr/bin/systemctl}"
   SYSTEMCTL_QUERY="${NFLPROPS_SYSTEMCTL_QUERY:-/usr/bin/systemctl}"
+  HEALTH_ATTEMPTS="${NFLPROPS_HEALTH_ATTEMPTS:-16}"
+  HEALTH_INTERVAL_SECONDS="${NFLPROPS_HEALTH_INTERVAL_SECONDS:-15}"
+  HEALTH_REQUIRED_PASSES="${NFLPROPS_HEALTH_REQUIRED_PASSES:-2}"
   CURRENT="$RUNTIME_ROOT/current"
   ENV_FILE="$RUNTIME_ROOT/nflprops-runtime.env"
 
@@ -104,29 +112,55 @@ switch_current() {
   "$BOOTSTRAP_PYTHON" -c 'import os, sys; os.replace(sys.argv[1], sys.argv[2])' "$CURRENT.new" "$CURRENT"
 }
 
-health_gate() {
+# One observation: the unit is active AND the versioned deploy-gate health
+# (which includes the critical runtime_loop heartbeat/PID/release check)
+# passes from current/.venv.
+health_probe() {
   local expect_sha="$1"
-  echo "HEALTH GATE: restart $UNIT (expect $expect_sha)"
-  if ! $SYSTEMCTL_CONTROL restart "$UNIT"; then
-    echo "HEALTH GATE: restart $UNIT failed" >&2
-    return 1
-  fi
   if ! $SYSTEMCTL_QUERY is-active --quiet "$UNIT"; then
     echo "HEALTH GATE: $UNIT is not active" >&2
     return 1
   fi
-  if ! (
+  (
     set -a
     # shellcheck disable=SC1090
     . "$ENV_FILE"
     set +a
     "$CURRENT/.venv/bin/python" -m nflprops.cli platform health \
       --deploy-gate --expect-version "$expect_sha"
-  ); then
-    echo "HEALTH GATE: platform health --deploy-gate failed" >&2
+  )
+}
+
+# Restart, then poll within a bounded window until REQUIRED_PASSES
+# consecutive probes pass (a crash-looping runtime cannot pass twice in a
+# row with a live PID and fresh heartbeat). Never masks a failure: running
+# out of attempts fails the gate.
+health_gate() {
+  local expect_sha="$1" attempt=0 passes=0
+  echo "HEALTH GATE: restart $UNIT (expect $expect_sha)"
+  if ! $SYSTEMCTL_CONTROL restart "$UNIT"; then
+    echo "HEALTH GATE: restart $UNIT failed" >&2
     return 1
   fi
-  echo "HEALTH GATE: passed ($expect_sha)"
+  while [ "$attempt" -lt "$HEALTH_ATTEMPTS" ]; do
+    attempt=$((attempt + 1))
+    sleep "$HEALTH_INTERVAL_SECONDS"
+    local output
+    if output="$(health_probe "$expect_sha" 2>&1)"; then
+      passes=$((passes + 1))
+      echo "HEALTH GATE: probe $attempt passed ($passes/$HEALTH_REQUIRED_PASSES)"
+      if [ "$passes" -ge "$HEALTH_REQUIRED_PASSES" ]; then
+        echo "HEALTH GATE: passed ($expect_sha)"
+        return 0
+      fi
+    else
+      passes=0
+      echo "HEALTH GATE: probe $attempt failed:" >&2
+      printf '%s\n' "$output" | tail -n 80 >&2
+    fi
+  done
+  echo "HEALTH GATE: FAILED after $attempt probes ($expect_sha)" >&2
+  return 1
 }
 
 # Bounded disk: keep exactly the active release and its rollback target.

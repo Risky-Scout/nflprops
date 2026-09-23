@@ -404,7 +404,7 @@ def test_runtime_unit_is_memory_and_task_capped() -> None:
 def test_env_example_sets_runtime_root_and_bounded_retention() -> None:
     text = (REPO_ROOT / "deploy" / "systemd" / "nflprops-runtime.env.example").read_text()
     assert f"NFLPROPS_RUNTIME_ROOT={_APPROVED_ROOT}\n" in text
-    assert f"NFLPROPS_DATA_ROOT={_APPROVED_ROOT}/state/warehouse\n" in text
+    assert f"NFLPROPS_DATA_ROOT={_APPROVED_ROOT}/state\n" in text
     assert re.search(r"^NFLPROPS_SNAPSHOT_RETENTION=\d+$", text, re.MULTILINE)
 
 

@@ -49,33 +49,21 @@ from prefect import flow, task
 
 from nflprops.backtest.leakage import LeakageError as BacktestLeakageError
 from nflprops.backtest.provenance import StateProvenanceContext
-from nflprops.collection.service import source_sha256
-from nflprops.config import Config, config_sha256
+from nflprops.config import Config
 from nflprops.data.warehouse import Warehouse
 from nflprops.errors import LeakageError as CoreLeakageError
 from nflprops.orchestration.checkpoints import (
-    OFFICIAL_CHECKPOINTS,
     CheckpointAction,
     CheckpointName,
-    CheckpointOffsets,
-    CheckpointsRuntimeConfig,
-    OrchestrationConfig,
-    evaluate_checkpoint,
 )
-from nflprops.orchestration.checkpoints import (
-    scheduled_as_of as compute_scheduled_as_of,
-)
-from nflprops.orchestration.manifest import compute_data_manifest_sha256
+from nflprops.orchestration.dispatch_plan import DispatchSettings, plan_due_checkpoints
 from nflprops.orchestration.pricing_store import persist_player_prop_pricing
 from nflprops.orchestration.projection_store import persist_player_game_projections
 from nflprops.orchestration.run_store import (
-    FAILURE_CHECKPOINT_MISSED,
     PredictionRunRecord,
     PredictionRunStatus,
     PublicationStatus,
-    checkpoint_satisfied,
     claim_checkpoint,
-    compute_run_id,
     update_run_status,
 )
 from nflprops.orchestration.tasks import (
@@ -87,7 +75,6 @@ from nflprops.orchestration.threshold_event_store import (
     persist_player_game_threshold_events,
 )
 from nflprops.pipelines.pregame import (
-    _latest_games_asof,
     compute_game_prediction,
     persist_current_pricing,
 )
@@ -733,23 +720,12 @@ def checkpoint_dispatch_flow(
     `claim_checkpoint`'s atomic insert is the sole source of that
     guarantee, not any check performed here.
     """
-    checkpoints_cfg = CheckpointsRuntimeConfig.from_config(config)
-    if not checkpoints_cfg.enabled:
-        return []
-
-    offsets = CheckpointOffsets.from_config(config)
-    orchestration_cfg = OrchestrationConfig.from_config(config)
-
-    resolved_model_version = model_version or str(
-        config.get_path("model.version", "2026.1.0")
-    )
-    resolved_n_draws = (
-        n_draws if n_draws is not None else int(config.get_path("simulation.n_draws", 20_000))
-    )
-    resolved_retain = (
-        retain_joint_draws
-        if retain_joint_draws is not None
-        else int(config.get_path("simulation.retain_joint_draws", 0))
+    settings = DispatchSettings.resolve(
+        config,
+        model_version=model_version,
+        n_draws=n_draws,
+        retain_joint_draws=retain_joint_draws,
+        market_mode=market_mode,
     )
     resolved_tier = (
         max_confidence_tier
@@ -757,142 +733,57 @@ def checkpoint_dispatch_flow(
         else int(config.get_path("market.max_confidence_tier", 2))
     )
 
-    cfg_sha = config_sha256(config)
-    src_sha = source_sha256()
-
-    games = warehouse.read("games")
-    current_games = _latest_games_asof(games, as_of=now, season=season, week=week)
-
     results: list[PredictionRunRecord] = []
-    for game in current_games.iter_rows(named=True):
-        game_id = str(game["canonical_game_id"])
-        kickoff_at = game["date"]
+    for planned in plan_due_checkpoints(
+        warehouse=warehouse,
+        config=config,
+        season=season,
+        week=week,
+        now=now,
+        settings=settings,
+    ):
+        record = planned.record
+        if planned.action is CheckpointAction.MISSED:
+            if claim_checkpoint(warehouse, record):
+                results.append(record)
+            continue
 
-        for checkpoint in OFFICIAL_CHECKPOINTS:
-            if checkpoint_satisfied(
-                warehouse, game_id=game_id, checkpoint_name=checkpoint, kickoff_at=kickoff_at
-            ):
-                continue
+        # planned.action is CheckpointAction.RUN (on-time or catch-up).
+        if not claim_checkpoint(warehouse, record):
+            # Already claimed by this or a concurrent dispatcher.
+            continue
 
-            scheduled = compute_scheduled_as_of(
-                kickoff_at=kickoff_at, checkpoint=checkpoint, offsets=offsets
-            )
-            action = evaluate_checkpoint(
-                scheduled_as_of_time=scheduled,
-                kickoff_at=kickoff_at,
-                now=now,
-                catch_up_before_kickoff=checkpoints_cfg.catch_up_before_kickoff,
-                dispatcher_tick_seconds=orchestration_cfg.dispatcher_tick_seconds,
-            )
-            if action is CheckpointAction.NOT_DUE:
-                continue
-
-            run_id = compute_run_id(
-                game_id=game_id,
-                checkpoint_name=checkpoint,
-                scheduled_as_of=scheduled,
-                kickoff_at=kickoff_at,
-                model_version=resolved_model_version,
-                config_sha256=cfg_sha,
-                source_sha256=src_sha,
-            )
-            manifest_sha = compute_data_manifest_sha256(
-                warehouse, game_id=game_id, scheduled_as_of=scheduled, market_mode=market_mode
-            )
-
-            if action is CheckpointAction.MISSED:
-                record = PredictionRunRecord(
-                    run_id=run_id,
-                    season=season,
-                    week=week,
-                    game_id=game_id,
-                    checkpoint_name=checkpoint.value,
-                    scheduled_as_of=scheduled,
-                    kickoff_at=kickoff_at,
-                    flow_started_at=now,
-                    flow_completed_at=now,
-                    status=PredictionRunStatus.FAILED,
-                    model_version=resolved_model_version,
-                    config_sha256=cfg_sha,
-                    source_sha256=src_sha,
-                    data_manifest_sha256=manifest_sha,
-                    n_draws=resolved_n_draws,
-                    retained_joint_draws=resolved_retain,
-                    publication_status=PublicationStatus.NOT_PUBLISHED,
-                    is_final_forecast=False,
-                    fallback_from_checkpoint=None,
-                    failure_code=FAILURE_CHECKPOINT_MISSED,
-                    failure_detail=(
-                        f"{checkpoint.value} for game {game_id!r} first discovered at/after "
-                        f"kickoff ({now.isoformat()} >= {kickoff_at.isoformat()}); no pregame "
-                        "forecast was executed."
-                    ),
-                    created_at=now,
-                )
-                if claim_checkpoint(warehouse, record):
-                    results.append(record)
-                continue
-
-            # action is CheckpointAction.RUN (on-time or catch-up).
-            scheduled_record = PredictionRunRecord(
-                run_id=run_id,
-                season=season,
-                week=week,
-                game_id=game_id,
-                checkpoint_name=checkpoint.value,
-                scheduled_as_of=scheduled,
-                kickoff_at=kickoff_at,
-                flow_started_at=now,
-                flow_completed_at=None,
-                status=PredictionRunStatus.SCHEDULED,
-                model_version=resolved_model_version,
-                config_sha256=cfg_sha,
-                source_sha256=src_sha,
-                data_manifest_sha256=manifest_sha,
-                n_draws=resolved_n_draws,
-                retained_joint_draws=resolved_retain,
+        ctx = CheckpointRunContext(
+            warehouse=warehouse,
+            season=season,
+            week=week,
+            game_id=record.game_id,
+            checkpoint=planned.checkpoint,
+            kickoff_at=record.kickoff_at,
+            scheduled_as_of=record.scheduled_as_of,
+            run_id=record.run_id,
+            model_version=settings.model_version,
+            n_draws=settings.n_draws,
+            retain_joint_draws=settings.retain_joint_draws,
+            max_confidence_tier=resolved_tier,
+            market_mode=market_mode,
+            simulation_config=simulation_config,
+            player_state_config=player_state_config,
+            team_state_config=team_state_config,
+        )
+        try:
+            final_record = game_checkpoint_flow(ctx, now=now)
+        except Exception as exc:
+            failure_code, failure_detail = _classify_exception(exc)
+            final_record = update_run_status(
+                warehouse,
+                record.run_id,
+                status=PredictionRunStatus.FAILED,
                 publication_status=PublicationStatus.NOT_PUBLISHED,
-                is_final_forecast=False,
-                fallback_from_checkpoint=None,
-                failure_code=None,
-                failure_detail=None,
-                created_at=now,
+                failure_code=failure_code,
+                failure_detail=failure_detail,
+                flow_completed_at=now,
             )
-            if not claim_checkpoint(warehouse, scheduled_record):
-                # Already claimed by this or a concurrent dispatcher.
-                continue
-
-            ctx = CheckpointRunContext(
-                warehouse=warehouse,
-                season=season,
-                week=week,
-                game_id=game_id,
-                checkpoint=checkpoint,
-                kickoff_at=kickoff_at,
-                scheduled_as_of=scheduled,
-                run_id=run_id,
-                model_version=resolved_model_version,
-                n_draws=resolved_n_draws,
-                retain_joint_draws=resolved_retain,
-                max_confidence_tier=resolved_tier,
-                market_mode=market_mode,
-                simulation_config=simulation_config,
-                player_state_config=player_state_config,
-                team_state_config=team_state_config,
-            )
-            try:
-                final_record = game_checkpoint_flow(ctx, now=now)
-            except Exception as exc:
-                failure_code, failure_detail = _classify_exception(exc)
-                final_record = update_run_status(
-                    warehouse,
-                    run_id,
-                    status=PredictionRunStatus.FAILED,
-                    publication_status=PublicationStatus.NOT_PUBLISHED,
-                    failure_code=failure_code,
-                    failure_detail=failure_detail,
-                    flow_completed_at=now,
-                )
-            results.append(final_record)
+        results.append(final_record)
 
     return results

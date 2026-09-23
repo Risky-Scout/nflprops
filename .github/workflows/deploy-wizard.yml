@@ -119,6 +119,44 @@ jobs:
           # shellcheck disable=SC2086
           scp $SSH_OPTS "$RUNNER_TEMP/release.tar.gz" "$REMOTE:$RELEASE_ROOT/releases/$RELEASE_ID.tar.gz"
 
+      - name: Install runtime env file if absent (environment secrets; never overwrites)
+        env:
+          SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+          BDL_API_KEY: ${{ secrets.BDL_API_KEY }}
+        run: |
+          REMOTE="${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}"
+          ENV_PATH="$RELEASE_ROOT/nflprops-runtime.env"
+          # shellcheck disable=SC2086,SC2029
+          STATE="$(ssh $SSH_OPTS "$REMOTE" "if [ -e '$ENV_PATH' ]; then echo EXISTS; else echo ABSENT; fi")"
+          if [ "$STATE" = "EXISTS" ]; then
+            echo "Runtime env file already present -- left untouched."
+            exit 0
+          fi
+          if [ -z "$BDL_API_KEY" ]; then
+            echo "::error::MISSING SECRET: BDL_API_KEY (wizardofodds.com environment) -- required to install $ENV_PATH"
+            exit 1
+          fi
+          umask 077
+          RENDERED="$RUNNER_TEMP/nflprops-runtime.env"
+          # The secret is read from the environment and written only to a
+          # 0600 runner-temp file streamed over SSH stdin -- never argv,
+          # never echoed.
+          python3 - "$RENDERED" <<'PY'
+          import os
+          import sys
+
+          key = os.environ["BDL_API_KEY"]
+          with open("deploy/systemd/nflprops-runtime.env.example") as handle:
+              lines = handle.read().splitlines()
+          rendered = [f"BDL_API_KEY={key}" if line == "BDL_API_KEY=" else line for line in lines]
+          with open(sys.argv[1], "w") as handle:
+              handle.write("\n".join(rendered) + "\n")
+          PY
+          # shellcheck disable=SC2086,SC2029
+          ssh $SSH_OPTS "$REMOTE" "umask 077 && cat > '$ENV_PATH.new' && mv -n '$ENV_PATH.new' '$ENV_PATH' && test ! -e '$ENV_PATH.new'" < "$RENDERED"
+          rm -f "$RENDERED"
+          echo "Runtime env file installed (mode 600)."
+
       - name: Prepare release (own .venv + pre-activation checks; current untouched)
         env:
           SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
@@ -152,4 +190,4 @@ jobs:
 
       - name: Cleanup SSH material
         if: always()
-        run: rm -f ~/.ssh/wizard_deploy_key ~/.ssh/known_hosts
+        run: rm -f ~/.ssh/wizard_deploy_key ~/.ssh/known_hosts "$RUNNER_TEMP/nflprops-runtime.env"

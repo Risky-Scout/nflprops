@@ -44,6 +44,11 @@ which fails any PR that touches either boundary.
 | BLOCK 2B: Wizard-host runtime CLI (`python -m nflprops.platform.wizard_runtime`) | `src/nflprops/platform/wizard_runtime.py` |
 | BLOCK 2B: GitHub <-> Wizard snapshot download / result-bundle upload (foundation, not yet triggered) | `.github/workflows/wizard-snapshot-transfer.yml` |
 | BLOCK 2B: read-only Wizard resource/collision probe | `.github/workflows/wizard-probe.yml` |
+| BLOCK 3: the long-running Wizard runtime (collection + checkpoint preparation + snapshots) | `src/nflprops/platform/runtime_loop.py` |
+| BLOCK 3: schedule/prepare boundary (claim + snapshot + pending GitHub execution) | `src/nflprops/platform/checkpoint_prepare.py` |
+| BLOCK 3: Prefect-free checkpoint planning shared with the dispatch flow | `src/nflprops/orchestration/dispatch_plan.py` |
+| BLOCK 3: read-only live-warehouse certification report | `src/nflprops/platform/runtime_report.py` |
+| BLOCK 3: fixed-menu Wizard runtime operations (main-only) | `.github/workflows/wizard-ops.yml`, `deploy/wizard/ops.sh` |
 | BLOCK 2B: `nflprops-runtime` systemd unit foundation | `deploy/systemd/nflprops-runtime.service` |
 
 ## Remote training workflow contract
@@ -355,9 +360,10 @@ other workload:
 
 ```
 /home/wizard-deploy/nflprops/
-    current/        -> releases/<sha> (atomic symlink flip)
+    current/        -> releases/<release-id> (atomic symlink flip)
     releases/       <sha>-<run>-<attempt>/ with its own .venv; active + previous kept
-    state/          NFLPROPS_DATA_ROOT=state/warehouse (+ state/nflprops.duckdb)
+    state/          NFLPROPS_DATA_ROOT (run.data_root): canonical/ tables,
+                    nflprops.duckdb query layer, raw/ provider payloads
     snapshots/      immutable warehouse snapshots, bounded retention
     publications/   immutable GitHub result bundles
     backups/
@@ -368,7 +374,10 @@ other workload:
 
 `NFLPROPS_RUNTIME_ROOT` selects the root. If it is unset, the runtime
 falls back to the warehouse root's parent, so dev checkouts behave as
-before. `resolve_runtime_layout` refuses any root or warehouse path that
+before. (Block 3 correction: the warehouse is always derived exactly as the
+collector derives it, `<run.data_root>/canonical`; Block 2B had briefly
+treated `NFLPROPS_DATA_ROOT` itself as the warehouse, which would have put
+the snapshot/health view and the live collector on different directories.) `resolve_runtime_layout` refuses any root or warehouse path that
 overlaps `/home/wizard-deploy/nfl-production-2026` or
 `/var/www/sportsodds`. Nothing touches the WNBA or game-model state.
 
@@ -424,49 +433,141 @@ could never pass on the locked architecture.
   `nflprops-runtime.service` plus the versioned deploy-gate health, with
   verified rollback.
 
-## One-time root setup (Block 3; NOT performed in BLOCK 2B)
+## BLOCK 3: the live Wizard runtime
 
-GitHub's SSH user (`wizard-deploy`) has no root, and the deploy workflow
-never asks for it. Until an operator with root runs the steps below,
+**What runs.** `nflprops-runtime.service` (`Type=simple`) runs ONE
+long-running process, `current/.venv/bin/python -m
+nflprops.platform.wizard_runtime run` (`nflprops.platform.runtime_loop`),
+which owns every write to the live warehouse. Each tick (≤ 15 s, bounded,
+interruptible) it:
+
+1. rewrites `logs/runtime-status.json` (heartbeat, PID, release SHA,
+   target week, next collection due, next official checkpoint);
+2. bootstraps reference teams/players once if absent (the certified
+   `LeanIngestor.bootstrap`; the BDL id translation needs it);
+3. resolves the target (season, week): the week of the nearest
+   **unstarted** kickoff, from the warehouse's latest canonical game rows
+   (which carry reschedules) plus a read-only, cached schedule discovery
+   that never writes;
+4. runs ONE certified `collect_once` cycle iff the locked cadence says
+   one is due (`collection.due.collection_due`, moved verbatim out of the
+   Prefect module) under the writer lock, recording the trigger
+   (`SCHEDULED` vs `MANUAL`) in `runtime_collection_triggers`;
+5. schedules/**prepares** due official checkpoints (below);
+6. takes a periodic snapshot every 6 h (deduplicated; bounded retention).
+
+SIGTERM/SIGINT finish the current step, write `state: stopped`, close the
+provider client, release the lock, and exit 0; 10 consecutive failed
+ticks exit 1 so systemd's bounded restart policy (5 starts / 10 min)
+applies. Nothing on the runtime path imports Prefect (calling a Prefect
+flow outside a server would start a local API server: memory and a
+listening port).
+
+**Locked cadence (unchanged).** >48 h: 30 min; 48–24 h: 20 min;
+24–6 h: 10 min; 6 h–90 m: 5 min; 90–30 m: 2 min; 30 m–kickoff: 1 min;
+at/after kickoff: schedule-discovery polling only (30 min). Due-ness uses
+the latest attempted cycle's `started_at`, recomputed every tick, so a
+tighter window applies immediately and a restart never re-collects early.
+
+**Schedule/prepare on Wizard, execute on GitHub.** The planning half of
+`checkpoint_dispatch_flow` was extracted verbatim into
+`orchestration.dispatch_plan.plan_due_checkpoints` (the Prefect flow now
+calls it and still executes locally for GitHub/heavy contexts).
+`platform.checkpoint_prepare` uses the same planner but never runs
+science:
+
+- claim (atomic, deterministic run identity, `scheduled_as_of` = the
+  knowledge cutoff, never the wake time; kickoff revision in the
+  identity; post-kickoff discovery → FAILED/CHECKPOINT_MISSED);
+  the `prediction_runs` row stays **SCHEDULED** (claimed, not executed);
+- a `remote_checkpoint_requests` row (PREPARING);
+- one immutable snapshot (lock → DuckDB CHECKPOINT → temp copy → verify
+  → atomic rename);
+- an immutable request bundle
+  `publications/checkpoint_requests/<run_id>/request.json` (identity, full
+  PIT data manifest, snapshot id + manifest SHA, `execution_target:
+  GITHUB_ACTIONS`, requested `n_draws`), then state
+  **PENDING_REMOTE_EXECUTION**. Snapshots referenced by pending requests
+  are never pruned.
+
+Every step is resumable after a crash. MANUAL checkpoints
+(`wizard_runtime checkpoint manual`) use the existing MANUAL identity
+convention and never satisfy an official checkpoint. Block 4 connects
+pending requests to GitHub execution and publication.
+
+**Health (Block 3 additions).** `clock_sync` (read-only `timedatectl`;
+fails only if the host reports `NTPSynchronized=no`), `runtime_loop`
+(fresh heartbeat, live PID, expected release; critical after
+activation), `collection_freshness` (latest cycle within 2× the current
+cadence + 5 min; "never collected" is unhealthy), `provider_config`
+(`BDL_API_KEY` present, value never read into the report), raw-payload
+bytes in `storage_growth`. The deploy gate excludes `latest_snapshot` and
+`collection_freshness` (a fresh runtime may still be on its first cycle);
+pre-activation also excludes `runtime_loop`.
+
+**Deploy (Block 3 changes).** A first-install step renders
+`nflprops-runtime.env` from the `BDL_API_KEY` secret of the
+`wizardofodds.com` environment (streamed over SSH stdin from a 0600
+runner file, never argv/logs) **only if the file is absent**; prepare
+refuses a missing or non-0600 env file and never creates one. After
+activation the gate needs **2 consecutive** healthy probes within
+16 × 15 s.
+
+**Ops.** `.github/workflows/wizard-ops.yml` (main-only, same environment)
+runs a fixed menu from `deploy/wizard/ops.sh`: `status`, `report`,
+`verify-snapshot` (read-only), `collect-once` (one MANUAL cycle),
+`manual-checkpoint` (claim + prepare only), `restart` (scoped, gated).
+
+**Known capacity risk (to be measured, not assumed).** The certified
+collector rewrites a whole table's Parquet on each append, and raw
+payloads accumulate under `state/raw` (637 MiB in the dev checkout vs
+4 MiB canonical). Near kickoff (1-minute cadence, props per game) both
+grow fastest. Health reports both; season-long capacity is not claimed.
+
+## One-time root setup (Block 3 bootstrap)
+
+GitHub's SSH user (`wizard-deploy`) has no root, and no workflow ever
+asks for it. Until an operator with root runs the steps below,
 `prepare_release.sh`'s preflight fails closed ("not installed" or
 "sudoers"). All production files and state stay under
 `/home/wizard-deploy/nflprops/`. Root owns only the unit file and one
 sudoers line.
 
 The installed unit must match the unit file of the release being deployed
-**byte for byte**, because prepare checks its SHA-256. Copy it from the
-exact commit you will deploy:
+**byte for byte** (prepare checks its SHA-256), so install it from the
+exact commit that will be deployed:
 
 ```bash
-# 1. From a checkout of the SHA to be deployed, as wizard-deploy (no root):
+# A. From a checkout of the SHA to be deployed, as wizard-deploy (no root):
 scp -P "$WIZARD_SSH_PORT" deploy/systemd/nflprops-runtime.service \
   wizard-deploy@"$WIZARD_SSH_HOST":/home/wizard-deploy/nflprops-runtime.service.pending
 
-# 2. On the Wizard host, as an administrator with root:
-sudo install -m 644 -o root -g root \
+# B-F. On the Wizard host, as root:
+install -m 644 -o root -g root \
   /home/wizard-deploy/nflprops-runtime.service.pending \
   /etc/systemd/system/nflprops-runtime.service
-sudo systemctl daemon-reload
-
+sha256sum /etc/systemd/system/nflprops-runtime.service
+systemctl daemon-reload
 # Scoped rule: wizard-deploy may restart ONLY this unit, nothing else.
+# (is-active/status/show are unprivileged and need no rule.)
 echo 'wizard-deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart nflprops-runtime.service' \
-  | sudo tee /etc/sudoers.d/nflprops-runtime >/dev/null
-sudo chmod 440 /etc/sudoers.d/nflprops-runtime
-sudo visudo -cf /etc/sudoers.d/nflprops-runtime
+  > /etc/sudoers.d/nflprops-runtime
+chmod 440 /etc/sudoers.d/nflprops-runtime
+visudo -cf /etc/sudoers.d/nflprops-runtime
+# G. Do NOT start or enable it here.
 
-# 3. Verify, as wizard-deploy (must list the command, no password prompt):
-sudo -n -l /usr/bin/systemctl restart nflprops-runtime.service
+# H. Verify as wizard-deploy (lists the command; no password prompt):
+sudo -u wizard-deploy sudo -n -l /usr/bin/systemctl restart nflprops-runtime.service
 rm /home/wizard-deploy/nflprops-runtime.service.pending
 
-# 4. Only AFTER the first successful deploy-wizard.yml run (so `current`
-#    exists), enable start-at-boot:
-sudo systemctl enable nflprops-runtime.service
+# After the first successful deploy + certification, keep it across reboots:
+systemctl enable nflprops-runtime.service
 ```
 
-Any later change to `deploy/systemd/nflprops-runtime.service` needs step
-2's `install` and `daemon-reload` again. Until then, deploys fail closed
-with "installed nflprops-runtime.service differs". The sudoers rule
-never needs to change.
+Any later change to `deploy/systemd/nflprops-runtime.service` needs the
+`install` + `daemon-reload` again; until then deploys fail closed with
+"installed nflprops-runtime.service differs". The sudoers rule never
+needs to change.
 
 ## EXTERNAL_PROVISIONING_STILL_REQUIRED
 
@@ -489,9 +590,10 @@ never needs to change.
   probe. `wizard-deploy` cannot write `/var/lib`, `/var/log`,
   `/opt/wizardofodds`, or `/etc`, so every nflprops path moved to
   `/home/wizard-deploy/nflprops/`, which it can write without root.
-- One-time root setup on the Wizard host (Block 3, not yet done). See
-  "One-time root setup" above for the exact commands: the unit file plus
-  one scoped sudoers line.
+- One-time root setup on the Wizard host (Block 3 bootstrap). See
+  "One-time root setup" above: the unit file plus one scoped sudoers line.
+- `BDL_API_KEY` as a secret of the `wizardofodds.com` GitHub environment
+  (the deploy's first-install step renders the runtime env file from it).
 - Once Platform and Science are integrated onto the same commit: the real
   `nflprops.calibration.phase10c3a_runner` (or whatever the finalized
   entry point is named) must accept the keyword arguments
