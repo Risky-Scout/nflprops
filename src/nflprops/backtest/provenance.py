@@ -26,6 +26,7 @@ from nflprops.backtest.leakage import (
     PredictionLineage,
     assert_no_leakage,
 )
+from nflprops.data.injury_availability import injury_feed_available_at
 from nflprops.features.asof import filter_pit
 
 LINEAGE_VERSION = "2026.1"
@@ -152,6 +153,17 @@ class StateProvenanceContext:
     team_stats_rows: int
     roster_rows: int
     injury_rows: int
+    # Whether a successful injury collection ran at or before state_as_of —
+    # from the generalized collector_resource_runs log (PHASE 4), NOT
+    # from injury_rows. A zero-row injury_snapshots result can be a
+    # genuinely successful, healthy-slate collection; injury_rows alone
+    # cannot tell that apart from the feed never having run at all (e.g.
+    # every 2022-2025 historical as_of). Both cases currently leave a
+    # player's simulated `active` state at its configured default
+    # (features.injury.missing_row_means) -- that default must never be
+    # mistaken for a verified read. This flag is the machine-readable record
+    # of which case actually occurred.
+    injury_data_available: bool
 
 
 @dataclass(frozen=True)
@@ -161,6 +173,7 @@ class PredictionProvenance:
     state_as_of: datetime
     feature_max_available_at: datetime
     injury_available_at: datetime | None
+    injury_data_available: bool
     lineage_version: str = LINEAGE_VERSION
     lineage_checked: bool = True
 
@@ -173,6 +186,7 @@ class PredictionProvenance:
                 self.feature_max_available_at
             ),
             "injury_available_at": self.injury_available_at,
+            "injury_data_available": self.injury_data_available,
             "lineage_version": self.lineage_version,
             "lineage_checked": self.lineage_checked,
         }
@@ -186,10 +200,18 @@ def build_state_provenance_context(
     players: pl.DataFrame,
     roster: pl.DataFrame,
     injuries: pl.DataFrame,
+    injury_runs: pl.DataFrame,
     as_of: datetime,
     model_version: str,
 ) -> StateProvenanceContext:
-    """Describe and fingerprint the exact PIT state-input universe."""
+    """Describe and fingerprint the exact PIT state-input universe.
+
+    ``injury_runs`` is the generalized ``collector_resource_runs`` log
+    (PHASE 4; see ``nflprops.collection``) — the authoritative source for
+    whether the injury feed was available at ``as_of``, independent of how
+    many rows any given collection returned. (Legacy: prior to PHASE 4 this
+    was the injury-specific ``injury_snapshot_runs`` table.)
+    """
 
     _require_aware(as_of, "as_of")
 
@@ -198,6 +220,7 @@ def build_state_provenance_context(
     rr = _pit(roster, as_of)
     ii = _pit(injuries, as_of)
     gg = _pit(games, as_of)
+    injury_data_available = injury_feed_available_at(injury_runs, as_of=as_of)
 
     state_game_ids: set[str] = set()
 
@@ -357,6 +380,7 @@ def build_state_provenance_context(
         team_stats_rows=ts.height,
         roster_rows=rr.height,
         injury_rows=ii.height,
+        injury_data_available=injury_data_available,
     )
 
 
@@ -581,4 +605,7 @@ def audit_prediction_inputs(
         state_as_of=state_context.state_as_of,
         feature_max_available_at=feature_max,
         injury_available_at=injury_available_at,
+        injury_data_available=(
+            state_context.injury_data_available
+        ),
     )

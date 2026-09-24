@@ -13,6 +13,10 @@ import polars as pl
 BACKTEST_ROW_CONTRACT = (
     "prediction_id",
     "as_of",
+    "quote_available_at",
+    "quote_time_source",
+    "quote_age_seconds",
+    "injury_data_available",
     "canonical_game_id",
     "canonical_player_id",
     "prop_type",

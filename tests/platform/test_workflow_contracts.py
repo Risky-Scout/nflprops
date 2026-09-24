@@ -1,0 +1,234 @@
+"""Structural tests against the platform-automation GitHub Actions
+workflows -- these don't dispatch the workflows (nothing in this PR does),
+they parse the committed YAML and assert the properties the platform brief
+requires: training concurrency lock, no Mac filesystem path, no Wizard
+training dependency, no hardcoded secrets, artifacts uploaded, main-only
+Wizard deployment.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+import yaml
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+REMOTE_TRAINING = REPO_ROOT / ".github" / "workflows" / "remote-training.yml"
+DEPLOY_WIZARD = REPO_ROOT / ".github" / "workflows" / "deploy-wizard.yml"
+CI = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+
+_SECRET_LITERAL_RE = re.compile(
+    r"(api[_-]?key|secret|token|password)\s*[:=]\s*['\"][A-Za-z0-9_\-]{16,}['\"]",
+    re.IGNORECASE,
+)
+
+
+def _load(path: Path) -> dict:
+    # PyYAML parses the bare `on:` key as the boolean True under default
+    # YAML 1.1 resolution; that's irrelevant to every assertion here, so no
+    # special-casing is needed.
+    return yaml.safe_load(path.read_text())
+
+
+@pytest.fixture(scope="module")
+def remote_training_doc() -> dict:
+    return _load(REMOTE_TRAINING)
+
+
+@pytest.fixture(scope="module")
+def remote_training_text() -> str:
+    return REMOTE_TRAINING.read_text()
+
+
+@pytest.fixture(scope="module")
+def deploy_wizard_doc() -> dict:
+    return _load(DEPLOY_WIZARD)
+
+
+@pytest.fixture(scope="module")
+def deploy_wizard_text() -> str:
+    return DEPLOY_WIZARD.read_text()
+
+
+# --- remote-training.yml ------------------------------------------------------
+
+
+def test_remote_training_requires_explicit_inputs(remote_training_doc: dict) -> None:
+    inputs = remote_training_doc[True]["workflow_dispatch"]["inputs"]
+    assert inputs["science_ref"]["required"] is True
+    assert inputs["data_manifest_sha256"]["required"] is True
+    assert inputs["mode"]["required"] is True
+    assert set(inputs["mode"]["options"]) == {"production", "smoke"}
+
+
+def test_remote_training_has_production_only_concurrency_lock(
+    remote_training_doc: dict,
+) -> None:
+    concurrency = remote_training_doc["concurrency"]
+    assert "remote-training-production" in concurrency["group"]
+    assert concurrency["cancel-in-progress"] is False
+
+
+def test_remote_training_has_no_mac_filesystem_path(remote_training_text: str) -> None:
+    assert "/Users/" not in remote_training_text
+
+
+def test_remote_training_has_no_wizard_dependency(remote_training_doc: dict) -> None:
+    # No step may reference a WIZARD_SSH_* secret or the wizardofodds.com
+    # environment -- training must never depend on the serving host. A
+    # prose comment naming "WizardOfOdds" as context is fine.
+    text = repr(remote_training_doc).lower()
+    assert "wizard_ssh" not in text
+    assert "wizardofodds.com" not in text
+
+
+def test_remote_training_has_no_hardcoded_secrets(remote_training_text: str) -> None:
+    assert not _SECRET_LITERAL_RE.search(remote_training_text)
+    # Every credential must be a `secrets.*` reference, never a literal.
+    assert "${{ secrets." in remote_training_text
+
+
+def test_remote_training_uploads_artifact_unconditionally(
+    remote_training_doc: dict,
+) -> None:
+    steps = remote_training_doc["jobs"]["train"]["steps"]
+    upload_steps = [s for s in steps if "upload-artifact" in s.get("uses", "")]
+    assert upload_steps, "expected an actions/upload-artifact step"
+    assert upload_steps[0]["if"] == "always()"
+
+
+def test_remote_training_cleans_up_workspace_unconditionally(
+    remote_training_doc: dict,
+) -> None:
+    steps = remote_training_doc["jobs"]["train"]["steps"]
+    cleanup_steps = [s for s in steps if "cleanup-data" in s.get("run", "")]
+    assert cleanup_steps, "expected a cleanup-data step"
+    assert cleanup_steps[0]["if"] == "always()"
+
+
+def test_remote_training_runs_on_github_hosted_ubuntu_runner(
+    remote_training_doc: dict,
+) -> None:
+    # BLOCK 1 GITHUB EXECUTION: the self-hosted `nflprops-training` label
+    # requirement is removed -- training now runs on a standard GitHub-hosted
+    # Ubuntu runner. Never Joseph's Mac.
+    runs_on = remote_training_doc["jobs"]["train"]["runs-on"]
+    assert runs_on == "ubuntu-24.04"
+
+
+def test_remote_training_no_longer_references_self_hosted_label(
+    remote_training_text: str,
+) -> None:
+    assert "self-hosted" not in remote_training_text
+    assert "nflprops-training" not in remote_training_text
+    assert "macos" not in remote_training_text.lower()
+
+
+def test_remote_training_rejects_non_sha_science_ref_before_checkout(
+    remote_training_doc: dict,
+) -> None:
+    steps = remote_training_doc["jobs"]["train"]["steps"]
+    assert "science_ref" in steps[0]["run"]
+    assert steps[1]["uses"].startswith("actions/checkout")
+
+
+# --- deploy-wizard.yml ---------------------------------------------------------
+
+
+def test_deploy_wizard_is_workflow_dispatch_only(deploy_wizard_doc: dict) -> None:
+    triggers = deploy_wizard_doc[True]
+    assert set(triggers) == {"workflow_dispatch"}
+
+
+def test_deploy_wizard_enforces_main_only(deploy_wizard_text: str) -> None:
+    assert "refs/heads/main" in deploy_wizard_text
+
+
+def test_deploy_wizard_uses_wizardofodds_environment(deploy_wizard_doc: dict) -> None:
+    assert deploy_wizard_doc["jobs"]["deploy"]["environment"] == "wizardofodds.com"
+
+
+def test_deploy_wizard_verifies_known_hosts(deploy_wizard_text: str) -> None:
+    assert "WIZARD_SSH_KNOWN_HOSTS" in deploy_wizard_text
+    assert "StrictHostKeyChecking=yes" in deploy_wizard_text
+
+
+def test_deploy_wizard_has_no_mac_filesystem_path(deploy_wizard_text: str) -> None:
+    assert "/Users/" not in deploy_wizard_text
+
+
+def test_deploy_wizard_has_no_hardcoded_secrets(deploy_wizard_text: str) -> None:
+    assert not _SECRET_LITERAL_RE.search(deploy_wizard_text)
+
+
+def test_deploy_wizard_is_namespaced_away_from_sibling_deployments(
+    deploy_wizard_doc: dict,
+) -> None:
+    assert "RELEASE_ROOT" in deploy_wizard_doc["env"]
+    # No step may reference a sibling deployment's path -- a prose comment
+    # naming "WNBA" as context (what NOT to touch) is fine.
+    assert "wnba" not in repr(deploy_wizard_doc).lower()
+
+
+# --- ci.yml ---------------------------------------------------------------------
+
+
+def test_ci_has_platform_scope_guard_job() -> None:
+    doc = _load(CI)
+    assert "platform-scope-guard" in doc["jobs"]
+    guard = doc["jobs"]["platform-scope-guard"]
+    assert guard["if"] == (
+        "github.event_name == 'pull_request' && "
+        "github.head_ref == 'work/platform-automation'"
+    )
+
+
+def test_ci_platform_scope_guard_is_restricted_to_platform_branch() -> None:
+    # The guard must only fire for the dedicated Platform-automation branch,
+    # never for every pull request -- otherwise a dev -> main integration PR
+    # (which legitimately carries certified science changes) would be
+    # misclassified as an out-of-scope Platform change.
+    doc = _load(CI)
+    guard_if = doc["jobs"]["platform-scope-guard"]["if"]
+    assert "github.head_ref" in guard_if
+    assert "work/platform-automation" in guard_if
+
+
+def test_ci_platform_scope_guard_diffs_against_actual_pr_base() -> None:
+    # The guard must compare against the PR's own base ref/merge-base, not a
+    # hardcoded `main`, so it stays correct when the Platform branch is
+    # based on something other than main (e.g. dev/nflprops-production).
+    text = CI.read_text()
+    guard_block = text.split("platform-scope-guard:", 1)[1]
+    assert "github.event.pull_request.base.ref" in guard_block
+    assert "git fetch origin main" not in guard_block
+    assert "merge-base origin/main" not in guard_block
+
+
+def test_ci_dev_to_main_integration_pr_will_not_trigger_platform_guard() -> None:
+    # Simulates evaluating the guard's `if` condition for a hypothetical
+    # dev/nflprops-production -> main PR: head_ref is the dev branch, not
+    # the Platform branch, so the guard must not run.
+    doc = _load(CI)
+    guard_if = doc["jobs"]["platform-scope-guard"]["if"]
+    head_ref = "dev/nflprops-production"
+    condition = guard_if.replace(
+        "github.head_ref == 'work/platform-automation'",
+        repr(head_ref == "work/platform-automation").lower(),
+    ).replace("github.event_name == 'pull_request'", "true")
+    assert condition == "true && false"
+
+
+def test_ci_runs_on_push_to_dev_integration_branch() -> None:
+    # The integrated dev branch must get ordinary CI on every push so the
+    # full suite runs in GitHub rather than only ever running on main.
+    doc = _load(CI)
+    assert "dev/nflprops-production" in doc[True]["push"]["branches"]
+    assert "main" in doc[True]["push"]["branches"]
+
+
+def test_ci_has_migration_head_validation_job() -> None:
+    doc = _load(CI)
+    assert "migration-head" in doc["jobs"]

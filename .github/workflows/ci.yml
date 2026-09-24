@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev/nflprops-production]
   pull_request:
   schedule:
     # Nightly provider schema-drift check. SPEC §7.
@@ -19,7 +19,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install -e ".[dev]"
+      # [orchestration] pulls in prefect -- required so tests/orchestration/*
+      # collect at all; those modules import nflprops.orchestration, which
+      # imports prefect (see the [project.optional-dependencies] comment in
+      # pyproject.toml). [storage] pulls in sqlalchemy/psycopg/alembic/boto3,
+      # required for the Docker-gated PostgreSQL/MinIO integration tests this
+      # job's own step name below claims to run. Neither is needed by core
+      # model code.
+      - run: pip install -e ".[dev,orchestration,storage]"
 
       - name: Validate machine-readable contracts
         run: python tools/validate_contracts.py
@@ -33,7 +40,10 @@ jobs:
       - name: Lint
         run: ruff check src tests
 
-      - name: Test
+      - name: Byte-compile every module
+        run: python -m compileall -q src
+
+      - name: Test (includes Docker-gated PostgreSQL/MinIO integration tests where available)
         run: pytest -q
 
       # --- architectural guards. These are the rules that keep the package
@@ -67,7 +77,11 @@ jobs:
         with:
           python-version: "3.11"
 
-      - run: pip install -e ".[dev]"
+      # See the matching comment on the `test` job: mypy must see
+      # prefect's/sqlalchemy's/etc. types to typecheck
+      # src/nflprops/orchestration/* and src/nflprops/data/storage/*
+      # correctly.
+      - run: pip install -e ".[dev,orchestration,storage]"
 
       - name: Strict mypy non-regression gate
         run: |
@@ -123,3 +137,55 @@ jobs:
         env:
           BDL_API_KEY: ${{ secrets.BDL_API_KEY }}
         run: nflprops provider drift bdl
+
+  migration-head:
+    # Alembic's migration graph must resolve to exactly one head. `alembic
+    # heads` only inspects migrations/versions/ -- it needs no DATABASE_URL.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[storage]"
+      - name: Validate single Alembic head
+        run: |
+          alembic heads | tee /tmp/alembic_heads.txt
+          COUNT=$(grep -c . /tmp/alembic_heads.txt || true)
+          if [ "$COUNT" -ne 1 ]; then
+            echo "FAIL: expected exactly one Alembic head, found $COUNT"
+            exit 1
+          fi
+
+  platform-scope-guard:
+    # PLATFORM AUTOMATION PRs must never touch model science or create a
+    # migration (§1/§2 of the platform brief). This guard is specific to the
+    # dedicated Platform-automation branch and compares against that PR's
+    # ACTUAL base ref/merge-base -- it must never run on the eventual
+    # dev/nflprops-production -> main integration PR, which legitimately
+    # carries certified science changes accumulated on dev since main.
+    if: github.event_name == 'pull_request' && github.head_ref == 'work/platform-automation'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Diff against PR base
+        run: |
+          git fetch origin "${{ github.event.pull_request.base.ref }}" --quiet
+          BASE="$(git merge-base origin/${{ github.event.pull_request.base.ref }} HEAD)"
+          echo "Comparing HEAD against merge-base $BASE (PR base: ${{ github.event.pull_request.base.ref }})"
+          git diff --name-only "$BASE"...HEAD > /tmp/changed_files.txt
+          cat /tmp/changed_files.txt
+
+          FORBIDDEN='^src/nflprops/(calibration|distributions|simulation|projections|thresholds)/|^src/nflprops/market/current_pricing\.py$'
+          if grep -E "$FORBIDDEN" /tmp/changed_files.txt; then
+            echo "FAIL: this PR touches model-science files (see § SCIENCE IS OUT OF SCOPE)"
+            exit 1
+          fi
+
+          if grep -E '^migrations/versions/' /tmp/changed_files.txt; then
+            echo "FAIL: this PR adds/modifies an Alembic migration (§ NO ALEMBIC MIGRATION IN THIS PARALLEL PHASE)"
+            exit 1
+          fi
+        # This job only guards the science/migration boundary described
+        # above; it deliberately does not gate on any other path.

@@ -102,7 +102,7 @@ class RosterEntry(PITMixin):
     depth: int | None = None
     player_name: str | None = None
     injury_status_raw: str | None = None
-    injury_status: InjuryStatusCanonical = InjuryStatusCanonical.UNKNOWN
+    injury_status: InjuryStatusCanonical = InjuryStatusCanonical.UNKNOWN_PROVIDER_STATUS
     raw_record_hash: str
 
 
@@ -463,7 +463,7 @@ class Injury(PITMixin):
 
     canonical_player_id: str
     status_raw: str | None = None
-    status: InjuryStatusCanonical = InjuryStatusCanonical.UNKNOWN
+    status: InjuryStatusCanonical = InjuryStatusCanonical.UNKNOWN_PROVIDER_STATUS
     comment: str | None = None
     date: datetime | None = None
     raw_record_hash: str
@@ -571,6 +571,7 @@ class GameOdds(PITMixin):
 
     canonical_game_id: str
     vendor: str
+    vendor_raw: str | None = None
     spread_home_value: Decimal | None = None
     spread_home_odds: int | None = None
     spread_away_value: Decimal | None = None
@@ -584,6 +585,7 @@ class GameOdds(PITMixin):
     opened_at: datetime | None = None
     is_opening: bool = False
     collector_received_at: datetime | None = None
+    raw_record_hash: str | None = None
 
 
 class PlayerProp(PITMixin):
@@ -597,6 +599,7 @@ class PlayerProp(PITMixin):
     canonical_game_id: str
     canonical_player_id: str
     vendor: str
+    vendor_raw: str | None = None
     prop_type: str
     line_value: Decimal | None = None
     market_type: MarketType
@@ -608,6 +611,7 @@ class PlayerProp(PITMixin):
     is_opening: bool = False
     collector_received_at: datetime
     minutes_to_start: float | None = None
+    raw_record_hash: str | None = None
 
 
 # ======================================================================= DFS

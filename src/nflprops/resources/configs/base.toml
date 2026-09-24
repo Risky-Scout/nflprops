@@ -89,6 +89,55 @@ max_confidence_tier = 2            # Tier 3 remains research-only until PBP labe
 consensus_method = "logit_median"
 truth_source_vendors = []        # empty: BDL has no sharp book. SPEC §6.
 
+[market.sportsbooks]
+# PHASE 3: provider-agnostic sportsbook policy. reference_book is display/
+# comparison-only -- its absence must never fail ingestion or prediction.
+# blocked names are canonicalized (case-insensitive) before matching.
+allow_all_supported = true
+blocked = []
+reference_book = "bet365"
+
+[collection]
+# PHASE 4: generalized continuous point-in-time collection. Retry/backoff
+# reuses [provider.bdl.retry] (BDLClient's existing retry loop) rather than a
+# second, competing retry configuration -- see nflprops.collection.service.
+enabled = true
+no_future_game_poll_seconds = 1800
+
+[collection.cadence]
+# Game-relative polling interval, keyed by time-to-kickoff of the nearest
+# unstarted game. Boundaries are upper-inclusive on the nearer edge; see
+# nflprops.collection.cadence.cadence_seconds for the exact rule.
+gt_48h_seconds = 1800
+h48_to_h24_seconds = 1200
+h24_to_h6_seconds = 600
+h6_to_m90_seconds = 300
+m90_to_m30_seconds = 120
+m30_to_kickoff_seconds = 60
+
+[orchestration]
+# PHASE 5: Prefect orchestration around the existing collector and pregame
+# prediction pipeline. This section controls the orchestration layer only --
+# it never changes collection or prediction behavior itself.
+enabled = true
+prefect_work_pool = "nflprops-production"
+dispatcher_tick_seconds = 60
+
+[checkpoints]
+# Official, game-relative pregame prediction checkpoints. scheduled_as_of =
+# kickoff_at - offset_seconds is the model knowledge-time cutoff; it is
+# never the wall-clock time a worker happens to run -- see
+# nflprops.orchestration.checkpoints and docs/ORCHESTRATION_ARCHITECTURE.md.
+enabled = true
+catch_up_before_kickoff = true
+
+[checkpoints.offset_seconds]
+T48H = 172800
+T24H = 86400
+T6H = 21600
+T90M = 5400
+T30M = 1800
+
 [market.collector]
 # SPEC §58 — BDL retains no live prop history. Deploy this before week 1.
 checkpoints = ["OPEN","T-48H","T-24H","T-12H","T-6H","T-3H","T-1H","T-30M","T-10M","CLOSE"]

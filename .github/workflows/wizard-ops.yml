@@ -1,0 +1,129 @@
+name: Wizard Runtime Ops
+
+# BLOCK 3: a FIXED menu of auditable operations against the live Wizard
+# runtime (deploy/wizard/ops.sh, streamed over SSH). workflow_dispatch
+# only, main-only, the same protected wizardofodds.com environment and
+# strict known_hosts SSH as deploy-wizard.yml. No arbitrary commands:
+# the operation is a choice input and every argument is format-validated.
+#
+#   status / report / verify-snapshot   read-only
+#   collect-once                        ONE explicit MANUAL collection cycle
+#   manual-checkpoint                   claim + PREPARE one MANUAL checkpoint
+#                                       (never science, never publication)
+#   restart                             scoped restart of nflprops-runtime
+#                                       only, gated on health
+#
+# Never touches any other service, nginx, DNS, or any path outside
+# /home/wizard-deploy/nflprops.
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "Operation"
+        required: true
+        type: choice
+        options:
+          - status
+          - report
+          - collect-once
+          - manual-checkpoint
+          - verify-snapshot
+          - restart
+      game_id:
+        description: "manual-checkpoint: canonical game id (UUID)"
+        required: false
+        type: string
+      as_of:
+        description: "manual-checkpoint: ISO-8601 UTC cutoff, e.g. 2026-09-23T20:00:00+00:00 (must be <= now)"
+        required: false
+        type: string
+      season:
+        description: "manual-checkpoint: season"
+        required: false
+        type: string
+      week:
+        description: "manual-checkpoint: week"
+        required: false
+        type: string
+      snapshot_id:
+        description: "verify-snapshot: snapshot id"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  RUNTIME_ROOT: /home/wizard-deploy/nflprops
+
+concurrency:
+  group: wizard-ops
+  cancel-in-progress: false
+
+jobs:
+  ops:
+    name: ${{ inputs.operation }}
+    runs-on: ubuntu-latest
+    environment: wizardofodds.com
+    steps:
+      - name: Enforce main-only + validate inputs
+        env:
+          OPERATION: ${{ inputs.operation }}
+          GAME_ID: ${{ inputs.game_id }}
+          AS_OF: ${{ inputs.as_of }}
+          SEASON: ${{ inputs.season }}
+          WEEK: ${{ inputs.week }}
+          SNAPSHOT_ID: ${{ inputs.snapshot_id }}
+        run: |
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "::error::Wizard ops may only run from main (got ${{ github.ref }})"; exit 1
+          fi
+          case "$OPERATION" in
+            manual-checkpoint)
+              [[ "$GAME_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || { echo "::error::game_id must be a canonical UUID"; exit 1; }
+              [[ "$AS_OF" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\+00:00|Z)$ ]] || { echo "::error::as_of must be ISO-8601 UTC"; exit 1; }
+              [[ "$SEASON" =~ ^20[0-9]{2}$ ]] || { echo "::error::season must be a year"; exit 1; }
+              [[ "$WEEK" =~ ^[0-9]{1,2}$ ]] || { echo "::error::week must be a number"; exit 1; }
+              ;;
+            verify-snapshot)
+              [[ "$SNAPSHOT_ID" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$ ]] || { echo "::error::snapshot_id format"; exit 1; }
+              ;;
+          esac
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install SSH key and verified known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.WIZARD_SSH_PRIVATE_KEY }}" > ~/.ssh/wizard_deploy_key
+          chmod 600 ~/.ssh/wizard_deploy_key
+          printf '%s\n' "${{ secrets.WIZARD_SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Run operation
+        env:
+          SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+          OPERATION: ${{ inputs.operation }}
+          GAME_ID: ${{ inputs.game_id }}
+          AS_OF: ${{ inputs.as_of }}
+          SEASON: ${{ inputs.season }}
+          WEEK: ${{ inputs.week }}
+          SNAPSHOT_ID: ${{ inputs.snapshot_id }}
+        run: |
+          REMOTE="${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}"
+          ARGS=()
+          case "$OPERATION" in
+            manual-checkpoint) ARGS=("$GAME_ID" "$AS_OF" "$SEASON" "$WEEK") ;;
+            verify-snapshot) ARGS=("$SNAPSHOT_ID") ;;
+          esac
+          # shellcheck disable=SC2086
+          ssh $SSH_OPTS "$REMOTE" bash -s -- "$OPERATION" "$RUNTIME_ROOT" "${ARGS[@]}" \
+            < deploy/wizard/ops.sh
+
+      - name: Cleanup SSH material
+        if: always()
+        run: rm -f ~/.ssh/wizard_deploy_key ~/.ssh/known_hosts

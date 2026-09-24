@@ -1,0 +1,152 @@
+name: Remote Training Smoke (GitHub-hosted)
+
+# Proves the GitHub-hosted execution path for `remote-training.yml`'s
+# Platform -> Science handoff on every push to dev/nflprops-production --
+# before workflow_dispatch is reachable there (GitHub only offers manual
+# dispatch for a workflow file that already exists on the default branch).
+# See docs/PLATFORM_AUTOMATION.md.
+#
+# Structurally incapable of producing promotion evidence or touching
+# production state:
+#   - `--mode smoke` is hardcoded below; there is no dispatch input here to
+#     escalate it, and `nflprops.platform.remote_training` independently
+#     forces `promotion_evidence_eligible=False` for every non-production
+#     mode regardless of what the Science entry point itself reports.
+#   - Draw count is capped by `remote_training.MAX_SMOKE_N_DRAWS`, far below
+#     the `PRODUCTION_N_DRAWS=20000` lock.
+#   - Training data is a small synthetic fixture generated in-repo by
+#     `tools/generate_smoke_warehouse.py` -- never the real historical
+#     snapshot, never downloaded from an object store. No
+#     OBJECT_STORE_*/DATABASE_URL secret is read by this workflow.
+#   - No champion promotion function is called anywhere in this path (see
+#     tests/platform/test_remote_training.py::test_module_never_imports_or_calls_promotion).
+
+on:
+  push:
+    branches: [dev/nflprops-production]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remote-training-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: GitHub-hosted training smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify checked-out SHA matches github.sha
+        run: |
+          ACTUAL="$(git rev-parse HEAD)"
+          if [ "$ACTUAL" != "${{ github.sha }}" ]; then
+            echo "::error::checked out $ACTUAL but github.sha was ${{ github.sha }}"
+            exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project (Platform harness + Science; no storage/orchestration
+          extras needed -- the fixture warehouse only touches base deps)
+        run: pip install -e ".[dev]"
+
+      - name: Record pre-run resource telemetry
+        run: |
+          {
+            echo "runner_os: $(uname -a)"
+            echo "cpu_count: $(nproc)"
+            echo "ram_mb: $(free -m | awk '/Mem:/ {print $2}')"
+            echo "disk_avail_kb_before: $(df --output=avail -k "$RUNNER_TEMP" | tail -1 | tr -d ' ')"
+          } | tee "$RUNNER_TEMP/resource_telemetry.txt"
+
+      - name: Generate synthetic version-controlled fixture warehouse (never real historical data)
+        run: |
+          python tools/generate_smoke_warehouse.py --output-dir "$RUNNER_TEMP/smoke-warehouse" \
+            | tee "$RUNNER_TEMP/fixture_gen.txt"
+          grep '^SMOKE_DATA_MANIFEST_SHA256=' "$RUNNER_TEMP/fixture_gen.txt" >> "$GITHUB_ENV"
+
+      - name: Run GitHub-hosted smoke training (Platform -> Science handoff)
+        run: |
+          set +e
+          START_EPOCH=$(date +%s)
+          if command -v /usr/bin/time >/dev/null 2>&1; then
+            /usr/bin/time -v -o "$RUNNER_TEMP/time_v.txt" \
+              python -m nflprops.platform.remote_training run \
+                --science-ref "${{ github.sha }}" \
+                --data-manifest-sha256 "$SMOKE_DATA_MANIFEST_SHA256" \
+                --mode smoke \
+                --entry-point nflprops.calibration.phase10c3a_runner \
+                --data-dir "$RUNNER_TEMP/smoke-warehouse" \
+                --report-path "$RUNNER_TEMP/remote_training_smoke_report.json" \
+                --repository "${{ github.repository }}" \
+                --workflow-sha "${{ github.sha }}"
+            STATUS=$?
+            cat "$RUNNER_TEMP/time_v.txt" >> "$RUNNER_TEMP/resource_telemetry.txt"
+          else
+            echo "max_rss: GNU time unavailable on this runner image" >> "$RUNNER_TEMP/resource_telemetry.txt"
+            python -m nflprops.platform.remote_training run \
+              --science-ref "${{ github.sha }}" \
+              --data-manifest-sha256 "$SMOKE_DATA_MANIFEST_SHA256" \
+              --mode smoke \
+              --entry-point nflprops.calibration.phase10c3a_runner \
+              --data-dir "$RUNNER_TEMP/smoke-warehouse" \
+              --report-path "$RUNNER_TEMP/remote_training_smoke_report.json" \
+              --repository "${{ github.repository }}" \
+              --workflow-sha "${{ github.sha }}"
+            STATUS=$?
+          fi
+          END_EPOCH=$(date +%s)
+          {
+            echo "elapsed_seconds: $((END_EPOCH - START_EPOCH))"
+            echo "exit_status: $STATUS"
+          } >> "$RUNNER_TEMP/resource_telemetry.txt"
+          exit $STATUS
+
+      - name: Verify smoke report is structurally ineligible for promotion
+        if: success()
+        run: |
+          python - <<'PY'
+          import json
+          import os
+
+          path = os.path.join(os.environ["RUNNER_TEMP"], "remote_training_smoke_report.json")
+          with open(path) as fh:
+              report = json.load(fh)
+
+          assert report["exit_status"] == "SUCCEEDED", report
+          assert report["mode"] == "smoke", report
+          assert report["promotion_evidence_eligible"] is False, report
+          assert report["n_draws"] <= 2000, report
+
+          print("SMOKE_REPORT_VERIFIED: mode=smoke, promotion_evidence_eligible=False, "
+                f"n_draws={report['n_draws']}")
+          PY
+
+      - name: Record post-run disk telemetry
+        if: always()
+        run: |
+          echo "disk_avail_kb_after: $(df --output=avail -k "$RUNNER_TEMP" | tail -1 | tr -d ' ')" \
+            >> "$RUNNER_TEMP/resource_telemetry.txt"
+          cat "$RUNNER_TEMP/resource_telemetry.txt"
+
+      - name: Clean up ephemeral fixture warehouse
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/smoke-warehouse"
+
+      - name: Upload smoke run report and resource telemetry
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-training-smoke-${{ github.run_id }}
+          if-no-files-found: warn
+          retention-days: 90
+          path: |
+            ${{ runner.temp }}/remote_training_smoke_report.json
+            ${{ runner.temp }}/resource_telemetry.txt

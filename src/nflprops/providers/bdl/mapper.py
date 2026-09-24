@@ -2,14 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
-from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
-
-from pydantic import BaseModel
 
 from nflprops.domain.enums import (
     GameStatusState,
@@ -18,6 +13,7 @@ from nflprops.domain.enums import (
     PositionGroup,
     SeasonType,
 )
+from nflprops.domain.hashing import hash_payload
 from nflprops.domain.ids import (
     canonical_dfs_slate_id,
     canonical_game_id,
@@ -46,6 +42,7 @@ from nflprops.domain.models import (
     TeamGameStat,
     TeamSeasonStat,
 )
+from nflprops.market.vendors import canonical_vendor
 from nflprops.providers.bdl.quirks import (
     normalize_experience,
     normalize_injury_status,
@@ -104,14 +101,9 @@ class MappingContext:
         return self.available_at or self.ingested_at
 
 
-def _dump(value: BaseModel | Mapping[str, Any]) -> dict[str, Any]:
-    return value.model_dump(mode="python") if isinstance(value, BaseModel) else dict(value)
-
-
-def _hash_record(value: BaseModel | Mapping[str, Any]) -> str:
-    payload = _dump(value)
-    blob = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":"))
-    return hashlib.sha256(blob.encode()).hexdigest()
+# Provider-neutral (PHASE 3): moved to nflprops.domain.hashing so a non-BDL
+# provider can fingerprint payloads without importing this module.
+_hash_record = hash_payload
 
 
 def _pit(
@@ -478,7 +470,8 @@ def map_game_odds(
     return GameOdds(
         **_pit(ctx, raw.id, event_time=event_time),
         canonical_game_id=canonical_game_id(PROVIDER, raw.game_id),
-        vendor=raw.vendor,
+        vendor=canonical_vendor(raw.vendor),
+        vendor_raw=raw.vendor,
         spread_home_value=parse_decimal_line(raw.spread_home_value),
         spread_home_odds=raw.spread_home_odds,
         spread_away_value=parse_decimal_line(raw.spread_away_value),
@@ -492,6 +485,7 @@ def map_game_odds(
         opened_at=opened,
         is_opening=opening,
         collector_received_at=ctx.ingested_at,
+        raw_record_hash=_hash_record(raw),
     )
 
 
@@ -513,7 +507,8 @@ def map_player_prop(
         **_pit(ctx, raw.id, event_time=opened or updated),
         canonical_game_id=canonical_game_id(PROVIDER, raw.game_id),
         canonical_player_id=canonical_player_id(PROVIDER, raw.player_id),
-        vendor=raw.vendor,
+        vendor=canonical_vendor(raw.vendor),
+        vendor_raw=raw.vendor,
         prop_type=raw.prop_type,
         line_value=parse_decimal_line(raw.line_value),
         market_type=market_type,
@@ -525,6 +520,7 @@ def map_player_prop(
         is_opening=opening,
         collector_received_at=ctx.ingested_at,
         minutes_to_start=minutes_to_start,
+        raw_record_hash=_hash_record(raw),
     )
 
 

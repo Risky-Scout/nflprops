@@ -36,6 +36,17 @@ def get(name: str) -> Factory:
         ) from exc
 
 
+def get_provider(name: str, *factory_args: Any, **factory_kwargs: Any) -> Any:
+    """Construct the registered provider named `name`.
+
+    The single provider-name-driven construction entry point (PHASE 3): looks
+    the factory up via `get` (which fails explicitly with `KeyError` on an
+    unregistered name -- never silently falls back to any default provider)
+    and calls it. Equivalent to `get(name)(*factory_args, **factory_kwargs)`.
+    """
+    return get(name)(*factory_args, **factory_kwargs)
+
+
 def capabilities(name: str, *factory_args: Any, **factory_kwargs: Any) -> set[str]:
     """Instantiate the provider and report satisfied runtime-checkable protocols."""
     provider = get(name)(*factory_args, **factory_kwargs)

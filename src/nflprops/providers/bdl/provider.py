@@ -147,6 +147,11 @@ class BDLProvider:
     def _ctx() -> MappingContext:
         return MappingContext.now()
 
+    def pop_retry_count(self) -> int:
+        """PHASE 4: optional collection-telemetry hook. Delegates to the
+        client's single existing retry loop; see BDLClient.pop_retry_count."""
+        return self.client.pop_retry_count()
+
     @staticmethod
     def _data(response: dict) -> list[dict]:
         data = response.get("data", [])

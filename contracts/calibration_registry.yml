@@ -1,0 +1,170 @@
+# =====================================================================
+# JOINT-GAME CALIBRATION ARTIFACT REGISTRY (NORMATIVE) -- PHASE 10C1
+#
+# Governs the calibration-artifact registry only: identity, compatibility,
+# lifecycle, and champion-resolution RULES. It contains NO fitted
+# parameters and NO validation measurements -- those live in the
+# calibration_artifacts / calibration_validations rows themselves
+# (migrations/versions/0008_calibration_artifact_registry.py).
+#
+# SCIENTIFIC ARCHITECTURE LOCK (Phase 10C-A, locked here):
+#   Public calibrated inference uses exactly ONE approved calibrator per
+#   (scope_type, checkpoint_scope, compatibility_digest) key, producing
+#   ONE shared weight vector over complete coherent joint-game draws. That
+#   same vector generates every calibrated player/prop PMF, threshold
+#   probability, and public Win Chance/Fair Price/Model Edge for that
+#   game. There is NO separate player calibrator, PropType calibrator,
+#   position calibrator, or prop-family calibrator at the live public
+#   scope -- doing so would imply multiple simultaneous weight vectors
+#   over the same game and break joint coherence. Position/prop-family/
+#   PropType groupings may exist only as validation/diagnostic strata or
+#   training loss components (PHASE 10C2+), never as an independent live
+#   public calibration scope.
+#
+# Phase 10C1 builds the registry only: no algorithm, no fitting, no draw
+# weights, no calibrated PMFs. See docs/... (Phase 10C-A audit) for the
+# full architectural rationale.
+# =====================================================================
+
+schema_version: "2026.1.0"
+
+# The only calibration scope Phase 10C1 (and, per the architecture lock,
+# every future phase) may register a LIVE PUBLIC artifact against.
+supported_scope_types:
+  - JOINT_GAME
+
+# Checkpoint applicability an artifact may declare. ALL_PREGAME_CHECKPOINTS
+# means one artifact is applicable to every official pregame checkpoint
+# (T48H/T24H/T6H/T90M/T30M); a specific checkpoint name restricts an
+# artifact to that one checkpoint only. Phase 10C1 does not assume any
+# checkpoint-specific artifact will actually be trained -- Phase 10C2
+# decides whether enough evidence exists to justify one.
+checkpoint_scopes:
+  - ALL_PREGAME_CHECKPOINTS
+  - T48H
+  - T24H
+  - T6H
+  - T90M
+  - T30M
+
+# The EXACT, ordered field list a compatibility digest is computed over
+# (nflprops.calibration.artifact.compute_compatibility_digest). Training
+# cutoff, validation data, and payload hash are deliberately EXCLUDED --
+# they distinguish one artifact from another but do not define whether an
+# artifact is structurally compatible with an active model/config.
+compatibility_digest_fields:
+  - base_model_version
+  - simulation_config_version
+  - feature_contract_version
+  - prop_contract_version
+  - calibration_contract_version
+  - scope_type
+  - checkpoint_scope
+
+# The EXACT, ordered field list a calibration_artifact_id is computed over
+# (nflprops.calibration.artifact.compute_calibration_artifact_id). A
+# superset of the compatibility-digest fields, plus the fields that make
+# one fitted artifact scientifically distinct from another with the same
+# compatibility profile.
+artifact_identity_fields:
+  - calibration_schema_version
+  - algorithm_family
+  - algorithm_version
+  - scope_type
+  - checkpoint_scope
+  - base_model_version
+  - simulation_config_version
+  - feature_contract_version
+  - prop_contract_version
+  - calibration_contract_version
+  - training_cutoff
+  - training_manifest_sha256
+  - payload_sha256
+  - code_sha
+
+# Every immutable scientific column on calibration_artifacts (everything
+# except created_at, which is operational metadata only and excluded from
+# scientific equality).
+artifact_immutable_fields:
+  - calibration_artifact_id
+  - calibration_schema_version
+  - algorithm_family
+  - algorithm_version
+  - scope_type
+  - checkpoint_scope
+  - base_model_version
+  - simulation_config_version
+  - feature_contract_version
+  - prop_contract_version
+  - calibration_contract_version
+  - training_cutoff
+  - training_start
+  - training_end
+  - training_manifest_sha256
+  - code_sha
+  - payload_format
+  - payload_schema_version
+  - object_uri
+  - payload_sha256
+  - payload_byte_count
+  - scientific_content_sha256
+
+# Append-only lifecycle event types (calibration_lifecycle_events.event_type).
+lifecycle_event_types:
+  - REGISTERED
+  - APPROVED
+  - PROMOTED
+  - INVALIDATED
+  - RETIRED
+
+# Terminal lifecycle states: once reached, no further APPROVED/PROMOTED
+# event may ever be recorded for that artifact, and resolve_calibration_
+# champion must never return it -- irrespective of what the (possibly
+# stale) calibration_champions pointer says.
+terminal_ineligible_event_types:
+  - INVALIDATED
+  - RETIRED
+
+# The `calibration_validations` boolean gates that must ALL be true for an
+# APPROVED lifecycle event to be recorded against a validation row
+# ("a successful validation record", PHASE 10C1 §9). `promotion_gate_passed`
+# is deliberately NOT in this list: it is a strictly stronger, separate bar
+# required only for PROMOTED (see promotion_required_gates below).
+approval_required_gates:
+  - chronology_checks_passed
+  - leakage_checks_passed
+  - simulation_invariants_passed
+  - reproducibility_passed
+  - support_preservation_passed
+  - first_td_simplex_passed
+
+# The additional gate required, on top of an existing APPROVED event and
+# an exact compatibility-digest match, before a PROMOTED event may change
+# a calibration_champions pointer.
+promotion_required_gates:
+  - promotion_gate_passed
+
+rules:
+  # No wall-clock-based invalidation of any kind. An artifact/champion
+  # never becomes ineligible merely because time has passed or because a
+  # daily calibration job found no new settled labels; only an explicit
+  # INVALIDATED/RETIRED lifecycle event changes eligibility.
+  no_wall_clock_expiry: true
+
+  # resolve_calibration_champion requires an EXACT compatibility-digest
+  # match. A broader/narrower or partially-matching scope, or a different
+  # base model / simulation config / feature / prop / calibration contract
+  # version, never resolves -- there is no silent fallback to a "close
+  # enough" calibrator, and no raw-model fallback of any kind.
+  exact_champion_resolution: true
+
+  # A live public calibration scope is exactly JOINT_GAME. No live
+  # position/prop-family/PropType-scoped public calibrator is permitted
+  # by this contract, now or in any later phase, without a superseding
+  # contract revision.
+  live_scope_is_joint_game_only: true
+
+  # Registering a new artifact never changes any calibration_champions
+  # row. Only an explicit, successful promote operation may do so ("no
+  # latest-artifact-wins").
+  registration_never_promotes: true

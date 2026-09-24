@@ -169,6 +169,18 @@ def prediction(
                 prediction_id
             ],
             "as_of": [AS_OF],
+            "quote_available_at": [
+                AS_OF - timedelta(hours=1)
+            ],
+            "quote_time_source": [
+                "available_at"
+            ],
+            "quote_age_seconds": [
+                3600.0
+            ],
+            "injury_data_available": [
+                False
+            ],
             "game_id": ["g1"],
             "player_id": [player_id],
             "prop_type": [
@@ -242,6 +254,22 @@ def test_real_historical_predict_contract_is_used() -> None:
 
     assert rows.height == 1
     assert rows["prediction_id"][0] == "pred-1"
+    assert (
+        rows["quote_available_at"][0]
+        == AS_OF - timedelta(hours=1)
+    )
+    assert (
+        rows["quote_time_source"][0]
+        == "available_at"
+    )
+    assert (
+        rows["quote_age_seconds"][0]
+        == 3600.0
+    )
+    assert (
+        rows["injury_data_available"][0]
+        is False
+    )
     assert rows["season"][0] == 2025
     assert rows["week"][0] == 1
     assert rows["checkpoint_id"][0] == "2025-w1-g1"

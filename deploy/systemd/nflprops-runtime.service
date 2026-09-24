@@ -1,0 +1,107 @@
+# nflprops runtime unit (BLOCK 3: the real long-running runtime). Installed
+# ONCE by root (see "One-time root setup" in docs/PLATFORM_AUTOMATION.md);
+# restarted by deploy-wizard.yml via a scoped sudoers rule. Never installed
+# on a developer machine.
+#
+# This is the ONE runtime-owner process on the Wizard host that is allowed
+# to mutate the canonical local DuckDB/Parquet warehouse (collector,
+# checkpoint scheduler-worker, snapshot creation) -- preferring one owner
+# process, rather than several independently-scheduled ones, is what makes
+# the single-writer guarantee (nflprops.platform.writer_lock) trivial to
+# reason about: every write already happens from inside this one unit.
+#
+# Installing the unit does not start it: the first deploy-wizard.yml run
+# (after its pre-activation checks pass) restarts it, which begins live
+# collection; `systemctl enable` (root, after certification) keeps it
+# running across reboots.
+#
+# Layout (MEASURED by BLOCK 2B's read-only Wizard probe -- see the BLOCK
+# 2B final report in docs/PLATFORM_AUTOMATION.md): the wizard-deploy user
+# can write ONLY under /home/wizard-deploy (not /var/lib, /var/log,
+# /opt/wizardofodds, or /etc), so every nflprops path lives under one
+# isolated root:
+#
+#   /home/wizard-deploy/nflprops/
+#       current/  releases/  state/  snapshots/  publications/
+#       backups/  logs/  locks/
+#       nflprops-runtime.env   (mode 600, outside git, never overwritten)
+#
+#   - Ubuntu (the existing WizardOfOdds host), 1 CPU / 1.9 GiB RAM with
+#     swap already saturated at probe time -> exactly ONE lightweight
+#     process, hard memory/task caps below, no heavy compute ever (20k-draw
+#     simulation, replay, training, calibration stay on GitHub Actions)
+#   - Release tree: $RELEASE_ROOT=/home/wizard-deploy/nflprops, `current`
+#     symlink atomically flipped by deploy-wizard.yml (WorkingDirectory/
+#     ExecStart follow that symlink, so a release swap needs no unit edit)
+#   - Runs as the existing SSH deploy user (wizard-deploy) -- no second,
+#     separately-privileged system user
+#   - NFLPROPS_DATA_ROOT=/home/wizard-deploy/nflprops/state (warehouse
+#     tables at state/canonical, DuckDB at state/nflprops.duckdb, raw
+#     payloads at state/raw),
+#     NFLPROPS_RUNTIME_ROOT=/home/wizard-deploy/nflprops (snapshots/,
+#     publications/, locks/writer.lock) -- never /home/wizard-deploy/
+#     nfl-production-2026 or /var/www/sportsodds, the existing unrelated
+#     workloads on this host (nflprops.platform.runtime_layout refuses any
+#     overlap)
+#   - Secrets/environment live ONLY in the env file above, never in this
+#     unit file (which is often world-readable)
+#
+# Executable: the ACTIVE release's own venv, via the `current` symlink --
+# /home/wizard-deploy/nflprops/current/.venv/bin/python, built per release
+# by deploy/wizard/prepare_release.sh. ExecStart may ONLY run the
+# lightweight runtime: never training, historical replay, the 20k-draw
+# simulation, or calibration optimization -- that heavy work stays on
+# GitHub Actions (enforced by tests/platform/test_wizard_deploy_release.py).
+#
+# One-time root setup (Block 3; NOT run by anything in BLOCK 2B, never by
+# GitHub, which has no root): see "One-time root setup" in
+# docs/PLATFORM_AUTOMATION.md for the exact commands -- install this unit
+# and a sudoers drop-in allowing wizard-deploy ONLY
+# `/usr/bin/systemctl restart nflprops-runtime.service`.
+
+[Unit]
+Description=NFL Props Wizard Runtime (lightweight collection + checkpoint preparation)
+After=network-online.target time-sync.target
+Wants=network-online.target
+# Bounded restart policy: at most 5 starts per 10 minutes, then systemd
+# stops retrying (a persistent failure is surfaced, never hot-looped).
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+# BLOCK 3: the real long-running foreground runtime
+# (nflprops.platform.runtime_loop via nflprops.platform.wizard_runtime run):
+# locked-cadence PIT collection, official checkpoint scheduling/PREPARATION
+# (claim + manifest + immutable snapshot, pending GitHub execution) and
+# bounded snapshots. It never runs checkpoint science, training, replay,
+# the 20k-draw simulation, or calibration -- that stays on GitHub Actions.
+Type=simple
+User=wizard-deploy
+Group=wizard-deploy
+WorkingDirectory=/home/wizard-deploy/nflprops/current
+EnvironmentFile=/home/wizard-deploy/nflprops/nflprops-runtime.env
+ExecStart=/home/wizard-deploy/nflprops/current/.venv/bin/python -m nflprops.platform.wizard_runtime run
+# SIGTERM -> the runtime finishes its current step, writes its final
+# status, closes the provider client, and exits 0.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=30
+
+# Lightweight-runtime caps (probe: 1 CPU, 1.9 GiB RAM, swap saturated).
+# Exceeding them is an alert condition, never a reason to grow.
+MemoryHigh=384M
+MemoryMax=512M
+MemorySwapMax=0
+TasksMax=16
+CPUQuota=50%
+Nice=10
+
+# Hardening: this process only ever needs its own isolated state tree.
+ProtectSystem=strict
+ReadWritePaths=/home/wizard-deploy/nflprops
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

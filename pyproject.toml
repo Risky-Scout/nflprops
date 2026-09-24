@@ -48,6 +48,31 @@ dev = [
   "mypy==2.3.1",
   "types-PyYAML",
 ]
+# Production storage backend (PHASE 1: managed PostgreSQL + S3-compatible object
+# storage). The local DuckDB/Parquet warehouse remains dependency-free; these are
+# only imported when NFLPROPS_STORAGE_BACKEND=postgres or an object-store client
+# is constructed.
+storage = [
+  "sqlalchemy>=2.0",
+  "psycopg[binary]>=3.1",
+  "alembic>=1.13",
+  "boto3>=1.34",
+]
+# PHASE 5: Prefect orchestration around the existing collector and pregame
+# prediction pipeline. Core model modules (simulation, state, backtest,
+# market math, collection) never import prefect -- only nflprops.orchestration
+# does, and only in tasks.py/flows/*.py/deployments.py.
+orchestration = [
+  "prefect>=3,<4",
+]
+# BLOCK 2B: the lightweight Wizard runtime release venv installs
+# `.[orchestration,runtime]` (deploy/wizard/prepare_release.sh). `runtime`
+# adds only what `nflprops platform health` needs beyond the core
+# dependencies (alembic, to report the migration head) -- no database
+# driver, no object-store client, no training-only challenger packages.
+runtime = [
+  "alembic>=1.13",
+]
 
 [project.scripts]
 nflprops = "nflprops.cli:app"
@@ -64,6 +89,7 @@ markers = [
   "leakage: point-in-time correctness detectors",
   "determinism: byte-level reproducibility",
   "slow: long-running",
+  "docker: requires a local Docker daemon (PostgreSQL/MinIO integration tests)",
 ]
 
 [tool.ruff]

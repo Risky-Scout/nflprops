@@ -94,5 +94,16 @@ class ConvergenceError(NflpropsError):
     """Monte Carlo did not reach the target standard error within max_draws."""
 
 
+class ProjectionError(NflpropsError):
+    """A player-game projection could not be built from a coherent simulation.
+
+    Raised by `nflprops.projections` when a registry stat has no draw vector
+    for an eligible player, a vector's length disagrees with `n_draws`, or a
+    vector contains a non-finite value. Never downgraded: a projection is
+    published whole or not at all. An existing coherent all-zero vector is
+    valid and is NOT an error.
+    """
+
+
 class NotFittedError(NflpropsError):
     """A component model was asked to predict before being fitted."""

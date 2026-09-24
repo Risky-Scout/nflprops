@@ -1,0 +1,197 @@
+name: Wizard Snapshot Transfer (foundation)
+
+# BLOCK 2B foundation only (docs/PLATFORM_AUTOMATION.md): implements and
+# tests the transport/verification boundary between GitHub and the
+# Wizard host's immutable warehouse snapshots (task §4) and result
+# bundles (task §5). Nothing in this repository triggers this workflow
+# automatically -- workflow_dispatch only, mirroring deploy-wizard.yml.
+#
+# GitHub NEVER opens the live DuckDB warehouse for writes and NEVER
+# mutates a snapshot it downloads:
+#   - download-snapshot only ever reads an already-published, already-
+#     immutable snapshot directory over SCP into RUNNER_TEMP, then
+#     independently verifies it (manifest SHA + every file's SHA/size)
+#     before trusting it for anything downstream.
+#   - upload-result-bundle only ever builds+verifies a result bundle
+#     locally, then hands it to the WIZARD RUNTIME OWNER (the already-
+#     deployed `nflprops` CLI on the Wizard host, via
+#     deploy-wizard.yml's release) to atomically publish into a staging
+#     "incoming" area -- GitHub itself never touches the live warehouse
+#     file, and installing a published bundle into live state is a
+#     separate, later, explicit step this block does not implement.
+#
+# Everything this workflow touches on the Wizard host is namespaced
+# under $SNAPSHOT_ROOT / $RESULT_BUNDLE_ROOT (both under
+# /home/wizard-deploy/nflprops, the isolated runtime root approved by
+# BLOCK 2B's read-only Wizard probe) -- it never
+# writes to the existing WNBA deployment, the existing separate NFL
+# game-model deployment, /home/wizard-deploy/nfl-production-2026,
+# /var/www/sportsodds, nginx, or DNS.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "download-snapshot or upload-result-bundle"
+        required: true
+        type: choice
+        options:
+          - download-snapshot
+          - upload-result-bundle
+      snapshot_id:
+        description: "Explicit snapshot_id (required for download-snapshot)."
+        required: false
+        type: string
+      expected_manifest_sha256:
+        description: "Explicit expected manifest SHA-256 (required for download-snapshot)."
+        required: false
+        type: string
+      bundle_id:
+        description: "Explicit result-bundle id (required for upload-result-bundle)."
+        required: false
+        type: string
+      science_sha:
+        description: "Science git SHA that produced the result bundle (upload-result-bundle)."
+        required: false
+        type: string
+      source_dir:
+        description: "Directory (in this checkout) of files to package into the result bundle (upload-result-bundle)."
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  # Isolated entirely under /home/wizard-deploy/nflprops -- the
+  # probe-approved runtime root (wizard-deploy cannot write /var/lib or
+  # /opt/wizardofodds), never a path any other Wizard service uses.
+  SNAPSHOT_ROOT: /home/wizard-deploy/nflprops/snapshots
+  RESULT_BUNDLE_ROOT: /home/wizard-deploy/nflprops/publications
+  WIZARD_RELEASE_PYTHON: /home/wizard-deploy/nflprops/current/.venv/bin/python
+
+jobs:
+  download-snapshot:
+    if: inputs.action == 'download-snapshot'
+    name: Download + verify an immutable Wizard snapshot
+    runs-on: ubuntu-latest
+    environment: wizardofodds.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate required inputs (explicit snapshot_id + expected manifest SHA)
+        run: |
+          if [ -z "${{ inputs.snapshot_id }}" ]; then
+            echo "::error::snapshot_id is required"; exit 1
+          fi
+          if ! [[ "${{ inputs.snapshot_id }}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::snapshot_id must be a plain identifier (no path separators)"; exit 1
+          fi
+          if ! [[ "${{ inputs.expected_manifest_sha256 }}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "::error::expected_manifest_sha256 must be an explicit 64-character hex SHA-256"; exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -e ".[dev]"
+
+      - name: Install SSH key and verified known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.WIZARD_SSH_PRIVATE_KEY }}" > ~/.ssh/wizard_deploy_key
+          chmod 600 ~/.ssh/wizard_deploy_key
+          printf '%s\n' "${{ secrets.WIZARD_SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Download the exact snapshot_id directory into RUNNER_TEMP
+        env:
+          SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+        run: |
+          REMOTE="${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}"
+          mkdir -p "$RUNNER_TEMP/snapshot-download"
+          # shellcheck disable=SC2086
+          scp -r $SSH_OPTS \
+            "$REMOTE:$SNAPSHOT_ROOT/${{ inputs.snapshot_id }}" \
+            "$RUNNER_TEMP/snapshot-download/${{ inputs.snapshot_id }}"
+
+      - name: Verify manifest SHA-256 + every file's SHA/size (fails closed on any mismatch)
+        run: |
+          python -m nflprops.platform.wizard_runtime bundle-verify \
+            --bundle-dir "$RUNNER_TEMP/snapshot-download/${{ inputs.snapshot_id }}" \
+            --expected-manifest-sha256 "${{ inputs.expected_manifest_sha256 }}"
+
+      - name: Cleanup downloaded snapshot workspace
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/snapshot-download"
+
+  upload-result-bundle:
+    if: inputs.action == 'upload-result-bundle'
+    name: Build + verify + upload a certified result bundle
+    runs-on: ubuntu-latest
+    environment: wizardofodds.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate required inputs
+        run: |
+          if [ -z "${{ inputs.bundle_id }}" ]; then
+            echo "::error::bundle_id is required"; exit 1
+          fi
+          if ! [[ "${{ inputs.bundle_id }}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::bundle_id must be a plain identifier (no path separators)"; exit 1
+          fi
+          if [ -z "${{ inputs.source_dir }}" ]; then
+            echo "::error::source_dir is required"; exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -e ".[dev]"
+
+      - name: Build the result bundle + deterministic manifest
+        run: |
+          python -m nflprops.platform.wizard_runtime result-bundle build \
+            --bundle-id "${{ inputs.bundle_id }}" \
+            --source-dir "${{ inputs.source_dir }}" \
+            --staging-dir "$RUNNER_TEMP/result-bundle-staging" \
+            --science-sha "${{ inputs.science_sha }}" \
+            --workflow-sha "${{ github.sha }}"
+
+      - name: Install SSH key and verified known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.WIZARD_SSH_PRIVATE_KEY }}" > ~/.ssh/wizard_deploy_key
+          chmod 600 ~/.ssh/wizard_deploy_key
+          printf '%s\n' "${{ secrets.WIZARD_SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Upload to a temp remote path, then atomic publish through the Wizard runtime owner
+        env:
+          SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+        run: |
+          REMOTE="${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}"
+          REMOTE_INCOMING_PARENT="$RESULT_BUNDLE_ROOT/_incoming"
+          REMOTE_STAGING="$REMOTE_INCOMING_PARENT/${{ inputs.bundle_id }}"
+          REMOTE_FINAL="$RESULT_BUNDLE_ROOT/${{ inputs.bundle_id }}"
+
+          # shellcheck disable=SC2086
+          ssh $SSH_OPTS "$REMOTE" "mkdir -p '$REMOTE_INCOMING_PARENT'"
+          # shellcheck disable=SC2086
+          scp -r $SSH_OPTS "$RUNNER_TEMP/result-bundle-staging" "$REMOTE:$REMOTE_STAGING"
+          # Publication (verify-then-atomic-rename, never overwriting
+          # different content) happens through the WIZARD RUNTIME OWNER's
+          # own already-deployed CLI -- GitHub never opens the live
+          # warehouse or the publications store directly for writes.
+          # shellcheck disable=SC2086
+          ssh $SSH_OPTS "$REMOTE" \
+            "$WIZARD_RELEASE_PYTHON -m nflprops.platform.wizard_runtime bundle-publish --staging-dir '$REMOTE_STAGING' --final-dir '$REMOTE_FINAL'"
+
+      - name: Cleanup local staging workspace
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/result-bundle-staging"

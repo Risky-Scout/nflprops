@@ -1,0 +1,103 @@
+name: Wizard Read-Only Probe (BLOCK 2B foundation)
+
+# BLOCK 2B §13: a strictly READ-ONLY resource/collision probe against the
+# real Wizard host, using the existing WIZARD_SSH_* secrets/mechanism
+# (same wizardofodds.com environment, same key-based SSH with strict
+# known_hosts checking as deploy-wizard.yml). Nothing in this repository
+# triggers this workflow automatically -- workflow_dispatch only.
+#
+# NOTE (BLOCK 2B final report): dispatching this from a non-main branch
+# was attempted and confirmed BLOCKED, independent of workflow_dispatch's
+# own default-branch-registration requirement -- the wizardofodds.com
+# GitHub environment has a deployment branch protection rule that rejects
+# any job from a branch other than main ("Branch dev/nflprops-production
+# is not allowed to deploy to wizardofodds.com due to environment
+# protection rules"), the same reason deploy-wizard.yml hard-gates on
+# `github.ref == refs/heads/main` before attempting anything. The real
+# probe cannot run until this workflow reaches main (or the environment's
+# branch policy is deliberately changed by whoever administers it) --
+# BLOCK 2B does not do either on its own authority.
+#
+# RESULT: the temporary push-trigger attempt (eb0de38, reverted in
+# dc9db13; run 35765851043) was REJECTED by the environment's branch
+# protection before connecting. The operator supplied the real
+# measurements from a read-only probe of the host: 1 CPU, 1.9 GiB RAM (~1.4 GiB
+# available), 496 MiB swap effectively fully used, ~11 GB free of 49 GB
+# (79% used); wizard-deploy can write only /home/wizard-deploy. Decision
+# and the resulting /home/wizard-deploy/nflprops layout: see "BLOCK 2B
+# final report" in docs/PLATFORM_AUTOMATION.md.
+#
+# Every remote command below is read-only: uname/nproc/free/swapon/df/ls/
+# du/systemctl list-units/ss. It never installs a package, never creates
+# or starts a system service, never restarts anything, never touches
+# nginx, and never writes to any existing directory (candidate nflprops
+# paths are only `ls`/`du`-probed if they already exist; writability is
+# checked with a permission test, never an actual write).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Read-only resource/collision probe
+    runs-on: ubuntu-latest
+    environment: wizardofodds.com
+    steps:
+      - name: Install SSH key and verified known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.WIZARD_SSH_PRIVATE_KEY }}" > ~/.ssh/wizard_deploy_key
+          chmod 600 ~/.ssh/wizard_deploy_key
+          printf '%s\n' "${{ secrets.WIZARD_SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Run READ-ONLY resource/collision probe over SSH
+        env:
+          SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+        run: |
+          REMOTE="${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}"
+          # shellcheck disable=SC2086
+          ssh $SSH_OPTS "$REMOTE" bash -s <<'REMOTE_SCRIPT'
+            set -uo pipefail
+            echo "=== uname -a ==="; uname -a
+            echo "=== nproc ==="; nproc
+            echo "=== free -h ==="; free -h
+            echo "=== swapon --show ==="; swapon --show || echo "(no swap configured)"
+            echo "=== df -h ==="; df -h
+
+            echo "=== candidate nflprops paths (read-only: ls/du only if already present) ==="
+            for p in /var/lib/nflprops /var/log/nflprops /home/wizard-deploy/nflprops \
+                     /opt/wizardofodds/nflprops-releases /etc/nflprops; do
+              if [ -e "$p" ]; then
+                echo "--- $p EXISTS ---"
+                ls -la "$p" 2>&1 | head -20
+                echo "$p du: $(du -sh "$p" 2>/dev/null || echo n/a)"
+              else
+                echo "$p does not exist yet"
+              fi
+            done
+
+            echo "=== write-permission probe (permission test only, never an actual write) ==="
+            for parent in /var/lib /var/log /home/wizard-deploy /opt/wizardofodds /etc; do
+              if [ -w "$parent" ]; then
+                echo "$parent: writable by this user"
+              else
+                echo "$parent: NOT writable by this user"
+              fi
+            done
+
+            echo "=== existing systemd service name collisions (nflprops/wizard/wnba/sportsodds) ==="
+            systemctl list-units --type=service --all --no-pager 2>/dev/null \
+              | grep -i "nflprops\|wizard\|wnba\|sportsodds" || echo "(no matching existing services)"
+
+            echo "=== listening ports ==="
+            (ss -tln 2>/dev/null || netstat -tln 2>/dev/null) || echo "(ss/netstat unavailable)"
+          REMOTE_SCRIPT
+
+      - name: Cleanup local SSH material
+        if: always()
+        run: rm -rf ~/.ssh

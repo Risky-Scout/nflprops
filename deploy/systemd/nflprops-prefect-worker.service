@@ -1,0 +1,37 @@
+# PHASE 5: Prefect worker unit (deployment artifact only -- never installed
+# on a developer machine; see docs/ORCHESTRATION_ARCHITECTURE.md).
+#
+# Assumptions (adjust paths/user if your deployment target differs):
+#   - Ubuntu 24.04 LTS
+#   - Application checked out at /opt/nflprops, with a virtualenv at
+#     /opt/nflprops/.venv (containing the `orchestration` extra:
+#     pip install ".[orchestration]")
+#   - Dedicated, unprivileged service user/group: nflprops
+#   - Secrets (PREFECT_API_URL, PREFECT_API_KEY, DATABASE_URL, provider API
+#     keys, etc.) live ONLY in /etc/nflprops/nflprops.env, readable by the
+#     nflprops user/group and no one else (chmod 640, chown nflprops:nflprops)
+#     -- never in this unit file, which is often world-readable.
+#   - Work pool: nflprops-production (see [orchestration] in configs/base.toml)
+#
+# Install:
+#   sudo cp deploy/systemd/nflprops-prefect-worker.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now nflprops-prefect-worker
+
+[Unit]
+Description=NFL Props Prefect Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nflprops
+Group=nflprops
+WorkingDirectory=/opt/nflprops
+EnvironmentFile=/etc/nflprops/nflprops.env
+ExecStart=/opt/nflprops/.venv/bin/prefect worker start --pool nflprops-production --type process
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

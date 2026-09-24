@@ -27,7 +27,9 @@ from nflprops.data.availability import (
 from nflprops.data.quality import enforce, validate_core
 from nflprops.data.raw_store import RawStore, make_raw_hook
 from nflprops.data.warehouse import Warehouse, records_to_frame
+from nflprops.domain.protocols import FullProvider
 from nflprops.paths import runtime_data_root, runtime_resource
+from nflprops.providers import registry as provider_registry
 from nflprops.providers.bdl.client import BDLClient
 from nflprops.providers.bdl.provider import BDLProvider
 
@@ -143,6 +145,15 @@ def build_bdl_provider(
     return provider, warehouse
 
 
+# PHASE 3: register with the provider factory registry so callers construct
+# providers by name (nflprops.providers.registry.get_provider) rather than
+# importing BDLProvider/build_bdl_provider directly outside this module.
+# Bootstrap/composition code (here, and cli.py via get_provider) may
+# legitimately know the concrete provider; football/model logic must not.
+provider_registry.register("bdl", build_bdl_provider)
+provider_registry.register("balldontlie", build_bdl_provider)
+
+
 def _append_reference(warehouse: Warehouse, table: str, records, key: list[str]):
     warehouse.append_records(table, records, key=key, sort_by=key)
 
@@ -216,7 +227,15 @@ def _set_weekly_availability(
 
 
 class LeanIngestor:
-    def __init__(self, provider: BDLProvider, warehouse: Warehouse, *, goat: bool = False):
+    """Ingestion orchestration against any `FullProvider` -- not structurally
+    coupled to BDL. Every call below (`self.provider.X(...)`) is a
+    Protocol-defined method; BDL is simply the provider this repository ships
+    with. See `nflprops.domain.protocols` and `nflprops.providers.registry`.
+    """
+
+    def __init__(
+        self, provider: FullProvider, warehouse: Warehouse, *, goat: bool = False
+    ):
         self.provider = provider
         self.warehouse = warehouse
         self.goat = goat
@@ -466,6 +485,12 @@ class LeanIngestor:
             )
 
         # Current injuries are league-wide and are core availability inputs.
+        # PHASE 4 CLEANUP: this one-shot path no longer writes a collection
+        # marker at all -- injury_snapshot_runs is legacy/deprecated and
+        # collector_resource_runs (nflprops.collection.service.collect_once)
+        # is the sole authoritative feed-availability source going forward.
+        # See nflprops.data.injury_availability and
+        # docs/COLLECTION_ARCHITECTURE.md.
         injuries = self.provider.injuries()
         if injuries:
             self.warehouse.append_records(

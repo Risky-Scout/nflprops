@@ -1,4 +1,4 @@
-"""Odds conversion and expected value.
+"""Odds conversion, expected value, and push-aware model fair pricing.
 
 SPEC: docs/IMPLEMENTATION_SPEC.md §55, §57
 PHASE: 9
@@ -7,10 +7,19 @@ STATUS: IMPLEMENTED — normative.
 Everything here uses Decimal at the boundary. BDL delivers line and odds values as
 strings; parsing them through binary float at ingestion is how you end up with a
 67.49999999999999 line that does not join to anything. SPEC §12.
+
+`conditional_nonpush_fair_probability` / `fair_decimal_odds` / `fair_american_odds`
+(PHASE 9B) are the MODEL-side conditional-fair-probability contract: P(win | the
+wager does not push). They are distinct from, and must never be conflated with,
+the sportsbook-implied devigged probability produced by
+`nflprops.market.devig.proportional_two_sided` (`p_market_fair`). `expected_value`
+is intentionally NOT conditionalized on non-push outcomes -- pushes contribute
+exactly zero to EV, per its own docstring -- and is unchanged by this addition.
 """
 
 from __future__ import annotations
 
+import math
 from decimal import Decimal, InvalidOperation
 
 
@@ -106,6 +115,75 @@ def expected_value(
 def edge(p_model: float, p_market_fair: float) -> float:
     """Probability-space edge. Positive means the model likes the side."""
     return p_model - p_market_fair
+
+
+def _validate_win_push(p_win: float, p_push: float) -> None:
+    """Shared, non-clipping validation for the push-aware fair-price helpers.
+
+    Rejects NaN/inf and any scientifically invalid probability pair with a
+    hard `ValueError` -- never silently repairs or clips an invalid input.
+    """
+    for name, value in (("p_win", p_win), ("p_push", p_push)):
+        if math.isnan(value) or math.isinf(value):
+            raise ValueError(f"{name} must be finite, got {value!r}")
+    if p_win < 0 or p_push < 0:
+        raise ValueError("probabilities must be non-negative")
+    if p_win > 1 or p_push > 1:
+        raise ValueError("probabilities must not exceed 1")
+    if p_win + p_push > 1.0 + 1e-9:
+        raise ValueError(f"p_win({p_win}) + p_push({p_push}) exceeds 1.0")
+
+
+def conditional_nonpush_fair_probability(
+    p_win: float,
+    p_push: float,
+) -> float | None:
+    """Model conditional non-push fair probability: P(win | the wager does
+    not push).
+
+        p_nonpush = 1 - p_push
+        p_fair    = p_win / p_nonpush   (equivalently p_win / (p_win + p_loss))
+
+    This is a MODEL-side quantity, distinct from any sportsbook-implied
+    devigged probability (`nflprops.market.devig`). Never clips a
+    scientifically invalid input -- raises `ValueError` instead. Returns
+    `None` only when every draw pushes (`p_nonpush == 0`): there is no
+    executable side left to price a conditional probability for.
+    """
+    _validate_win_push(p_win, p_push)
+    p_nonpush = 1.0 - p_push
+    if p_nonpush <= 0:
+        return None
+    return p_win / p_nonpush
+
+
+def fair_decimal_odds(p_win: float, p_push: float) -> float | None:
+    """Model fair decimal odds = 1 / conditional_nonpush_fair_probability
+    = (1 - p_push) / p_win.
+
+    `None` when the conditional fair probability is undefined (all-push)
+    or exactly 0 -- a mathematical price of positive infinity is never
+    persisted as `inf`.
+    """
+    p_fair = conditional_nonpush_fair_probability(p_win, p_push)
+    if p_fair is None or p_fair <= 0:
+        return None
+    return 1.0 / p_fair
+
+
+def fair_american_odds(p_win: float, p_push: float) -> float | None:
+    """Genuine model fair American odds, derived from the conditional
+    non-push fair probability -- NEVER from the raw (push-uncorrected)
+    win probability, which is wrong for any push-eligible market.
+
+    `None` at both probability boundaries (0 and 1) and when all-push:
+    no finite American price represents a certainty or an undefined
+    conditional event.
+    """
+    p_fair = conditional_nonpush_fair_probability(p_win, p_push)
+    if p_fair is None or not (0.0 < p_fair < 1.0):
+        return None
+    return implied_to_american(p_fair)
 
 
 def kelly_fraction(

@@ -57,6 +57,42 @@
     {
       "code": "arg-type",
       "count": 1,
+      "message": "Argument \"schema_version\" to \"CalibrationRegistryContract\" has incompatible type \"Any | None\"; expected \"str\"",
+      "path": "src/nflprops/calibration/contract.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument 1 to \"tuple\" has incompatible type \"Any | None\"; expected \"Iterable[str]\"",
+      "path": "src/nflprops/calibration/contract.py"
+    },
+    {
+      "code": "index",
+      "count": 7,
+      "message": "Value of type \"Any | None\" is not indexable",
+      "path": "src/nflprops/calibration/contract.py"
+    },
+    {
+      "code": "type-arg",
+      "count": 2,
+      "message": "Missing type arguments for generic type \"dict\"",
+      "path": "src/nflprops/calibration/contract.py"
+    },
+    {
+      "code": "union-attr",
+      "count": 1,
+      "message": "Item \"None\" of \"Any | None\" has no attribute \"__iter__\" (not iterable)",
+      "path": "src/nflprops/calibration/contract.py"
+    },
+    {
+      "code": "union-attr",
+      "count": 1,
+      "message": "Item \"None\" of \"Any | None\" has no attribute \"get\"",
+      "path": "src/nflprops/calibration/contract.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
       "message": "Argument \"fit_max_outcome_available_at\" to \"_CurrentGroupFit\" has incompatible type \"int | float | Decimal | date | time | timedelta | str | bytes | ndarray[Any, Any] | list[Any] | None\"; expected \"datetime\"",
       "path": "src/nflprops/calibration/oof.py"
     },
@@ -65,6 +101,78 @@
       "count": 1,
       "message": "Call to untyped function \"transform\" in typed context",
       "path": "src/nflprops/calibration/oof.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 2,
+      "message": "Argument 1 to \"compute_compatibility_digest\" has incompatible type \"**dict[str, object]\"; expected \"str\"",
+      "path": "src/nflprops/calibration/registry.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument 1 to \"checkpoint_satisfied\" has incompatible type \"Warehouse\"; expected \"StorageBackend\"",
+      "path": "src/nflprops/cli.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument 1 to \"claim_checkpoint\" has incompatible type \"Warehouse\"; expected \"StorageBackend\"",
+      "path": "src/nflprops/cli.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 3,
+      "message": "Argument 1 to \"update_run_status\" has incompatible type \"Warehouse\"; expected \"StorageBackend\"",
+      "path": "src/nflprops/cli.py"
+    },
+    {
+      "code": "attr-defined",
+      "count": 1,
+      "message": "\"object\" has no attribute \"cadence_seconds\"",
+      "path": "src/nflprops/cli.py"
+    },
+    {
+      "code": "attr-defined",
+      "count": 1,
+      "message": "\"object\" has no attribute \"collector_run_id\"",
+      "path": "src/nflprops/cli.py"
+    },
+    {
+      "code": "attr-defined",
+      "count": 1,
+      "message": "\"object\" has no attribute \"status\"",
+      "path": "src/nflprops/cli.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument 2 to \"signal\" has incompatible type \"object\"; expected \"Callable[[int, FrameType | None], Any] | int | Handlers | None\"",
+      "path": "src/nflprops/collection/loop.py"
+    },
+    {
+      "code": "assignment",
+      "count": 1,
+      "message": "Incompatible types in assignment (expression has type \"int\", variable has type \"Signals\")",
+      "path": "src/nflprops/collection/loop.py"
+    },
+    {
+      "code": "unreachable",
+      "count": 1,
+      "message": "Statement is unreachable",
+      "path": "src/nflprops/collection/loop.py"
+    },
+    {
+      "code": "var-annotated",
+      "count": 1,
+      "message": "Need type annotation for \"scope\" (hint: \"scope: dict[<type>, <type>] = ...\")",
+      "path": "src/nflprops/collection/migrate_injury_runs.py"
+    },
+    {
+      "code": "unreachable",
+      "count": 3,
+      "message": "Statement is unreachable",
+      "path": "src/nflprops/collection/service.py"
     },
     {
       "code": "no-any-return",
@@ -103,6 +211,24 @@
       "path": "src/nflprops/data/snapshots.py"
     },
     {
+      "code": "no-any-return",
+      "count": 1,
+      "message": "Returning Any from function declared to return \"bytes\"",
+      "path": "src/nflprops/data/storage/object_store.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"keep\" to \"unique\" of \"DataFrame\" has incompatible type \"str\"; expected \"Literal['first', 'last', 'any', 'none']\"",
+      "path": "src/nflprops/data/storage/postgres.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 1,
+      "message": "Function is missing a return type annotation",
+      "path": "src/nflprops/data/storage/settings.py"
+    },
+    {
       "code": "arg-type",
       "count": 1,
       "message": "Argument \"keep\" to \"unique\" of \"DataFrame\" has incompatible type \"str\"; expected \"Literal['first', 'last', 'any', 'none']\"",
@@ -117,7 +243,241 @@
     {
       "code": "assignment",
       "count": 1,
+      "message": "Incompatible types in assignment (expression has type \"Any | None\", variable has type \"int\")",
+      "path": "src/nflprops/market/current_pricing.py"
+    },
+    {
+      "code": "type-arg",
+      "count": 3,
+      "message": "Missing type arguments for generic type \"dict\"",
+      "path": "src/nflprops/market/current_pricing.py"
+    },
+    {
+      "code": "unreachable",
+      "count": 1,
+      "message": "Statement is unreachable",
+      "path": "src/nflprops/market/current_pricing.py"
+    },
+    {
+      "code": "attr-defined",
+      "count": 4,
+      "message": "\"StorageBackend\" has no attribute \"engine\"",
+      "path": "src/nflprops/orchestration/calibration_store.py"
+    },
+    {
+      "code": "list-item",
+      "count": 1,
+      "message": "List item 0 has incompatible type \"RunnerDeployment | Coroutine[Any, Any, RunnerDeployment]\"; expected \"RunnerDeployment\"",
+      "path": "src/nflprops/orchestration/deployments.py"
+    },
+    {
+      "code": "list-item",
+      "count": 1,
+      "message": "List item 1 has incompatible type \"RunnerDeployment | Coroutine[Any, Any, RunnerDeployment]\"; expected \"RunnerDeployment\"",
+      "path": "src/nflprops/orchestration/deployments.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"retry_delay_seconds\" to \"task\" has incompatible type \"list[int]\"; expected \"float | int | list[float] | Callable[[int], list[float]] | None\"",
+      "path": "src/nflprops/orchestration/flows/checkpoints.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 2,
+      "message": "Argument 1 to \"claim_checkpoint\" has incompatible type \"Warehouse\"; expected \"StorageBackend\"",
+      "path": "src/nflprops/orchestration/flows/checkpoints.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument 1 to \"persist_player_game_projections\" has incompatible type \"Warehouse\"; expected \"StorageBackend\"",
+      "path": "src/nflprops/orchestration/flows/checkpoints.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument 1 to \"persist_player_game_threshold_events\" has incompatible type \"Warehouse\"; expected \"StorageBackend\"",
+      "path": "src/nflprops/orchestration/flows/checkpoints.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument 1 to \"persist_player_prop_pricing\" has incompatible type \"Warehouse\"; expected \"StorageBackend\"",
+      "path": "src/nflprops/orchestration/flows/checkpoints.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 10,
+      "message": "Argument 1 to \"update_run_status\" has incompatible type \"Warehouse\"; expected \"StorageBackend\"",
+      "path": "src/nflprops/orchestration/flows/checkpoints.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 1,
+      "message": "Function is missing a type annotation for one or more parameters",
+      "path": "src/nflprops/orchestration/flows/checkpoints.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"checkpoint_name\" to \"PredictionRunRecord\" has incompatible type \"object\"; expected \"str\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"config_sha256\" to \"PredictionRunRecord\" has incompatible type \"object\"; expected \"str\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"created_at\" to \"PredictionRunRecord\" has incompatible type \"object\"; expected \"datetime\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"data_manifest_sha256\" to \"PredictionRunRecord\" has incompatible type \"object\"; expected \"str\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"failure_code\" to \"PredictionRunRecord\" has incompatible type \"object\"; expected \"str | None\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"failure_detail\" to \"PredictionRunRecord\" has incompatible type \"object\"; expected \"str | None\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"fallback_from_checkpoint\" to \"PredictionRunRecord\" has incompatible type \"object\"; expected \"str | None\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"flow_completed_at\" to \"PredictionRunRecord\" has incompatible type \"object\"; expected \"datetime | None\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"flow_started_at\" to \"PredictionRunRecord\" has incompatible type \"object\"; expected \"datetime\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"game_id\" to \"PredictionRunRecord\" has incompatible type \"object\"; expected \"str\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"is_final_forecast\" to \"PredictionRunRecord\" has incompatible type \"object\"; expected \"bool\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"kickoff_at\" to \"PredictionRunRecord\" has incompatible type \"object\"; expected \"datetime\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"model_version\" to \"PredictionRunRecord\" has incompatible type \"object\"; expected \"str\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"n_draws\" to \"PredictionRunRecord\" has incompatible type \"object\"; expected \"int\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"retained_joint_draws\" to \"PredictionRunRecord\" has incompatible type \"object\"; expected \"int\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"run_id\" to \"PredictionRunRecord\" has incompatible type \"object\"; expected \"str\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"scheduled_as_of\" to \"PredictionRunRecord\" has incompatible type \"object\"; expected \"datetime\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 2,
+      "message": "Argument \"schema\" to \"DataFrame\" has incompatible type \"dict[str, object]\"; expected \"Mapping[str, DataTypeClass | DataType | type[int] | type[float] | type[bool] | type[str] | type[date] | <9 more items> | None] | Sequence[str | tuple[str, DataTypeClass | DataType | type[int] | type[float] | type[bool] | type[str] | type[date] | <9 more items> | None]] | None\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"season\" to \"PredictionRunRecord\" has incompatible type \"object\"; expected \"int\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"source_sha256\" to \"PredictionRunRecord\" has incompatible type \"object\"; expected \"str\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "arg-type",
+      "count": 1,
+      "message": "Argument \"week\" to \"PredictionRunRecord\" has incompatible type \"object\"; expected \"int\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "attr-defined",
+      "count": 2,
+      "message": "\"StorageBackend\" has no attribute \"engine\"",
+      "path": "src/nflprops/orchestration/run_store.py"
+    },
+    {
+      "code": "no-untyped-def",
+      "count": 1,
+      "message": "Function is missing a type annotation for one or more parameters",
+      "path": "src/nflprops/orchestration/tasks.py"
+    },
+    {
+      "code": "assignment",
+      "count": 1,
       "message": "Incompatible types in assignment (expression has type \"Sequence[Play]\", variable has type \"list[Any]\")",
+      "path": "src/nflprops/pipelines/lean.py"
+    },
+    {
+      "code": "call-arg",
+      "count": 1,
+      "message": "Unexpected keyword argument \"season_type\"",
+      "path": "src/nflprops/pipelines/lean.py"
+    },
+    {
+      "code": "call-arg",
+      "count": 1,
+      "message": "Unexpected keyword argument \"season_type\" for \"player_season_stats\" of \"StatisticsProvider\"",
+      "path": "src/nflprops/pipelines/lean.py"
+    },
+    {
+      "code": "call-arg",
+      "count": 1,
+      "message": "Unexpected keyword argument \"season_type\" for \"team_game_stats\" of \"StatisticsProvider\"",
       "path": "src/nflprops/pipelines/lean.py"
     },
     {
@@ -199,12 +559,6 @@
       "path": "src/nflprops/pipelines/lean.py"
     },
     {
-      "code": "assignment",
-      "count": 1,
-      "message": "Incompatible types in assignment (expression has type \"Any | None\", variable has type \"int\")",
-      "path": "src/nflprops/pipelines/pregame.py"
-    },
-    {
       "code": "no-untyped-def",
       "count": 4,
       "message": "Function is missing a return type annotation",
@@ -218,7 +572,7 @@
     },
     {
       "code": "type-arg",
-      "count": 3,
+      "count": 1,
       "message": "Missing type arguments for generic type \"dict\"",
       "path": "src/nflprops/pipelines/pregame.py"
     },
@@ -363,6 +717,6 @@
   ],
   "mypy_target_python": "3.11",
   "mypy_version": "mypy 2.3.1 (compiled: yes)",
-  "total_findings": 89,
+  "total_findings": 175,
   "version": 1
 }

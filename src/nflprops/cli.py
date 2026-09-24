@@ -30,6 +30,9 @@ snapshot_app = typer.Typer(help="Point-in-time snapshot collection.")
 pbp_app = typer.Typer(help="Play-by-play parsing and reconciliation.")
 features_app = typer.Typer(help="Point-in-time feature building.")
 state_app = typer.Typer(help="Empirical-Bayes state updates.")
+collect_app = typer.Typer(help="Continuous point-in-time collection (PHASE 4).")
+checkpoint_app = typer.Typer(help="Official pregame checkpoints (PHASE 5).")
+platform_app = typer.Typer(help="Platform operational status (PLATFORM AUTOMATION).")
 
 app.add_typer(provider_app, name="provider")
 app.add_typer(ingest_app, name="ingest")
@@ -37,6 +40,18 @@ app.add_typer(snapshot_app, name="snapshot")
 app.add_typer(pbp_app, name="pbp")
 app.add_typer(features_app, name="features")
 app.add_typer(state_app, name="state")
+app.add_typer(collect_app, name="collect")
+app.add_typer(checkpoint_app, name="checkpoint")
+app.add_typer(platform_app, name="platform")
+
+
+def _mount_wizard_runtime() -> None:
+    from nflprops.platform.wizard_runtime import app as wizard_runtime_app
+
+    app.add_typer(wizard_runtime_app, name="wizard-runtime")
+
+
+_mount_wizard_runtime()
 
 
 # --- provider ---------------------------------------------------------------
@@ -102,13 +117,15 @@ def provider_drift(provider: str) -> None:
 @ingest_app.command("bootstrap")
 def ingest_bootstrap(provider: str = "bdl") -> None:
     """Fetch reference teams/players into the lean local warehouse."""
-    if provider != "bdl":
-        raise typer.BadParameter("only bdl is currently implemented")
     from nflprops.config import load
-    from nflprops.pipelines.lean import LeanIngestor, build_bdl_provider
+    from nflprops.pipelines.lean import LeanIngestor
+    from nflprops.providers.registry import get_provider
 
     cfg = load(provider=provider)
-    source, warehouse = build_bdl_provider(cfg)
+    try:
+        source, warehouse = get_provider(provider, cfg)
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     try:
         LeanIngestor(
             source,
@@ -127,10 +144,11 @@ def ingest_season(
 ) -> None:
     """Backfill one season into canonical Parquet/DuckDB tables."""
     from nflprops.config import load
-    from nflprops.pipelines.lean import LeanIngestor, build_bdl_provider
+    from nflprops.pipelines.lean import LeanIngestor
+    from nflprops.providers.registry import get_provider
 
     cfg = load()
-    source, warehouse = build_bdl_provider(cfg)
+    source, warehouse = get_provider("bdl", cfg)
     try:
         LeanIngestor(
             source,
@@ -150,10 +168,11 @@ def ingest_season(
 def ingest_week(season: int, week: int) -> None:
     """Refresh the current week: games, odds, injuries, rosters, player props."""
     from nflprops.config import load
-    from nflprops.pipelines.lean import LeanIngestor, build_bdl_provider
+    from nflprops.pipelines.lean import LeanIngestor
+    from nflprops.providers.registry import get_provider
 
     cfg = load()
-    source, warehouse = build_bdl_provider(cfg)
+    source, warehouse = get_provider("bdl", cfg)
     try:
         LeanIngestor(
             source,
@@ -163,6 +182,295 @@ def ingest_week(season: int, week: int) -> None:
     finally:
         source.client.close()
     typer.echo(f"Season {season} week {week} refreshed.")
+
+
+# --- collection (PHASE 4) ----------------------------------------------------
+@collect_app.command("once")
+def collect_once_cmd(
+    season: int,
+    week: int,
+    provider: str = "bdl",
+) -> None:
+    """Run exactly one collection cycle: schedule, rosters, injuries, odds, props."""
+    from nflprops.collection.service import collect_once
+    from nflprops.config import load
+    from nflprops.pipelines.lean import LeanIngestor  # noqa: F401 -- registers "bdl"
+    from nflprops.providers.registry import get_provider
+
+    cfg = load()
+    try:
+        source, warehouse = get_provider(provider, cfg)
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    try:
+        result = collect_once(
+            provider=source,
+            season=season,
+            week=week,
+            warehouse=warehouse,
+            config=cfg,
+            now=datetime.now(UTC),
+        )
+    finally:
+        client = getattr(source, "client", None)
+        if client is not None:
+            client.close()
+    typer.echo(
+        f"collector_run_id={result.collector_run_id} status={result.status.value} "
+        f"cadence_seconds={result.cadence_seconds} "
+        f"games={result.games_received} odds_rows={result.game_odds_rows} "
+        f"prop_rows={result.prop_rows} roster_rows={result.roster_rows} "
+        f"injury_rows={result.injury_rows}"
+    )
+
+
+@collect_app.command("loop")
+def collect_loop_cmd(
+    season: int,
+    week: int,
+    provider: str = "bdl",
+) -> None:
+    """Run collection cycles continuously (foreground) until interrupted."""
+    from nflprops.collection.loop import run_collection_loop
+    from nflprops.config import load
+    from nflprops.pipelines.lean import LeanIngestor  # noqa: F401 -- registers "bdl"
+    from nflprops.providers.registry import get_provider
+
+    cfg = load()
+    try:
+        source, warehouse = get_provider(provider, cfg)
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+    def _report(result: object) -> None:
+        typer.echo(
+            f"collector_run_id={result.collector_run_id} status={result.status.value} "
+            f"cadence_seconds={result.cadence_seconds}"
+        )
+
+    try:
+        run_collection_loop(
+            provider=source,
+            season=season,
+            week=week,
+            warehouse=warehouse,
+            config=cfg,
+            on_cycle=_report,
+        )
+    finally:
+        client = getattr(source, "client", None)
+        if client is not None:
+            client.close()
+
+
+# --- official checkpoints (PHASE 5) -----------------------------------------
+@checkpoint_app.command("due")
+def checkpoint_due_cmd(
+    season: int,
+    week: int,
+    at: str = typer.Option(..., "--at", help="Explicit ISO timestamp to evaluate as 'now'."),
+    execute: bool = typer.Option(
+        False, "--execute", help="Actually claim and run due checkpoints instead of a dry inspection."
+    ),
+) -> None:
+    """Dry-inspect (default) official checkpoint due-ness for SEASON WEEK as of --at.
+
+    Never executes a prediction unless --execute is explicitly given.
+    """
+    from nflprops.config import load
+    from nflprops.orchestration.checkpoints import (
+        OFFICIAL_CHECKPOINTS,
+        CheckpointAction,
+        CheckpointOffsets,
+        CheckpointsRuntimeConfig,
+        OrchestrationConfig,
+        evaluate_checkpoint,
+    )
+    from nflprops.orchestration.checkpoints import (
+        scheduled_as_of as compute_scheduled_as_of,
+    )
+    from nflprops.orchestration.run_store import checkpoint_satisfied
+    from nflprops.pipelines.lean import open_warehouse
+    from nflprops.pipelines.pregame import _latest_games_asof
+
+    now = datetime.fromisoformat(at.replace("Z", "+00:00"))
+    if now.tzinfo is None:
+        raise typer.BadParameter("--at must include an explicit timezone")
+
+    cfg = load()
+    warehouse = open_warehouse(cfg)
+
+    if execute:
+        from nflprops.orchestration.flows.checkpoints import checkpoint_dispatch_flow
+
+        results = checkpoint_dispatch_flow(
+            warehouse=warehouse, config=cfg, season=season, week=week, now=now
+        )
+        if not results:
+            typer.echo("No due, unclaimed checkpoints.")
+            return
+        for record in results:
+            typer.echo(
+                f"run_id={record.run_id} game_id={record.game_id} "
+                f"checkpoint={record.checkpoint_name} status={record.status.value} "
+                f"publication_status={record.publication_status.value} "
+                f"failure_code={record.failure_code}"
+            )
+        return
+
+    offsets = CheckpointOffsets.from_config(cfg)
+    checkpoints_cfg = CheckpointsRuntimeConfig.from_config(cfg)
+    orchestration_cfg = OrchestrationConfig.from_config(cfg)
+
+    games = warehouse.read("games")
+    current_games = _latest_games_asof(games, as_of=now, season=season, week=week)
+    if current_games.is_empty():
+        typer.echo("No scheduled/live games found.")
+        return
+
+    for game in current_games.iter_rows(named=True):
+        game_id = str(game["canonical_game_id"])
+        kickoff_at = game["date"]
+        for checkpoint in OFFICIAL_CHECKPOINTS:
+            scheduled = compute_scheduled_as_of(
+                kickoff_at=kickoff_at, checkpoint=checkpoint, offsets=offsets
+            )
+            claimed = checkpoint_satisfied(
+                warehouse, game_id=game_id, checkpoint_name=checkpoint, kickoff_at=kickoff_at
+            )
+            action = evaluate_checkpoint(
+                scheduled_as_of_time=scheduled,
+                kickoff_at=kickoff_at,
+                now=now,
+                catch_up_before_kickoff=checkpoints_cfg.catch_up_before_kickoff,
+                dispatcher_tick_seconds=orchestration_cfg.dispatcher_tick_seconds,
+            )
+            due = action is CheckpointAction.RUN and not claimed
+            typer.echo(
+                f"game_id={game_id} kickoff_at={kickoff_at.isoformat()} "
+                f"checkpoint={checkpoint.value} scheduled_as_of={scheduled.isoformat()} "
+                f"due={due} claimed={claimed} action={action.value}"
+            )
+
+
+@checkpoint_app.command("run")
+def checkpoint_run_cmd(
+    game_id: str = typer.Option(..., "--game-id"),
+    as_of: str = typer.Option(..., "--as-of"),
+    season: int = typer.Option(..., help="Season the game belongs to."),
+    week: int = typer.Option(..., help="Week the game belongs to."),
+    draws: int = typer.Option(20000, min=1000),
+) -> None:
+    """Manually run a one-off diagnostic prediction for one game.
+
+    Always claimed under checkpoint_name=MANUAL (§38) -- a manual run must
+    never masquerade as an official T48H/T24H/T6H/T90M/T30M checkpoint;
+    only the checkpoint dispatcher ever claims those.
+    """
+    from nflprops.collection.service import source_sha256
+    from nflprops.config import config_sha256, load
+    from nflprops.orchestration.checkpoints import CheckpointName
+    from nflprops.orchestration.manifest import compute_data_manifest_sha256
+    from nflprops.orchestration.run_store import (
+        PredictionRunRecord,
+        PredictionRunStatus,
+        PublicationStatus,
+        claim_checkpoint,
+        compute_run_id,
+        update_run_status,
+    )
+    from nflprops.pipelines.lean import open_warehouse
+    from nflprops.pipelines.pregame import predict_game
+
+    dt = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        raise typer.BadParameter("--as-of must include an explicit timezone")
+
+    cfg = load()
+    warehouse = open_warehouse(cfg)
+    model_version = str(cfg.get_path("model.version", "2026.1.0"))
+    cfg_sha = config_sha256(cfg)
+    src_sha = source_sha256()
+
+    run_id = compute_run_id(
+        game_id=game_id,
+        checkpoint_name=CheckpointName.MANUAL,
+        scheduled_as_of=dt,
+        kickoff_at=dt,
+        model_version=model_version,
+        config_sha256=cfg_sha,
+        source_sha256=src_sha,
+    )
+    manifest_sha = compute_data_manifest_sha256(warehouse, game_id=game_id, scheduled_as_of=dt)
+    now = datetime.now(UTC)
+    record = PredictionRunRecord(
+        run_id=run_id,
+        season=season,
+        week=week,
+        game_id=game_id,
+        checkpoint_name=CheckpointName.MANUAL.value,
+        scheduled_as_of=dt,
+        kickoff_at=dt,
+        flow_started_at=now,
+        flow_completed_at=None,
+        status=PredictionRunStatus.SCHEDULED,
+        model_version=model_version,
+        config_sha256=cfg_sha,
+        source_sha256=src_sha,
+        data_manifest_sha256=manifest_sha,
+        n_draws=draws,
+        retained_joint_draws=0,
+        publication_status=PublicationStatus.NOT_PUBLISHED,
+        is_final_forecast=False,
+        fallback_from_checkpoint=None,
+        failure_code=None,
+        failure_detail=None,
+        created_at=now,
+    )
+    if not claim_checkpoint(warehouse, record):
+        typer.echo(f"a MANUAL run with this exact identity already exists: run_id={run_id}")
+        raise typer.Exit(1)
+
+    update_run_status(warehouse, run_id, status=PredictionRunStatus.RUNNING)
+    try:
+        predictions = predict_game(
+            warehouse,
+            season=season,
+            week=week,
+            game_id=game_id,
+            as_of=dt,
+            model_version=model_version,
+            n_draws=draws,
+            official_run_id=run_id,
+            checkpoint_name=CheckpointName.MANUAL.value,
+        )
+    except Exception as exc:
+        update_run_status(
+            warehouse,
+            run_id,
+            status=PredictionRunStatus.FAILED,
+            publication_status=PublicationStatus.NOT_PUBLISHED,
+            failure_code="PREDICTION_ERROR",
+            failure_detail=str(exc)[:500],
+            flow_completed_at=datetime.now(UTC),
+        )
+        typer.echo(f"MANUAL run failed: run_id={run_id} error={exc}")
+        raise typer.Exit(1) from exc
+
+    publication_status = (
+        PublicationStatus.MODEL_ONLY if predictions.is_empty() else PublicationStatus.PUBLISHED
+    )
+    update_run_status(
+        warehouse,
+        run_id,
+        status=PredictionRunStatus.SUCCESS,
+        publication_status=publication_status,
+        flow_completed_at=datetime.now(UTC),
+    )
+    typer.echo(
+        f"run_id={run_id} status=SUCCESS publication_status={publication_status.value} "
+        f"predictions={predictions.height}"
+    )
 
 
 # --- snapshots --------------------------------------------------------------
@@ -419,6 +727,171 @@ def coverage() -> None:
     for table in tables:
         frame = warehouse.read(table)
         typer.echo(f"{table}: {frame.height} rows")
+
+
+def _running_release_sha() -> str | None:
+    from nflprops.platform.runtime_layout import running_release_sha
+
+    return running_release_sha()
+
+
+@platform_app.command("health")
+def platform_health(
+    deploy_gate: bool = typer.Option(
+        False,
+        "--deploy-gate",
+        help="Exit status reflects only deployment-critical checks "
+        "(everything except platform.health.DEPLOY_GATE_NONCRITICAL).",
+    ),
+    expect_version: str = typer.Option(
+        "",
+        "--expect-version",
+        help="Require the running release SHA to equal this value (deployment-critical).",
+    ),
+    pre_activation: bool = typer.Option(
+        False,
+        "--pre-activation",
+        help="With --deploy-gate: the candidate release's runtime is not running yet, "
+        "so `runtime_loop` is reported but not gated.",
+    ),
+) -> None:
+    """Read-only infrastructure health report (JSON). Not a publication
+    readiness gate -- see docs/READINESS_2026.md for that.
+
+    BLOCK 2B (docs/PLATFORM_AUTOMATION.md) adds the Wizard runtime's own
+    checks: the canonical warehouse's readability/writability, the writer
+    lock's status, the latest snapshot's identity/verification, disk free,
+    live warehouse/snapshot growth against bounded retention, RAM/swap/PSI
+    memory pressure, and the current Alembic migration head -- alongside
+    the pre-existing database/object-store checks (reported as not
+    required/optional under the locked zero-cost DuckDB architecture, but
+    still exercised for the postgres/object-store paths this module also
+    supports). Every
+    check is read-only and never mutates the warehouse or contends for the
+    writer lock beyond a non-blocking probe.
+    """
+    import json
+
+    from nflprops.data.storage.settings import StorageSettings
+    from nflprops.platform.health import (
+        DEPLOY_GATE_NONCRITICAL,
+        PRE_ACTIVATION_NONCRITICAL,
+        HealthCheck,
+        clock_sync_check,
+        collect_platform_health,
+        collection_freshness_check,
+        database_reachable_check,
+        deploy_gate_passed,
+        disk_free_check,
+        latest_snapshot_check,
+        memory_pressure_check,
+        migration_storage_version_check,
+        object_store_reachable_check,
+        provider_config_check,
+        release_version_check,
+        runtime_loop_check,
+        runtime_version_check,
+        storage_growth_check,
+        warehouse_path_check,
+        warehouse_readable_check,
+        warehouse_writable_check,
+        writer_lock_status_check,
+    )
+    from nflprops.platform.runtime_layout import (
+        resolve_layout_from_config,
+        snapshot_retention,
+    )
+
+    settings = StorageSettings.from_env()
+    if settings.backend == "duckdb" and not settings.database_url:
+        # The locked zero-cost architecture needs no database server.
+        checks: dict[str, HealthCheck] = {
+            "database": lambda: (True, "not required (duckdb backend)")
+        }
+    else:
+        checks = {"database": database_reachable_check(settings.database_url)}
+    if settings.object_store_configured():
+        from nflprops.data.storage.object_store import ObjectStoreSettings
+
+        checks["object_store"] = object_store_reachable_check(
+            ObjectStoreSettings(
+                endpoint_url=settings.object_store_endpoint,  # type: ignore[arg-type]
+                region=settings.object_store_region,  # type: ignore[arg-type]
+                bucket=settings.object_store_bucket,  # type: ignore[arg-type]
+                access_key=settings.object_store_access_key,  # type: ignore[arg-type]
+                secret_key=settings.object_store_secret_key,  # type: ignore[arg-type]
+            )
+        )
+    else:
+        checks["object_store"] = lambda: (True, "not configured (optional as of BLOCK 2B)")
+
+    # Paths: the warehouse is the collector's own `<run.data_root>/canonical`
+    # (NFLPROPS_DATA_ROOT); snapshot/lock/publication/status paths come from
+    # the probe-approved runtime layout (NFLPROPS_RUNTIME_ROOT) -- see
+    # nflprops.platform.runtime_layout.
+    from nflprops.config import load as load_config
+
+    cfg = load_config()
+    layout = resolve_layout_from_config(cfg)
+    retention = snapshot_retention()
+    requests_path = layout.warehouse_root / "remote_checkpoint_requests.parquet"
+    protected: frozenset[str] = frozenset()
+    if requests_path.is_file():
+        import polars as pl
+
+        pending = pl.read_parquet(requests_path).filter(
+            pl.col("state") == "PENDING_REMOTE_EXECUTION"
+        )
+        protected = frozenset(v for v in pending["snapshot_id"].drop_nulls().to_list() if v)
+
+    running_sha = _running_release_sha()
+    checks["runtime_version"] = runtime_version_check(running_sha)
+    if expect_version:
+        checks["release_version"] = release_version_check(expect_version, running_sha)
+    checks["provider_config"] = provider_config_check(
+        str(cfg.get_path("provider.bdl.api_key_env", "BDL_API_KEY"))
+    )
+    checks["clock_sync"] = clock_sync_check()
+    checks["warehouse_path"] = warehouse_path_check(layout.warehouse_root)
+    checks["warehouse_readable"] = warehouse_readable_check(layout.warehouse_root)
+    checks["warehouse_writable"] = warehouse_writable_check(layout.warehouse_root)
+    checks["writer_lock"] = writer_lock_status_check(layout.writer_lock)
+    checks["runtime_loop"] = runtime_loop_check(
+        layout.runtime_status, expected_release_sha=expect_version or None
+    )
+    checks["collection_freshness"] = collection_freshness_check(layout.warehouse_root, config=cfg)
+    checks["latest_snapshot"] = latest_snapshot_check(layout.snapshots)
+    checks["disk_free"] = disk_free_check(layout.root, minimum_free_gb=2.0)
+    checks["storage_growth"] = storage_growth_check(
+        warehouse_root=layout.warehouse_root,
+        snapshot_root=layout.snapshots,
+        publications_root=layout.publications,
+        retention_limit=retention,
+        raw_root=layout.raw_root,
+        protected_snapshot_ids=protected,
+    )
+    checks["memory_pressure"] = memory_pressure_check()
+    checks["migration_storage_version"] = migration_storage_version_check()
+
+    report = collect_platform_health(checks)
+    payload = report.as_dict()
+    if deploy_gate:
+        passed = deploy_gate_passed(report, pre_activation=pre_activation)
+        noncritical = set(DEPLOY_GATE_NONCRITICAL)
+        if pre_activation:
+            noncritical |= PRE_ACTIVATION_NONCRITICAL
+        payload["deploy_gate"] = {
+            "passed": passed,
+            "pre_activation": pre_activation,
+            "noncritical": sorted(noncritical),
+        }
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        if not passed:
+            raise typer.Exit(1)
+        return
+    typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    if not report.healthy:
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

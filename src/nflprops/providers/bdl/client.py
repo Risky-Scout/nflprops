@@ -61,6 +61,11 @@ class BDLClient:
         self.raw_hook = raw_hook
         self._sleep = sleep
         self._rng = random.Random(jitter_seed)
+        # PHASE 4: cumulative retry count since the last pop_retry_count().
+        # Callers doing one logical resource fetch (which may itself involve
+        # several paginated get() calls) read this once, immediately after,
+        # via pop_retry_count() -- never a second, independent retry loop.
+        self._retry_count = 0
         self._headers = {
             "Authorization": api_key,
             "Accept": "application/json",
@@ -76,6 +81,18 @@ class BDLClient:
     def close(self) -> None:
         if self._owns_client:
             self._client.close()
+
+    def pop_retry_count(self) -> int:
+        """Return retries accumulated since the last call, then reset to 0.
+
+        PHASE 4 telemetry only -- this reads the outcome of the single
+        existing retry loop in `get()`; it does not add a second one. A
+        caller doing one logical resource fetch (possibly several paginated
+        `get()` calls) should call this exactly once, immediately after.
+        """
+        count = self._retry_count
+        self._retry_count = 0
+        return count
 
     def __enter__(self) -> BDLClient:
         return self
@@ -143,6 +160,7 @@ class BDLClient:
                 if response.status_code in _RETRYABLE_STATUS:
                     if attempt >= self.max_retries:
                         response.raise_for_status()
+                    self._retry_count += 1
                     self._sleep(self._retry_delay(response, attempt))
                     continue
 
@@ -160,6 +178,7 @@ class BDLClient:
                 last_exc = exc
                 if attempt >= self.max_retries:
                     raise
+                self._retry_count += 1
                 self._sleep(self._retry_delay(response, attempt))
 
         assert last_exc is not None

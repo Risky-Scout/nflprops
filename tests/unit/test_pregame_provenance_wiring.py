@@ -9,10 +9,16 @@ from nflprops.backtest.provenance import (
     StateGameMeta,
     StateProvenanceContext,
 )
+from nflprops.market.current_pricing import (
+    _audit_and_attach_prediction_provenance,
+    price_current_markets,
+)
 from nflprops.pipelines.pregame import (
     _assert_state_history_safe_for_games,
-    _audit_and_attach_prediction_provenance,
+    _persist_prediction_rows,
+    _prepare_prediction_inputs,
     predict_week,
+    simulate_game_for_prediction,
 )
 
 AS_OF = datetime(2025, 9, 10, 12, tzinfo=UTC)
@@ -21,6 +27,8 @@ AS_OF = datetime(2025, 9, 10, 12, tzinfo=UTC)
 def clean_context(
     *,
     state_games: tuple[StateGameMeta, ...] = (),
+    injury_rows: int = 1,
+    injury_data_available: bool = True,
 ) -> StateProvenanceContext:
     return StateProvenanceContext(
         state_snapshot_id="state-snapshot",
@@ -32,7 +40,8 @@ def clean_context(
         player_stats_rows=10,
         team_stats_rows=2,
         roster_rows=1,
-        injury_rows=1,
+        injury_rows=injury_rows,
+        injury_data_available=injury_data_available,
     )
 
 
@@ -116,6 +125,104 @@ def test_provenance_attachment_preserves_original_values() -> None:
     assert row["quote_available_at"] <= AS_OF
     assert row["game_market_available_at"] <= AS_OF
     assert row["injury_available_at"] <= AS_OF
+    assert row["injury_data_available"] is True
+
+
+def test_case_c_no_injury_collection_at_all_records_data_unavailable() -> None:
+    """CASE C (historical-availability audit): when no injury collection ever
+    ran for this as_of at all (every 2022-2025 historical prediction, per the
+    live BDL injury-history audit) — the persisted provenance must say so
+    explicitly rather than silently agreeing with Case A's "no designation"
+    reading."""
+    quote_available_at = AS_OF - timedelta(minutes=10)
+
+    priced_rows = [
+        {
+            "prediction_id": "prediction-historical",
+            "p_model_raw": 0.50,
+        }
+    ]
+
+    game = {
+        "canonical_game_id": "target-game",
+        "available_at": AS_OF - timedelta(days=5),
+    }
+
+    quote = {
+        "canonical_game_id": "target-game",
+        "canonical_player_id": "player-1",
+        "prop_type": "receiving_yards",
+        "available_at": quote_available_at,
+    }
+
+    enriched = _audit_and_attach_prediction_provenance(
+        priced_rows,
+        quote=quote,
+        game=game,
+        season=2023,
+        week=2,
+        as_of=AS_OF,
+        state_context=clean_context(
+            injury_rows=0, injury_data_available=False
+        ),
+        roster=pl.DataFrame(),
+        injuries=pl.DataFrame(),
+        game_market_available_at=None,
+        market_mode="opening",
+    )
+
+    assert len(enriched) == 1
+    row = enriched[0]
+    assert row["injury_available_at"] is None
+    assert row["injury_data_available"] is False
+
+
+def test_case_b_zero_relevant_rows_from_successful_collection_still_available() -> None:
+    """CASE B, the bug this correction fixes: a successful injury collection
+    ran (injury_rows == 0 is possible from a genuinely healthy-slate result)
+    but `injury_data_available` must still be True — it is derived from the
+    injury_snapshot_runs collection log, not from injury_rows."""
+    quote_available_at = AS_OF - timedelta(minutes=10)
+
+    priced_rows = [
+        {
+            "prediction_id": "prediction-live-healthy-slate",
+            "p_model_raw": 0.50,
+        }
+    ]
+
+    game = {
+        "canonical_game_id": "target-game",
+        "available_at": AS_OF - timedelta(days=5),
+    }
+
+    quote = {
+        "canonical_game_id": "target-game",
+        "canonical_player_id": "player-1",
+        "prop_type": "receiving_yards",
+        "available_at": quote_available_at,
+    }
+
+    enriched = _audit_and_attach_prediction_provenance(
+        priced_rows,
+        quote=quote,
+        game=game,
+        season=2026,
+        week=2,
+        as_of=AS_OF,
+        state_context=clean_context(
+            injury_rows=0, injury_data_available=True
+        ),
+        roster=pl.DataFrame(),
+        injuries=pl.DataFrame(),
+        game_market_available_at=None,
+        market_mode="opening",
+    )
+
+    assert len(enriched) == 1
+    row = enriched[0]
+    assert row["injury_available_at"] is None
+    assert row["injury_data_available"] is True
 
 
 def test_future_quote_fails_before_persistence() -> None:
@@ -181,25 +288,90 @@ def test_target_game_in_state_history_fails_closed() -> None:
 
 
 def test_state_history_guard_precedes_state_build_and_simulation() -> None:
-    source = inspect.getsource(predict_week)
+    """PHASE 6/7D: the invariant (history guard -> state build ->
+    simulation) still holds, now split across three call boundaries.
 
-    history_guard = source.index(
-        "_assert_state_history_safe_for_games("
-    )
-    state_build = source.index("build_team_states(")
-    simulation = source.index("simulate_game(")
+    * PHASE 7D: the point-in-time input prologue -- including the history
+      guard and `build_team_states(` -- moved out of `predict_week` into
+      `_prepare_prediction_inputs`, so the official checkpoint path can
+      reuse the identical inputs without a second pipeline. Within
+      `_prepare_prediction_inputs`, the guard still precedes state build.
+    * Within `predict_week`, `_prepare_prediction_inputs(` precedes the
+      call into `simulate_game_for_prediction(`.
+    * Within `simulate_game_for_prediction` (PHASE 6), the coherent
+      `simulate_game(` call is still present.
+    """
+    inputs_source = inspect.getsource(_prepare_prediction_inputs)
+    history_guard = inputs_source.index("_assert_state_history_safe_for_games(")
+    state_build = inputs_source.index("build_team_states(")
+    assert history_guard < state_build
 
-    assert history_guard < state_build < simulation
+    week_source = inspect.getsource(predict_week)
+    prepare_inputs = week_source.index("_prepare_prediction_inputs(")
+    simulation_call = week_source.index("simulate_game_for_prediction(")
+    assert prepare_inputs < simulation_call
+
+    boundary_source = inspect.getsource(simulate_game_for_prediction)
+    assert "simulate_game(" in boundary_source
 
 
 def test_prediction_audit_precedes_persistence() -> None:
-    source = inspect.getsource(predict_week)
+    """PHASE 6/7D: within `predict_week`, the pricing call
+    (`price_current_markets(`) still precedes prediction persistence.
 
-    audit = source.index(
-        "_audit_and_attach_prediction_provenance("
-    )
-    persistence = source.index(
-        'warehouse.append(\n            "predictions"'
-    )
+    * PHASE 7D: the `predictions` append moved out of `predict_week` into
+      `_persist_prediction_rows`; `predict_week` calls
+      `_persist_prediction_rows(` after `price_current_markets(`, and that
+      helper is the sole place the `predictions` table is appended.
+    * PHASE 6: `_audit_and_attach_prediction_provenance(` still lives
+      inside `price_current_markets` (`nflprops.market.current_pricing`).
+    """
+    week_source = inspect.getsource(predict_week)
+    pricing_call = week_source.index("price_current_markets(")
+    persistence = week_source.index("_persist_prediction_rows(")
+    assert pricing_call < persistence
 
-    assert audit < persistence
+    persist_source = inspect.getsource(_persist_prediction_rows)
+    assert 'warehouse.append(' in persist_source
+    assert '"predictions"' in persist_source
+
+    pricing_source = inspect.getsource(price_current_markets)
+    assert "_audit_and_attach_prediction_provenance(" in pricing_source
+
+def test_live_future_collector_receipt_fails_provenance_even_if_provider_time_is_old() -> None:
+    priced_rows = [
+        {
+            "prediction_id": "prediction-live",
+            "p_model_raw": 0.50,
+        }
+    ]
+
+    game = {
+        "canonical_game_id": "target-game",
+        "available_at": AS_OF - timedelta(days=5),
+    }
+
+    quote = {
+        "canonical_game_id": "target-game",
+        "canonical_player_id": "player-1",
+        "prop_type": "receiving_yards",
+        "available_at": AS_OF - timedelta(minutes=30),
+        "provider_updated_at": AS_OF - timedelta(minutes=30),
+        "collector_received_at": AS_OF + timedelta(seconds=1),
+    }
+
+    with pytest.raises(LeakageError):
+        _audit_and_attach_prediction_provenance(
+            priced_rows,
+            quote=quote,
+            game=game,
+            season=2025,
+            week=2,
+            as_of=AS_OF,
+            state_context=clean_context(),
+            roster=pl.DataFrame(),
+            injuries=pl.DataFrame(),
+            game_market_available_at=None,
+            market_mode="live",
+        )
+

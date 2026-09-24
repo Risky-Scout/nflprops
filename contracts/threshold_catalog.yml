@@ -1,0 +1,157 @@
+# =====================================================================
+# CANONICAL THRESHOLD & MILESTONE CATALOG (NORMATIVE) — PHASE 8
+#
+# The versioned, sportsbook-independent catalog of AT_LEAST threshold /
+# milestone events derived from the Phase-7 coherent simulation draws.
+#
+#   event  : hit(draw_i) = stat(draw_i) >= threshold
+#   p_hit  : count(hit) / n_draws          (the only stored probability)
+#   p_miss : 1 - p_hit                     (always derivable, never stored)
+#
+# Thresholds are round, support-spanning, model-motivated POSITIVE
+# INTEGERS chosen from the realistic NFL player range and public
+# vernacular -- never copied from a sportsbook alt-line menu, a quote
+# count, or a vendor.
+#
+# Binary Phase-7 events (anytime_td, anytime_td_1q / _1h / _2h, first_td)
+# are NOT in this catalog: their canonical probability is the Phase-7
+# player_game_projections.mean. `offensive_tds` deliberately starts at 2
+# so it never re-stores the `anytime_td` (>= 1) probability.
+#
+# classification:
+#   STANDARD_THRESHOLD_ELIGIBLE -> scalar count / yardage / points ladder
+#   MILESTONE_ONLY              -> small natural count-milestone set
+#
+# 23 Phase-8 catalog stat series
+#     = 22 Phase-7 registry-backed threshold stat series
+#     +  1 catalog-derived stat series (`offensive_tds`)
+# 131 total canonical AT_LEAST events
+#     = 111 STANDARD threshold events + 20 MILESTONE threshold events
+#
+# Registry classification (of the 30 Phase-7 registry stats):
+#     16 STANDARD registry stats  + 6 MILESTONE registry stats  (= the 22
+#        registry-backed catalog series above)
+#      5 binary Phase-7 stats deliberately NOT duplicated here
+#        (anytime_td, anytime_td_1q / _1h / _2h, first_td)
+#      3 registry stats with no independent Phase-8 ladder -- components
+#        only (receiving_tds, rushing_tds, xp_made)
+# =====================================================================
+version: "2026.1.0"
+
+event_type: AT_LEAST
+
+expected_event_count: 131
+
+# Catalog-derived stats: NOT one of the 30 Phase-7 registry stats. Each
+# declares a deterministic elementwise derivation over Phase-7
+# `player_draws` integer columns, evaluated draw-by-draw on the SAME
+# coherent GameSimulationResult -- no new distribution, no resampling,
+# no RNG.
+derived_stats:
+  offensive_tds:
+    derivation: "receiving_tds + rushing_tds"
+    inputs: [receiving_tds, rushing_tds]
+    unit: touchdowns
+    note: >
+      Player offensive touchdown total per draw. passing_tds is
+      deliberately EXCLUDED -- a QB throwing a touchdown is the
+      receiver's offensive TD, not the QB's. Ladder starts at 2 so it
+      never duplicates the `anytime_td` (>= 1) probability.
+
+thresholds:
+
+  # ---- STANDARD_THRESHOLD_ELIGIBLE  (111 events) ---------------------
+  passing_yards:
+    classification: STANDARD_THRESHOLD_ELIGIBLE
+    unit: yards
+    values: [150, 175, 200, 225, 250, 275, 300, 325, 350, 400]
+  passing_completions:
+    classification: STANDARD_THRESHOLD_ELIGIBLE
+    unit: completions
+    values: [15, 18, 20, 22, 25, 28, 30]
+  passing_attempts:
+    classification: STANDARD_THRESHOLD_ELIGIBLE
+    unit: attempts
+    values: [25, 30, 35, 40, 45, 50]
+  rushing_yards:
+    classification: STANDARD_THRESHOLD_ELIGIBLE
+    unit: yards
+    values: [25, 40, 50, 60, 75, 90, 100, 125, 150]
+  rush_attempts:
+    classification: STANDARD_THRESHOLD_ELIGIBLE
+    unit: attempts
+    values: [5, 8, 10, 12, 15, 18, 20, 25]
+  receiving_yards:
+    classification: STANDARD_THRESHOLD_ELIGIBLE
+    unit: yards
+    values: [20, 30, 40, 50, 60, 75, 90, 100, 125, 150]
+  receptions:
+    classification: STANDARD_THRESHOLD_ELIGIBLE
+    unit: catches
+    values: [2, 3, 4, 5, 6, 7, 8, 10]
+  targets:
+    classification: STANDARD_THRESHOLD_ELIGIBLE
+    unit: targets
+    values: [3, 5, 7, 9, 11]
+  longest_reception:
+    classification: STANDARD_THRESHOLD_ELIGIBLE
+    unit: yards
+    values: [15, 20, 25, 30, 40, 50]
+  longest_rush:
+    classification: STANDARD_THRESHOLD_ELIGIBLE
+    unit: yards
+    values: [10, 15, 20, 30, 40]
+  longest_pass:
+    classification: STANDARD_THRESHOLD_ELIGIBLE
+    unit: yards
+    values: [20, 30, 40, 50, 60]
+  rushing_receiving_yards:
+    classification: STANDARD_THRESHOLD_ELIGIBLE
+    unit: yards
+    values: [40, 50, 60, 75, 90, 100, 125, 150]
+  kicking_points:
+    classification: STANDARD_THRESHOLD_ELIGIBLE
+    unit: points
+    values: [4, 6, 7, 8, 10, 12]
+  passing_yards_1h:
+    classification: STANDARD_THRESHOLD_ELIGIBLE
+    unit: yards
+    values: [75, 100, 125, 150, 175, 200]
+  receiving_yards_1h:
+    classification: STANDARD_THRESHOLD_ELIGIBLE
+    unit: yards
+    values: [15, 25, 40, 50, 60, 75]
+  rushing_yards_1h:
+    classification: STANDARD_THRESHOLD_ELIGIBLE
+    unit: yards
+    values: [15, 25, 40, 50, 60, 75]
+
+  # ---- MILESTONE_ONLY  (20 events) --------------------------------
+  passing_tds:
+    classification: MILESTONE_ONLY
+    unit: touchdowns
+    values: [1, 2, 3, 4]
+  interceptions:
+    classification: MILESTONE_ONLY
+    unit: interceptions
+    values: [1, 2, 3]
+  fg_made:
+    classification: MILESTONE_ONLY
+    unit: field_goals
+    values: [1, 2, 3, 4]
+  fg_attempts:
+    classification: MILESTONE_ONLY
+    unit: attempts
+    values: [1, 2, 3]
+  offensive_tds:
+    classification: MILESTONE_ONLY
+    unit: touchdowns
+    values: [2, 3]
+  passing_tds_1h:
+    classification: MILESTONE_ONLY
+    unit: touchdowns
+    values: [1, 2]
+  fg_made_1h:
+    classification: MILESTONE_ONLY
+    unit: field_goals
+    values: [1, 2]
