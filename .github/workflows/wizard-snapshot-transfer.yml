@@ -77,7 +77,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: wizardofodds.com
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Validate required inputs (explicit snapshot_id + expected manifest SHA)
         run: |
@@ -133,7 +133,7 @@ jobs:
     runs-on: ubuntu-latest
     environment: wizardofodds.com
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Validate required inputs
         run: |
