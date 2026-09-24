@@ -110,14 +110,17 @@ jobs:
           tar --exclude='.git' --exclude='.venv' -czf "$RUNNER_TEMP/release.tar.gz" .
 
       - name: Upload release archive
+        # scp takes the port as -P (its -p means "preserve times"), so it
+        # gets its own option string -- never the shared ssh SSH_OPTS.
         env:
           SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+          SCP_OPTS: -i ~/.ssh/wizard_deploy_key -P ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
         run: |
           REMOTE="${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}"
           # shellcheck disable=SC2086,SC2029
           ssh $SSH_OPTS "$REMOTE" "install -d -m 750 '$RELEASE_ROOT' '$RELEASE_ROOT/releases'"
           # shellcheck disable=SC2086
-          scp $SSH_OPTS "$RUNNER_TEMP/release.tar.gz" "$REMOTE:$RELEASE_ROOT/releases/$RELEASE_ID.tar.gz"
+          scp $SCP_OPTS "$RUNNER_TEMP/release.tar.gz" "$REMOTE:$RELEASE_ROOT/releases/$RELEASE_ID.tar.gz"
 
       - name: Install runtime env file if absent (environment secrets; never overwrites)
         env:
