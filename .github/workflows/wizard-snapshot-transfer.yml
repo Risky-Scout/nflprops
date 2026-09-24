@@ -91,7 +91,7 @@ jobs:
             echo "::error::expected_manifest_sha256 must be an explicit 64-character hex SHA-256"; exit 1
           fi
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -147,7 +147,7 @@ jobs:
             echo "::error::source_dir is required"; exit 1
           fi
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
