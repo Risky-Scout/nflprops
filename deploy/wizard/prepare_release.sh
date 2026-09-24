@@ -87,7 +87,7 @@ main() {
 
   # ---- layout (as wizard-deploy, no root) ----------------------------
   local d
-  for d in releases state state/warehouse snapshots publications backups logs locks; do
+  for d in releases state state/canonical snapshots publications backups logs locks; do
     install -d -m 750 "$runtime_root/$d"
   done
 

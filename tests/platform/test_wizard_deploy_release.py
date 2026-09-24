@@ -197,9 +197,42 @@ def test_prepare_builds_a_release_with_its_own_venv(host: Host) -> None:
     assert (release / "RELEASE_SHA").read_text().strip() == SHA_A
     assert (release / ".prepared").is_file()
     assert not (host.root / "releases" / f"{host.release_id(SHA_A)}.tar.gz").exists()
-    for d in ("releases", "state", "state/warehouse", "snapshots", "publications",
+    for d in ("releases", "state", "state/canonical", "snapshots", "publications",
               "backups", "logs", "locks"):
         assert (host.root / d).is_dir(), d
+
+
+def _env_example_value(key: str) -> str:
+    for line in ENV_EXAMPLE.read_text().splitlines():
+        if line.startswith(f"{key}="):
+            return line.split("=", 1)[1]
+    raise AssertionError(f"{key} missing from {ENV_EXAMPLE}")
+
+
+def test_first_install_layout_creates_the_warehouse_the_health_check_reads(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from nflprops.platform.health import warehouse_readable_check
+    from nflprops.platform.runtime_layout import warehouse_root_from_config
+
+    # The exact warehouse root the runtime/health resolve in production,
+    # from the production env file's NFLPROPS_DATA_ROOT.
+    monkeypatch.setenv("NFLPROPS_DATA_ROOT", _env_example_value("NFLPROPS_DATA_ROOT"))
+    production_warehouse = warehouse_root_from_config()
+    relative = production_warehouse.relative_to(APPROVED_ROOT)
+    assert str(relative) == "state/canonical"
+
+    warehouse = host.root / relative
+    assert not warehouse.exists()
+    result = host.prepare(SHA_A)
+    assert result.returncode == 0, result.stderr
+
+    # First install: the directory exists and is empty, and the unchanged
+    # critical warehouse_readable check passes on it.
+    assert warehouse.is_dir()
+    assert list(warehouse.iterdir()) == []
+    healthy, detail = warehouse_readable_check(warehouse)()
+    assert healthy, detail
 
 
 def test_each_release_has_its_own_venv(host: Host) -> None:

@@ -107,13 +107,15 @@ jobs:
           chmod 600 ~/.ssh/known_hosts
 
       - name: Download the exact snapshot_id directory into RUNNER_TEMP
+        # scp takes the port as -P (its -p means "preserve times"), so it
+        # gets its own option string -- never the shared ssh SSH_OPTS.
         env:
-          SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+          SCP_OPTS: -i ~/.ssh/wizard_deploy_key -P ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
         run: |
           REMOTE="${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}"
           mkdir -p "$RUNNER_TEMP/snapshot-download"
           # shellcheck disable=SC2086
-          scp -r $SSH_OPTS \
+          scp -r $SCP_OPTS \
             "$REMOTE:$SNAPSHOT_ROOT/${{ inputs.snapshot_id }}" \
             "$RUNNER_TEMP/snapshot-download/${{ inputs.snapshot_id }}"
 
@@ -172,8 +174,11 @@ jobs:
           chmod 600 ~/.ssh/known_hosts
 
       - name: Upload to a temp remote path, then atomic publish through the Wizard runtime owner
+        # scp takes the port as -P (its -p means "preserve times"), so it
+        # gets its own option string -- never the shared ssh SSH_OPTS.
         env:
           SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+          SCP_OPTS: -i ~/.ssh/wizard_deploy_key -P ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
         run: |
           REMOTE="${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}"
           REMOTE_INCOMING_PARENT="$RESULT_BUNDLE_ROOT/_incoming"
@@ -183,7 +188,7 @@ jobs:
           # shellcheck disable=SC2086
           ssh $SSH_OPTS "$REMOTE" "mkdir -p '$REMOTE_INCOMING_PARENT'"
           # shellcheck disable=SC2086
-          scp -r $SSH_OPTS "$RUNNER_TEMP/result-bundle-staging" "$REMOTE:$REMOTE_STAGING"
+          scp -r $SCP_OPTS "$RUNNER_TEMP/result-bundle-staging" "$REMOTE:$REMOTE_STAGING"
           # Publication (verify-then-atomic-rename, never overwriting
           # different content) happens through the WIZARD RUNTIME OWNER's
           # own already-deployed CLI -- GitHub never opens the live

@@ -18,6 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 REMOTE_TRAINING = REPO_ROOT / ".github" / "workflows" / "remote-training.yml"
 DEPLOY_WIZARD = REPO_ROOT / ".github" / "workflows" / "deploy-wizard.yml"
 CI = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+SNAPSHOT_TRANSFER = REPO_ROOT / ".github" / "workflows" / "wizard-snapshot-transfer.yml"
 
 _SECRET_LITERAL_RE = re.compile(
     r"(api[_-]?key|secret|token|password)\s*[:=]\s*['\"][A-Za-z0-9_\-]{16,}['\"]",
@@ -173,63 +174,73 @@ def test_deploy_wizard_is_namespaced_away_from_sibling_deployments(
 
 
 _PORT_SECRET = "${{ secrets.WIZARD_SSH_PORT }}"
-_OPTS_VAR_RE = re.compile(r"^\s*(ssh|scp)\b.*?\$\{?([A-Z_]+_OPTS)\}?\b")
+_TRANSPORT_RE = re.compile(r"^\s*(ssh|scp)\s")
+_OPTS_VAR_RE = re.compile(r"\$\{?([A-Z_]+_OPTS)\}?\b")
+
+#: Every workflow that copies files to/from the Wizard host with scp.
+_SCP_WORKFLOWS = [DEPLOY_WIZARD, SNAPSHOT_TRANSFER]
 
 
-def _deploy_transport_calls(doc: dict) -> list[tuple[str, str, str, dict]]:
-    """Every ``ssh``/``scp`` invocation in the deploy job as
-    (step name, command, options variable, the step's env)."""
+def _transport_calls(path: Path) -> list[tuple[str, str, str | None, dict]]:
+    """Every ``ssh``/``scp`` invocation in any job of the workflow at `path`
+    as (step name, command, options variable or None, the step's env)."""
     calls = []
-    for step in doc["jobs"]["deploy"]["steps"]:
-        for line in step.get("run", "").splitlines():
-            match = _OPTS_VAR_RE.match(line)
-            if match:
-                calls.append(
-                    (step["name"], match.group(1), match.group(2), step.get("env", {}))
-                )
+    for job in _load(path)["jobs"].values():
+        for step in job["steps"]:
+            for line in step.get("run", "").splitlines():
+                command = _TRANSPORT_RE.match(line)
+                if command:
+                    var = _OPTS_VAR_RE.search(line)
+                    calls.append(
+                        (
+                            step["name"],
+                            command.group(1),
+                            var.group(1) if var else None,
+                            step.get("env", {}),
+                        )
+                    )
     return calls
 
 
-def test_deploy_wizard_has_ssh_and_scp_calls(deploy_wizard_doc: dict) -> None:
-    commands = {
-        command for _, command, _, _ in _deploy_transport_calls(deploy_wizard_doc)
-    }
-    assert commands == {"ssh", "scp"}
+@pytest.mark.parametrize("path", _SCP_WORKFLOWS, ids=lambda p: p.name)
+def test_wizard_transport_calls_all_use_an_option_variable(path: Path) -> None:
+    calls = _transport_calls(path)
+    assert "scp" in {command for _, command, _, _ in calls}
+    for name, command, var, env in calls:
+        assert var is not None and var in env, (name, command)
 
 
-def test_deploy_wizard_ssh_uses_lowercase_port_flag(deploy_wizard_doc: dict) -> None:
-    for name, command, var, env in _deploy_transport_calls(deploy_wizard_doc):
+@pytest.mark.parametrize("path", _SCP_WORKFLOWS, ids=lambda p: p.name)
+def test_wizard_ssh_uses_lowercase_port_flag(path: Path) -> None:
+    for name, command, var, env in _transport_calls(path):
         if command != "ssh":
             continue
-        opts = env[var].split()
         assert f"-p {_PORT_SECRET}" in env[var], name
-        assert "-P" not in opts, name
+        assert "-P" not in env[var].split(), name
 
 
-def test_deploy_wizard_scp_uses_uppercase_port_flag(deploy_wizard_doc: dict) -> None:
+@pytest.mark.parametrize("path", _SCP_WORKFLOWS, ids=lambda p: p.name)
+def test_wizard_scp_uses_uppercase_port_flag(path: Path) -> None:
     # scp's -p is "preserve times": a -p <port> makes scp treat the port as
     # a local source file ("scp: stat local ...").
-    for name, command, var, env in _deploy_transport_calls(deploy_wizard_doc):
+    for name, command, var, env in _transport_calls(path):
         if command != "scp":
             continue
-        opts = env[var].split()
         assert f"-P {_PORT_SECRET}" in env[var], name
-        assert "-p" not in opts, name
+        assert "-p" not in env[var].split(), name
 
 
-def test_deploy_wizard_ssh_and_scp_never_share_an_option_string(
-    deploy_wizard_doc: dict,
-) -> None:
-    calls = _deploy_transport_calls(deploy_wizard_doc)
+@pytest.mark.parametrize("path", _SCP_WORKFLOWS, ids=lambda p: p.name)
+def test_wizard_ssh_and_scp_never_share_an_option_string(path: Path) -> None:
+    calls = _transport_calls(path)
     ssh_vars = {var for _, command, var, _ in calls if command == "ssh"}
     scp_vars = {var for _, command, var, _ in calls if command == "scp"}
     assert not ssh_vars & scp_vars
 
 
-def test_deploy_wizard_scp_keeps_the_same_key_and_host_verification(
-    deploy_wizard_doc: dict,
-) -> None:
-    for name, _, var, env in _deploy_transport_calls(deploy_wizard_doc):
+@pytest.mark.parametrize("path", _SCP_WORKFLOWS, ids=lambda p: p.name)
+def test_wizard_transport_keeps_the_same_key_and_host_verification(path: Path) -> None:
+    for name, _, var, env in _transport_calls(path):
         opts = env[var]
         assert "-i ~/.ssh/wizard_deploy_key" in opts, name
         assert "-o UserKnownHostsFile=~/.ssh/known_hosts" in opts, name
