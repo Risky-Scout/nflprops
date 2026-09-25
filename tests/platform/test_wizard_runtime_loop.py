@@ -81,6 +81,17 @@ SEASON = 2026
 WEEK = 3
 
 
+@pytest.fixture(autouse=True)
+def _anchor_base_to_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Re-anchor BASE just after real time for EACH test. The FakeProvider
+    stamps available_at/receipt times with the real wall clock, so a BASE
+    fixed at import drifts behind real time in a long suite (CI) and every
+    collection lands after the cutoffs the test computes from BASE."""
+    monkeypatch.setitem(
+        globals(), "BASE", datetime.now(UTC).replace(microsecond=0) + timedelta(minutes=5)
+    )
+
+
 class Clock:
     def __init__(self, start: datetime) -> None:
         self.now = start
