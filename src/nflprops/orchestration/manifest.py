@@ -153,6 +153,21 @@ def _select_target_game_row(
     return eligible.sort("available_at").tail(1)
 
 
+def _read_scoped(warehouse: Warehouse, table: str, where: pl.Expr) -> pl.DataFrame:
+    """Exactly `warehouse.read(table).filter(where)`, without materializing
+    the rows `where` excludes -- the growing live snapshot tables must never
+    be loaded whole on the lightweight runtime. Every `where` used here is
+    the conjunction of this module's own PIT filter (`filter_pit`,
+    `available_at <= scheduled_as_of`) and the game/team/player scope it
+    applies right after, so the selected rows (and the manifest hash) are
+    unchanged. Falls back to the plain read if the table lacks a filtered
+    column, so the unchanged downstream checks behave exactly as before."""
+    try:
+        return warehouse.read(table, where=where)
+    except (TypeError, pl.exceptions.ColumnNotFoundError):
+        return warehouse.read(table)
+
+
 def _relevant_player_ids(*frames: pl.DataFrame) -> set[str]:
     player_ids: set[str] = set()
     for frame in frames:
@@ -185,10 +200,18 @@ def build_checkpoint_manifest(
     player_stats = warehouse.read("player_game_stats")
     team_stats = warehouse.read("team_game_stats")
     players = warehouse.read("players")
-    roster = warehouse.read("roster_snapshots")
-    injuries = warehouse.read("injury_snapshots")
     injury_runs = warehouse.read(RESOURCE_RUNS_TABLE)
-    game_odds, prop_quotes = _market_frames_for_mode(warehouse, market_mode=market_mode)
+    pit = pl.col("available_at") <= scheduled_as_of
+    if market_mode == "live":
+        # `_market_frames_for_mode`'s live branch, scoped to this game.
+        game_odds = _read_scoped(
+            warehouse, "game_odds_snapshots", (pl.col("canonical_game_id") == game_id) & pit
+        )
+        prop_quotes = _read_scoped(
+            warehouse, "player_prop_snapshots", (pl.col("canonical_game_id") == game_id) & pit
+        )
+    else:
+        game_odds, prop_quotes = _market_frames_for_mode(warehouse, market_mode=market_mode)
 
     target_game_row = _select_target_game_row(
         games, game_id=game_id, scheduled_as_of=scheduled_as_of
@@ -213,6 +236,13 @@ def build_checkpoint_manifest(
 
     player_stats_scoped = _scoped_by_team(player_stats)
     team_stats_scoped = _scoped_by_team(team_stats)
+    roster = (
+        _read_scoped(
+            warehouse, "roster_snapshots", pl.col("canonical_team_id").is_in(list(team_ids)) & pit
+        )
+        if team_ids
+        else pl.DataFrame()  # _scoped_by_team selects nothing without team ids
+    )
     roster_scoped = _scoped_by_team(roster)
 
     player_stats_component = _content_component(
@@ -227,6 +257,15 @@ def build_checkpoint_manifest(
 
     player_ids = _relevant_player_ids(player_stats_scoped, roster_scoped)
 
+    injuries = (
+        _read_scoped(
+            warehouse,
+            "injury_snapshots",
+            pl.col("canonical_player_id").is_in(sorted(player_ids)) & pit,
+        )
+        if player_ids
+        else pl.DataFrame()  # selects nothing without player ids (below)
+    )
     injuries_eligible = filter_pit(injuries, scheduled_as_of, strict=False)
     if player_ids and "canonical_player_id" in injuries_eligible.columns:
         injuries_scoped = injuries_eligible.filter(

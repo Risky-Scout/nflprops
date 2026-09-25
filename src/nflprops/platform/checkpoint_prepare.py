@@ -41,6 +41,8 @@ from typing import Any
 
 import polars as pl
 
+from nflprops.collection.models import RESOURCE_RUNS_TABLE, ResourceType
+from nflprops.collection.resource_availability import resource_feed_available_at
 from nflprops.config import Config
 from nflprops.data.warehouse import Warehouse
 from nflprops.errors import NflpropsError
@@ -56,6 +58,7 @@ from nflprops.orchestration.manifest import (
     compute_data_manifest_sha256,
 )
 from nflprops.orchestration.run_store import (
+    FAILURE_INSUFFICIENT_PRE_CUTOFF_PIT_DATA,
     PREDICTION_RUNS_TABLE,
     PredictionRunRecord,
     PredictionRunStatus,
@@ -63,6 +66,7 @@ from nflprops.orchestration.run_store import (
     claim_checkpoint,
     compute_run_id,
     get_run,
+    update_run_status,
 )
 from nflprops.platform.immutable_bundle import (
     build_manifest,
@@ -81,6 +85,16 @@ EXECUTION_TARGET = "GITHUB_ACTIONS"
 
 STATE_PREPARING = "PREPARING"
 STATE_PENDING_REMOTE_EXECUTION = "PENDING_REMOTE_EXECUTION"
+#: Retained, never dispatched: an official checkpoint whose required
+#: pre-cutoff collector evidence does not exist. The reason is the run's
+#: `failure_code` (FAILURE_INSUFFICIENT_PRE_CUTOFF_PIT_DATA).
+STATE_NOT_EXECUTABLE = "NOT_EXECUTABLE"
+
+#: Provider feeds a live official checkpoint's model inputs come from. Each
+#: must have been successfully checked (collector_resource_runs semantics,
+#: `resource_feed_available_at`) at or before `scheduled_as_of`.
+_REQUIRED_FEEDS = (ResourceType.GAMES, ResourceType.ROSTERS, ResourceType.INJURIES)
+_REQUIRED_MARKET_FEEDS = (ResourceType.GAME_ODDS, ResourceType.PLAYER_PROPS)
 
 _TS = pl.Datetime(time_unit="us", time_zone="UTC")
 _REQUEST_SCHEMA: dict[str, Any] = {
@@ -129,6 +143,7 @@ class PreparePassResult:
     missed: tuple[str, ...]
     prepared: tuple[PreparedCheckpoint, ...]
     snapshot: SnapshotInfo | None
+    blocked: tuple[str, ...] = ()
 
 
 def _read_requests(warehouse: Warehouse) -> pl.DataFrame:
@@ -151,9 +166,84 @@ def pending_requests(warehouse: Warehouse) -> pl.DataFrame:
 
 
 def protected_snapshot_ids(warehouse: Warehouse) -> frozenset[str]:
-    """Snapshots a PENDING request still references -- never pruned."""
+    """Snapshots a PENDING (or retained NOT_EXECUTABLE) request references
+    -- never pruned."""
+    requests = _read_requests(warehouse).filter(
+        pl.col("state").is_in([STATE_PENDING_REMOTE_EXECUTION, STATE_NOT_EXECUTABLE])
+    )
+    return frozenset(v for v in requests["snapshot_id"].drop_nulls().to_list() if v)
+
+
+def missing_pre_cutoff_feeds(
+    warehouse: Warehouse, *, scheduled_as_of: datetime, market_mode: str = "live"
+) -> list[str]:
+    """Required feeds with NO successful collection at or before
+    `scheduled_as_of` (empty = the checkpoint's inputs are PIT-covered)."""
+    runs = warehouse.read(RESOURCE_RUNS_TABLE)
+    required = _REQUIRED_FEEDS + (_REQUIRED_MARKET_FEEDS if market_mode == "live" else ())
+    return [
+        feed.value
+        for feed in required
+        if not resource_feed_available_at(runs, resource_type=feed, as_of=scheduled_as_of)
+    ]
+
+
+def remote_execution_blocker(
+    warehouse: Warehouse, request: dict[str, Any], *, market_mode: str = "live"
+) -> str | None:
+    """Fail-closed remote-execution eligibility for one request: None when
+    it may be executed, else the reason it must not be. MANUAL checkpoints
+    are exempt (unchanged behavior; they never satisfy an official one)."""
+    if request["checkpoint_name"] == CheckpointName.MANUAL.value:
+        return None
+    missing = missing_pre_cutoff_feeds(
+        warehouse, scheduled_as_of=request["scheduled_as_of"], market_mode=market_mode
+    )
+    if not missing:
+        return None
+    return (
+        f"{FAILURE_INSUFFICIENT_PRE_CUTOFF_PIT_DATA}: no successful "
+        f"{', '.join(missing)} collection at or before scheduled_as_of "
+        f"{request['scheduled_as_of'].astimezone(UTC).isoformat()}"
+    )
+
+
+def executable_requests(warehouse: Warehouse, *, market_mode: str = "live") -> pl.DataFrame:
+    """The requests a remote executor may run: PENDING and, re-checked
+    here (fail closed), still eligible."""
     pending = pending_requests(warehouse)
-    return frozenset(v for v in pending["snapshot_id"].drop_nulls().to_list() if v)
+    keep = [
+        remote_execution_blocker(warehouse, row, market_mode=market_mode) is None
+        for row in pending.iter_rows(named=True)
+    ]
+    return pending.filter(pl.Series(keep, dtype=pl.Boolean)) if keep else pending
+
+
+def _apply_execution_gate(warehouse: Warehouse, *, market_mode: str) -> tuple[str, ...]:
+    """Retain every official PREPARING/PENDING request that fails the gate
+    as NOT_EXECUTABLE (its run FAILED with the reason). Identity,
+    scheduled_as_of and the request row itself are kept. Idempotent: the
+    pre-cutoff evidence of a past cutoff can never change."""
+    candidates = _read_requests(warehouse).filter(
+        pl.col("state").is_in([STATE_PREPARING, STATE_PENDING_REMOTE_EXECUTION])
+    )
+    blocked: list[str] = []
+    for request in candidates.iter_rows(named=True):
+        reason = remote_execution_blocker(warehouse, request, market_mode=market_mode)
+        if reason is None:
+            continue
+        run = get_run(as_run_store_backend(warehouse), request["run_id"])
+        if run is not None and run.status is PredictionRunStatus.SCHEDULED:
+            update_run_status(
+                as_run_store_backend(warehouse),
+                request["run_id"],
+                status=PredictionRunStatus.FAILED,
+                failure_code=FAILURE_INSUFFICIENT_PRE_CUTOFF_PIT_DATA,
+                failure_detail=reason,
+            )
+        _upsert_request(warehouse, {**request, "state": STATE_NOT_EXECUTABLE})
+        blocked.append(request["run_id"])
+    return tuple(blocked)
 
 
 def _request_row_for_run(
@@ -369,6 +459,7 @@ def prepare_due_checkpoints(
             else:
                 claimed.append(item.record.run_id)
         _record_missing_requests(warehouse, prepared_at=now, release_sha=release_sha)
+        blocked = _apply_execution_gate(warehouse, market_mode=market_mode)
 
     snapshot, prepared = _finish_preparing(
         layout,
@@ -379,7 +470,11 @@ def prepare_due_checkpoints(
         market_mode=market_mode,
     )
     return PreparePassResult(
-        claimed=tuple(claimed), missed=tuple(missed), prepared=tuple(prepared), snapshot=snapshot
+        claimed=tuple(claimed),
+        missed=tuple(missed),
+        prepared=tuple(prepared),
+        snapshot=snapshot,
+        blocked=blocked,
     )
 
 

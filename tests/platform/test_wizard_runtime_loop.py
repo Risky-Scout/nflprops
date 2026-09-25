@@ -36,14 +36,17 @@ from nflprops.orchestration.checkpoints import (
     CheckpointName,
 )
 from nflprops.orchestration.run_store import (
+    FAILURE_INSUFFICIENT_PRE_CUTOFF_PIT_DATA,
     PREDICTION_RUNS_TABLE,
     compute_run_id,
 )
 from nflprops.platform.checkpoint_prepare import (
     EXECUTION_TARGET,
     REMOTE_REQUESTS_TABLE,
+    STATE_NOT_EXECUTABLE,
     STATE_PENDING_REMOTE_EXECUTION,
     CheckpointPrepareError,
+    executable_requests,
     prepare_due_checkpoints,
     prepare_manual_checkpoint,
     protected_snapshot_ids,
@@ -336,7 +339,13 @@ def test_runtime_modules_never_import_prefect() -> None:
 
 def _checkpoint_env(env: dict, kickoff: datetime) -> tuple[RuntimeLoop, Clock]:
     clock = Clock(BASE)
-    loop = _loop(env, _provider(kickoff), clock)
+    provider = _provider(kickoff)
+    # Every required feed (incl. ROSTERS) is successfully collected before
+    # the cutoff, so the official checkpoint passes the execution gate.
+    for team in ("t1", "t2"):
+        provider.seed_player(f"{team}-p1")
+        provider.seed_roster_entry(team_native_id=team, player_native_id=f"{team}-p1")
+    loop = _loop(env, provider, clock)
     loop.tick()  # collect the game into the live warehouse
     return loop, clock
 
@@ -588,3 +597,102 @@ def test_offsets_are_the_certified_official_set() -> None:
     assert {c.value: s for c, s in DEFAULT_CHECKPOINT_OFFSETS.offset_seconds.items()} == {
         "T48H": 172_800, "T24H": 86_400, "T6H": 21_600, "T90M": 5_400, "T30M": 1_800,
     }
+
+
+# ------------------------------------------- remote-execution eligibility gate
+
+
+def _requests_by_name(env: dict) -> dict[str, dict]:
+    frame = env["warehouse"].read(REMOTE_REQUESTS_TABLE)
+    return {row["checkpoint_name"]: row for row in frame.iter_rows(named=True)}
+
+
+def _runs_by_name(env: dict) -> dict[str, dict]:
+    frame = env["warehouse"].read(PREDICTION_RUNS_TABLE)
+    return {row["checkpoint_name"]: row for row in frame.iter_rows(named=True)}
+
+
+def test_first_start_catch_ups_are_retained_but_never_executable(env: dict) -> None:
+    """Production's first start: T48H/T24H cutoffs passed before any
+    collection existed. They are claimed (identity + cutoff recorded) but
+    blocked; the prospective T6H, collected before its cutoff, stays
+    executable; a MANUAL checkpoint is unchanged."""
+    kickoff = BASE + 20 * H + 2 * M
+    loop, clock = _checkpoint_env(env, kickoff)  # first tick: collect + catch-up
+
+    runs = _runs_by_name(env)
+    requests = _requests_by_name(env)
+    for name, offset in (("T48H", 48 * H), ("T24H", 24 * H)):
+        run = runs[name]
+        assert run["status"] == "FAILED"
+        assert run["failure_code"] == FAILURE_INSUFFICIENT_PRE_CUTOFF_PIT_DATA
+        assert "ROSTERS" in run["failure_detail"] or "GAMES" in run["failure_detail"]
+        assert run["scheduled_as_of"] == kickoff - offset  # cutoff never moved
+        assert run["run_id"] == compute_run_id(  # identity unchanged
+            game_id=run["game_id"],
+            checkpoint_name=CheckpointName(name),
+            scheduled_as_of=kickoff - offset,
+            kickoff_at=kickoff,
+            model_version=run["model_version"],
+            config_sha256=run["config_sha256"],
+            source_sha256=run["source_sha256"],
+        )
+        assert requests[name]["state"] == STATE_NOT_EXECUTABLE  # retained
+
+    game_id = env["warehouse"].read("games")["canonical_game_id"][0]
+    prepare_manual_checkpoint(  # cutoff BEFORE any collection: MANUAL is exempt
+        layout=env["layout"], warehouse=env["warehouse"], config=env["config"],
+        season=SEASON, week=WEEK, game_id=game_id, as_of=BASE - H,
+        now=clock.now, migration_head=HEAD, hostname="h", release_sha=None,
+    )
+    clock.advance(hours=14, minutes=3)  # T6H (prospective) is now due
+    loop.tick()
+
+    runs = _runs_by_name(env)
+    requests = _requests_by_name(env)
+    assert runs["T6H"]["status"] == "SCHEDULED"
+    assert runs["T6H"]["failure_code"] is None
+    assert requests["T6H"]["state"] == STATE_PENDING_REMOTE_EXECUTION
+    assert runs["MANUAL"]["status"] == "SCHEDULED"
+    assert requests["MANUAL"]["state"] == STATE_PENDING_REMOTE_EXECUTION
+    executable = set(executable_requests(env["warehouse"])["checkpoint_name"])
+    assert executable == {"T6H", "MANUAL"}
+
+    # Idempotent: another pass changes nothing and duplicates nothing.
+    before = env["warehouse"].read(REMOTE_REQUESTS_TABLE).sort("request_id")
+    clock.advance(minutes=1)
+    loop.tick()
+    after = env["warehouse"].read(REMOTE_REQUESTS_TABLE).sort("request_id")
+    assert after.select("request_id", "state").equals(before.select("request_id", "state"))
+
+
+def test_already_pending_catch_ups_are_blocked_on_the_next_pass(
+    env: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live warehouse today: catch-ups prepared PENDING by the previous
+    release (bundle published, snapshot taken). The first pass of the gated
+    release retains them NOT_EXECUTABLE; the bundle and its snapshot stay."""
+    import nflprops.platform.checkpoint_prepare as prepare_module
+
+    kickoff = BASE + 20 * H + 2 * M
+    with monkeypatch.context() as ungated:
+        ungated.setattr(prepare_module, "remote_execution_blocker", lambda *a, **k: None)
+        loop, clock = _checkpoint_env(env, kickoff)
+    requests = _requests_by_name(env)
+    assert {requests[n]["state"] for n in ("T48H", "T24H")} == {STATE_PENDING_REMOTE_EXECUTION}
+    snapshot_id = requests["T48H"]["snapshot_id"]
+    bundle_dir = env["layout"].checkpoint_requests / requests["T48H"]["run_id"]
+    assert bundle_dir.is_dir()
+
+    clock.advance(minutes=1)
+    loop.tick()  # the gated release's first pass
+
+    requests = _requests_by_name(env)
+    runs = _runs_by_name(env)
+    for name in ("T48H", "T24H"):
+        assert requests[name]["state"] == STATE_NOT_EXECUTABLE
+        assert requests[name]["snapshot_id"] == snapshot_id
+        assert runs[name]["failure_code"] == FAILURE_INSUFFICIENT_PRE_CUTOFF_PIT_DATA
+    assert bundle_dir.is_dir()  # never deleted
+    assert snapshot_id in protected_snapshot_ids(env["warehouse"])
+    assert executable_requests(env["warehouse"]).is_empty()
