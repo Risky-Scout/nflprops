@@ -13,6 +13,8 @@ from typing import Any
 
 import polars as pl
 
+from nflprops.data.warehouse import read_table, table_files
+
 #: Canonical snapshot tables and the natural keys `collect_once` appends
 #: them with (nflprops.collection.service). Duplicates on these keys would
 #: mean a restart manufactured a second scientific observation.
@@ -37,8 +39,17 @@ _NATURAL_KEYS: dict[str, list[str]] = {
 
 
 def _read(root: Path, table: str) -> pl.DataFrame:
-    path = root / f"{table}.parquet"
-    return pl.read_parquet(path) if path.is_file() else pl.DataFrame()
+    return read_table(root, table)
+
+
+def _scan(root: Path, table: str) -> pl.LazyFrame | None:
+    """The logical table as a lazy scan over every file holding it, so the
+    large snapshot tables are aggregated without being materialized."""
+    files = table_files(root, table)
+    if not files:
+        return None
+    scans = [pl.scan_parquet(path) for path in files]
+    return scans[0] if len(scans) == 1 else pl.concat(scans, how="diagonal_relaxed")
 
 
 def _iso(value: Any) -> Any:
@@ -102,29 +113,45 @@ def build_report(warehouse_root: Path, *, now: datetime | None = None) -> dict[s
     pit: dict[str, Any] = {}
     duplicates: dict[str, int] = {}
     for table, key in _NATURAL_KEYS.items():
-        frame = _read(warehouse_root, table)
-        if frame.is_empty():
+        lazy = _scan(warehouse_root, table)
+        if lazy is None:
             continue
-        present = [c for c in key if c in frame.columns]
+        columns = set(lazy.collect_schema().names())
+        present = [c for c in key if c in columns]
+        stats = [pl.len().alias("rows")]
         if present:
-            duplicates[table] = frame.height - frame.unique(subset=present).height
-        entry: dict[str, Any] = {"rows": frame.height}
-        if "available_at" in frame.columns:
-            entry["max_available_at"] = _iso(frame["available_at"].max())
-            entry["future_available_at_rows"] = frame.filter(pl.col("available_at") > current).height
-        if {"available_at", "collector_received_at"} <= set(frame.columns):
-            entry["available_after_received_rows"] = frame.filter(
-                pl.col("available_at") > pl.col("collector_received_at")
-            ).height
+            stats.append(pl.struct(present).n_unique().alias("unique_keys"))
+        if "available_at" in columns:
+            stats.append(pl.col("available_at").max().alias("max_available_at"))
+            stats.append(
+                (pl.col("available_at") > current).sum().alias("future_available_at_rows")
+            )
+        if {"available_at", "collector_received_at"} <= columns:
+            stats.append(
+                (pl.col("available_at") > pl.col("collector_received_at"))
+                .sum()
+                .alias("available_after_received_rows")
+            )
+        row = lazy.select(stats).collect(engine="streaming").row(0, named=True)
+        if row["rows"] == 0:
+            continue
+        if present:
+            duplicates[table] = row["rows"] - row["unique_keys"]
+        entry: dict[str, Any] = {"rows": row["rows"]}
+        if "available_at" in columns:
+            entry["max_available_at"] = _iso(row["max_available_at"])
+            entry["future_available_at_rows"] = row["future_available_at_rows"]
+        if {"available_at", "collector_received_at"} <= columns:
+            entry["available_after_received_rows"] = row["available_after_received_rows"]
         pit[table] = entry
     report["pit"] = pit
     report["natural_key_duplicates"] = duplicates
 
-    injuries = _read(warehouse_root, "injury_snapshots")
-    if not injuries.is_empty() and "status" in injuries.columns:
-        report["injury_status_counts"] = dict(
-            injuries.group_by("status").len().sort("status").iter_rows()
-        )
+    injuries = _scan(warehouse_root, "injury_snapshots")
+    if injuries is not None and "status" in injuries.collect_schema().names():
+        counts = injuries.group_by("status").len().sort("status").collect(engine="streaming")
+        if counts.height:
+            report["injury_status_counts"] = dict(counts.iter_rows())
 
     predictions = _read(warehouse_root, "prediction_runs")
     if not predictions.is_empty():

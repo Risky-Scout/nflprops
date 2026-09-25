@@ -30,6 +30,11 @@ if TYPE_CHECKING:
 PREDICTION_RUNS_TABLE = "prediction_runs"
 
 FAILURE_CHECKPOINT_MISSED = "CHECKPOINT_MISSED"
+#: An official checkpoint claimed by catch-up whose required collector
+#: evidence did not exist at or before its `scheduled_as_of` (e.g. the
+#: cutoff predates the start of production collection). Identity and
+#: cutoff stay recorded; it is never executed as PIT-faithful science.
+FAILURE_INSUFFICIENT_PRE_CUTOFF_PIT_DATA = "INSUFFICIENT_PRE_CUTOFF_PIT_DATA"
 
 
 class PredictionRunStatus(str, Enum):  # noqa: UP042

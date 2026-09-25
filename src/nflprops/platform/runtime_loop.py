@@ -375,12 +375,13 @@ class RuntimeLoop:
             release_sha=self.release_sha,
             lock_timeout_seconds=self.lock_timeout_seconds,
         )
-        if result.claimed or result.missed or result.prepared:
+        if result.claimed or result.missed or result.prepared or result.blocked:
             _log(
                 "checkpoints_prepared",
                 claimed=list(result.claimed),
                 missed=list(result.missed),
                 prepared=[p.run_id for p in result.prepared],
+                blocked_insufficient_pre_cutoff_pit=list(result.blocked),
                 snapshot_id=result.snapshot.snapshot_id if result.snapshot else None,
             )
             self._prune()

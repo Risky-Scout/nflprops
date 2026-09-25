@@ -359,9 +359,17 @@ def verify_live_warehouse(warehouse_root: Path) -> tuple[bool, str]:
     valid Parquet footer. Never raises -- returns `(healthy, detail)`."""
     if not warehouse_root.exists():
         return False, f"warehouse_root {warehouse_root} does not exist"
-    parquet_files = list(warehouse_root.glob("*.parquet"))
+    # Top-level single-file tables plus the part files of partitioned
+    # snapshot tables (`<table>.parts/`, nflprops.data.warehouse).
+    parquet_files = list(warehouse_root.glob("*.parquet")) + list(
+        warehouse_root.glob("*.parts/*.parquet")
+    )
     if not parquet_files:
         return True, "warehouse_root exists with no tables yet"
+    tables = {
+        path.stem if path.parent == warehouse_root else path.parent.name.removesuffix(".parts")
+        for path in parquet_files
+    }
     import polars as pl
 
     unreadable: list[str] = []
@@ -369,7 +377,7 @@ def verify_live_warehouse(warehouse_root: Path) -> tuple[bool, str]:
         try:
             pl.read_parquet_schema(path)
         except Exception as exc:
-            unreadable.append(f"{path.name}: {exc}")
+            unreadable.append(f"{path.relative_to(warehouse_root)}: {exc}")
     if unreadable:
         return False, f"{len(unreadable)} unreadable table(s): {unreadable[:3]}"
-    return True, f"{len(parquet_files)} table(s) readable"
+    return True, f"{len(tables)} table(s) readable"
