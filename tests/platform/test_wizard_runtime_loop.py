@@ -626,9 +626,9 @@ def _runs_by_name(env: dict) -> dict[str, dict]:
 def test_first_start_catch_ups_are_retained_but_never_executable(env: dict) -> None:
     """Production's first start: T48H/T24H cutoffs passed before any
     collection existed. They are claimed (identity + cutoff recorded) but
-    blocked; the prospective T6H, collected before its cutoff, stays
-    executable; a MANUAL checkpoint is unchanged."""
-    kickoff = BASE + 20 * H + 2 * M
+    blocked; the prospective T6H, collected shortly before its cutoff,
+    stays executable; a MANUAL checkpoint is unchanged."""
+    kickoff = BASE + 6 * H + 2 * M
     loop, clock = _checkpoint_env(env, kickoff)  # first tick: collect + catch-up
 
     runs = _runs_by_name(env)
@@ -656,7 +656,7 @@ def test_first_start_catch_ups_are_retained_but_never_executable(env: dict) -> N
         season=SEASON, week=WEEK, game_id=game_id, as_of=BASE - H,
         now=clock.now, migration_head=HEAD, hostname="h", release_sha=None,
     )
-    clock.advance(hours=14, minutes=3)  # T6H (prospective) is now due
+    clock.advance(minutes=3)  # T6H (prospective, evidence ~7m old) is now due
     loop.tick()
 
     runs = _runs_by_name(env)
@@ -706,4 +706,42 @@ def test_already_pending_catch_ups_are_blocked_on_the_next_pass(
         assert runs[name]["failure_code"] == FAILURE_INSUFFICIENT_PRE_CUTOFF_PIT_DATA
     assert bundle_dir.is_dir()  # never deleted
     assert snapshot_id in protected_snapshot_ids(env["warehouse"])
+    assert executable_requests(env["warehouse"]).is_empty()
+
+
+def test_already_pending_stale_catch_ups_are_blocked_on_the_next_pass(
+    env: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Production after the stall: every required feed WAS collected before
+    the T48H cutoff, but the latest such collection is older than the T48H
+    limit. A PENDING request prepared without the freshness rule is re-gated
+    NOT_EXECUTABLE on the next pass; identity and cutoff never move."""
+    import nflprops.platform.checkpoint_prepare as prepare_module
+
+    kickoff = BASE + 48 * H + 90 * M  # T48H cutoff ~95m after the collection
+    with monkeypatch.context() as ungated:
+        ungated.setattr(prepare_module, "remote_execution_blocker", lambda *a, **k: None)
+        loop, clock = _checkpoint_env(env, kickoff)
+        clock.advance(minutes=93)  # the scheduler wakes up late: T48H is due
+        loop.tick()
+    requests = _requests_by_name(env)
+    assert requests["T48H"]["state"] == STATE_PENDING_REMOTE_EXECUTION
+    run_id = requests["T48H"]["run_id"]
+
+    clock.advance(minutes=1)
+    loop.tick()  # the freshness-gated release's first pass
+
+    request = _requests_by_name(env)["T48H"]
+    run = _runs_by_name(env)["T48H"]
+    cutoff = kickoff - 48 * H
+    assert request["state"] == STATE_NOT_EXECUTABLE
+    assert request["run_id"] == run["run_id"] == run_id
+    assert request["scheduled_as_of"] == run["scheduled_as_of"] == cutoff
+    assert run["status"] == "FAILED"
+    assert run["failure_code"] == FAILURE_INSUFFICIENT_PRE_CUTOFF_PIT_DATA
+    detail = run["failure_detail"]
+    assert f"stale T48H evidence at scheduled_as_of {cutoff.isoformat()}" in detail
+    for feed in ("GAMES", "ROSTERS", "INJURIES", "GAME_ODDS", "PLAYER_PROPS"):
+        assert f"{feed} latest successful pre-cutoff collection" in detail
+    assert "max_allowed_age=1h00m00s" in detail
     assert executable_requests(env["warehouse"]).is_empty()
