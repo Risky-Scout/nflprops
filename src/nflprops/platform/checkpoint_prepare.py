@@ -35,14 +35,17 @@ from __future__ import annotations
 import json
 import shutil
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import polars as pl
 
 from nflprops.collection.models import RESOURCE_RUNS_TABLE, ResourceType
-from nflprops.collection.resource_availability import resource_feed_available_at
+from nflprops.collection.resource_availability import (
+    latest_feed_available_at,
+    resource_feed_available_at,
+)
 from nflprops.config import Config
 from nflprops.data.warehouse import Warehouse
 from nflprops.errors import NflpropsError
@@ -86,8 +89,9 @@ EXECUTION_TARGET = "GITHUB_ACTIONS"
 STATE_PREPARING = "PREPARING"
 STATE_PENDING_REMOTE_EXECUTION = "PENDING_REMOTE_EXECUTION"
 #: Retained, never dispatched: an official checkpoint whose required
-#: pre-cutoff collector evidence does not exist. The reason is the run's
-#: `failure_code` (FAILURE_INSUFFICIENT_PRE_CUTOFF_PIT_DATA).
+#: pre-cutoff collector evidence does not exist or is too old at its cutoff.
+#: The reason is the run's `failure_code`
+#: (FAILURE_INSUFFICIENT_PRE_CUTOFF_PIT_DATA).
 STATE_NOT_EXECUTABLE = "NOT_EXECUTABLE"
 
 #: Provider feeds a live official checkpoint's model inputs come from. Each
@@ -95,6 +99,20 @@ STATE_NOT_EXECUTABLE = "NOT_EXECUTABLE"
 #: `resource_feed_available_at`) at or before `scheduled_as_of`.
 _REQUIRED_FEEDS = (ResourceType.GAMES, ResourceType.ROSTERS, ResourceType.INJURIES)
 _REQUIRED_MARKET_FEEDS = (ResourceType.GAME_ODDS, ResourceType.PLAYER_PROPS)
+
+#: Official checkpoints only: the latest successful pre-cutoff check of every
+#: required feed must be at most this old AT `scheduled_as_of` (never
+#: measured against wall-clock time). A late (catch-up) preparation is still
+#: executable when its pre-cutoff evidence was this fresh; age == limit is
+#: eligible. Each limit is 2x the collection cadence in force just before
+#: that cutoff (configs/base.toml [collection.cadence]).
+OFFICIAL_MAX_EVIDENCE_AGE: dict[str, timedelta] = {
+    CheckpointName.T48H.value: timedelta(minutes=60),
+    CheckpointName.T24H.value: timedelta(minutes=40),
+    CheckpointName.T6H.value: timedelta(minutes=20),
+    CheckpointName.T90M.value: timedelta(minutes=10),
+    CheckpointName.T30M.value: timedelta(minutes=4),
+}
 
 _TS = pl.Datetime(time_unit="us", time_zone="UTC")
 _REQUEST_SCHEMA: dict[str, Any] = {
@@ -188,24 +206,61 @@ def missing_pre_cutoff_feeds(
     ]
 
 
+def _format_age(age: timedelta) -> str:
+    seconds = int(age.total_seconds())
+    return f"{seconds // 3600}h{seconds % 3600 // 60:02d}m{seconds % 60:02d}s"
+
+
 def remote_execution_blocker(
     warehouse: Warehouse, request: dict[str, Any], *, market_mode: str = "live"
 ) -> str | None:
     """Fail-closed remote-execution eligibility for one request: None when
-    it may be executed, else the reason it must not be. MANUAL checkpoints
-    are exempt (unchanged behavior; they never satisfy an official one)."""
-    if request["checkpoint_name"] == CheckpointName.MANUAL.value:
+    it may be executed, else the reason it must not be. An official
+    checkpoint needs, for every required feed, a successful collection at
+    or before `scheduled_as_of` whose latest such collection is no older
+    than `OFFICIAL_MAX_EVIDENCE_AGE` at that cutoff. Post-cutoff
+    collections are never considered. MANUAL checkpoints are exempt
+    (unchanged behavior; they never satisfy an official one)."""
+    name = request["checkpoint_name"]
+    if name == CheckpointName.MANUAL.value:
         return None
-    missing = missing_pre_cutoff_feeds(
-        warehouse, scheduled_as_of=request["scheduled_as_of"], market_mode=market_mode
-    )
-    if not missing:
+    cutoff: datetime = request["scheduled_as_of"]
+    cutoff_iso = cutoff.astimezone(UTC).isoformat()
+    max_age = OFFICIAL_MAX_EVIDENCE_AGE.get(name)
+    if max_age is None:
+        return (
+            f"{FAILURE_INSUFFICIENT_PRE_CUTOFF_PIT_DATA}: no evidence-freshness "
+            f"limit for checkpoint {name!r}"
+        )
+    runs = warehouse.read(RESOURCE_RUNS_TABLE)
+    required = _REQUIRED_FEEDS + (_REQUIRED_MARKET_FEEDS if market_mode == "live" else ())
+    missing: list[str] = []
+    stale: list[str] = []
+    for feed in required:
+        latest = latest_feed_available_at(runs, resource_type=feed, as_of=cutoff)
+        if latest is None:
+            missing.append(feed.value)
+            continue
+        age = cutoff - latest
+        if age > max_age:
+            stale.append(
+                f"{feed.value} latest successful pre-cutoff collection "
+                f"{latest.astimezone(UTC).isoformat()} age={_format_age(age)} "
+                f"max_allowed_age={_format_age(max_age)}"
+            )
+    reasons: list[str] = []
+    if missing:
+        reasons.append(
+            f"no successful {', '.join(missing)} collection at or before "
+            f"scheduled_as_of {cutoff_iso}"
+        )
+    if stale:
+        reasons.append(
+            f"stale {name} evidence at scheduled_as_of {cutoff_iso}: " + "; ".join(stale)
+        )
+    if not reasons:
         return None
-    return (
-        f"{FAILURE_INSUFFICIENT_PRE_CUTOFF_PIT_DATA}: no successful "
-        f"{', '.join(missing)} collection at or before scheduled_as_of "
-        f"{request['scheduled_as_of'].astimezone(UTC).isoformat()}"
-    )
+    return f"{FAILURE_INSUFFICIENT_PRE_CUTOFF_PIT_DATA}: " + " | ".join(reasons)
 
 
 def executable_requests(warehouse: Warehouse, *, market_mode: str = "live") -> pl.DataFrame:

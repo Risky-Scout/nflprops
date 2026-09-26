@@ -95,8 +95,31 @@ def resource_feed_available_at(
     code (state/feature construction) should use, since it has no reason to
     know which provider is configured.
     """
+    return (
+        latest_feed_available_at(
+            resource_runs,
+            resource_type=resource_type,
+            as_of=as_of,
+            provider=provider,
+            scope_type=scope_type,
+        )
+        is not None
+    )
+
+
+def latest_feed_available_at(
+    resource_runs: pl.DataFrame,
+    *,
+    resource_type: ResourceType | str,
+    as_of: datetime,
+    provider: str | None = None,
+    scope_type: str | None = None,
+) -> datetime | None:
+    """The latest ``collector_received_at <= as_of`` among the successful
+    checks `resource_feed_available_at` counts, or None if there is none.
+    Never looks past ``as_of``."""
     if resource_runs.is_empty():
-        return False
+        return None
 
     resource_value = (
         resource_type.value if isinstance(resource_type, ResourceType) else resource_type
@@ -121,8 +144,8 @@ def resource_feed_available_at(
     if scope_type is not None:
         mask = mask & (pl.col("scope_type") == scope_type)
 
-    eligible = resource_runs.filter(mask)
-    return not eligible.is_empty()
+    latest = resource_runs.filter(mask)["collector_received_at"].max()
+    return latest if isinstance(latest, datetime) else None
 
 
 def latest_resource_run_status(
