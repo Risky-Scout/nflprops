@@ -238,7 +238,7 @@ as the existing `wizard-deploy` SSH user, absolute paths throughout,
 `deploy/systemd/nflprops-runtime.env.example`), `Restart=on-failure` with
 a bounded `RestartSec`/`StartLimitBurst`, and hard lightweight-runtime
 caps (`MemoryHigh=384M`, `MemoryMax=512M`, `MemorySwapMax=0`,
-`TasksMax=16`, `CPUQuota=50%`). Its placeholder `ExecStart`
+`TasksMax=32`, `CPUQuota=50%`). Its placeholder `ExecStart`
 (`Type=oneshot`) is
 `/home/wizard-deploy/nflprops/current/.venv/bin/python -m nflprops.cli
 platform health --deploy-gate`, the read-only health gate and nothing
@@ -388,7 +388,7 @@ overlaps `/home/wizard-deploy/nfl-production-2026` or
   MemAvailable < 512 MiB, or when PSI `full avg60` > 10. When memory is
   tight, the runtime alerts; it never falls back to heavy local compute.
 - One runtime-owner process under the unit's hard caps (`MemoryMax=512M`,
-  `MemorySwapMax=0`, `TasksMax=16`, `CPUQuota=50%`, `Nice=10`).
+  `MemorySwapMax=0`, `TasksMax=32`, `CPUQuota=50%`, `Nice=10`).
 - No memory-heavy caching was added.
 - The future API runs as a single worker, bound to localhost only.
 

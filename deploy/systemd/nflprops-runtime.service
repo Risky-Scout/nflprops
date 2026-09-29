@@ -93,7 +93,10 @@ RestartSec=30
 MemoryHigh=384M
 MemoryMax=512M
 MemorySwapMax=0
-TasksMax=16
+# TasksMax covers the runtime AND its checkpoint-preparation child: parent
+# ~9 threads + child ~8 (tokio, jemalloc, Polars pool/cleanup) peaked at 19
+# under these limits; 16 starved the child (constrained-worker.yml).
+TasksMax=32
 CPUQuota=50%
 Nice=10
 

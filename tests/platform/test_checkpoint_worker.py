@@ -11,7 +11,10 @@ work; and repeated passes do not accumulate memory in the parent.
 
 from __future__ import annotations
 
+import json
+import os
 import shutil
+import signal
 import subprocess
 import sys
 import textwrap
@@ -33,6 +36,7 @@ from nflprops.platform.checkpoint_prepare import (
     REMOTE_REQUESTS_TABLE,
     STATE_PENDING_REMOTE_EXECUTION,
     STATE_PREPARING,
+    PreparePassResult,
     preparation_work_pending,
     prepare_due_checkpoints,
 )
@@ -342,3 +346,148 @@ def test_runtime_timeout_env_override(
     env = _env(tmp_path)
     loop = _build_loop(env["layout"], env["config"], env["warehouse"], FakeProvider(), None)
     assert loop.checkpoint_timeout_seconds == expected
+
+
+# ------------------------------------------------ worker exit closure
+
+#: Runs the real worker after recording the Polars pool size the child got
+#: (to the path in NFLPROPS_TEST_POOL_PROBE, inherited through worker_env).
+POOL_PROBE_WORKER = textwrap.dedent(
+    """
+    import os, sys
+    from pathlib import Path
+    import polars
+    Path(os.environ["NFLPROPS_TEST_POOL_PROBE"]).write_text(
+        f"{os.environ.get('POLARS_MAX_THREADS')}|{polars.thread_pool_size()}"
+    )
+    from nflprops.platform import checkpoint_worker
+    sys.exit(checkpoint_worker.main())
+    """
+)
+
+#: A pass that dies with the real pyo3 PanicException -- a direct
+#: BaseException subclass that `except Exception` never sees.
+PANIC_WORKER = textwrap.dedent(
+    """
+    import sys
+    from polars.exceptions import PanicException
+    from nflprops.platform import checkpoint_worker
+
+    def _panic(job_path):
+        raise PanicException("could not spawn threads: Resource temporarily unavailable")
+
+    checkpoint_worker.run_job = _panic
+    sys.exit(checkpoint_worker.main())
+    """
+)
+
+#: A child that dies without any Python-level handler (Rust abort shape).
+ABORT_WORKER = "import os, sys; sys.stderr.write('fatal runtime error: boom\\n'); os._exit(134)\n"
+
+
+def _script(tmp_path: Path, name: str, body: str) -> tuple[str, ...]:
+    script = tmp_path / name
+    script.write_text(body)
+    return (sys.executable, str(script))
+
+
+def _prepared_identity(result: PreparePassResult) -> list[tuple]:
+    return [(p.run_id, p.game_id, p.checkpoint_name, p.scheduled_as_of) for p in result.prepared]
+
+
+def test_worker_env_caps_polars_threads_in_the_child_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("POLARS_MAX_THREADS", raising=False)
+    assert checkpoint_worker.worker_env()["POLARS_MAX_THREADS"] == "1"
+    assert "POLARS_MAX_THREADS" not in os.environ  # the runtime itself is untouched
+    assert checkpoint_worker.worker_env({"POLARS_MAX_THREADS": "8"})["POLARS_MAX_THREADS"] == "1"
+
+
+def test_thread_cap_does_not_change_any_scientific_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One fixture prepared in two separate worker processes -- default
+    Polars threading vs POLARS_MAX_THREADS=1 -- is identical: data manifest,
+    run identity, request rows, scheduled_as_of."""
+    monkeypatch.delenv("POLARS_MAX_THREADS", raising=False)
+    env, now = _collected(tmp_path / "capped", kickoffs=2)
+    twin = _env(tmp_path / "default")
+    shutil.copytree(env["warehouse"].root, twin["warehouse"].root, dirs_exist_ok=True)
+    probe = tmp_path / "pool"
+
+    monkeypatch.setenv("NFLPROPS_TEST_POOL_PROBE", str(probe))
+    with monkeypatch.context() as patch:
+        patch.setattr(checkpoint_worker, "WORKER_ENV_OVERRIDES", {})
+        default = prepare_due_checkpoints_in_worker(
+            **_inputs(twin, now), timeout_seconds=120,
+            worker_argv=_script(tmp_path, "probe_default.py", POOL_PROBE_WORKER),
+        )
+    default_pool = probe.read_text()
+    capped = prepare_due_checkpoints_in_worker(
+        **_inputs(env, now), timeout_seconds=120,
+        worker_argv=_script(tmp_path, "probe_capped.py", POOL_PROBE_WORKER),
+    )
+
+    assert default_pool.startswith("None|")  # uncapped child: host default pool
+    assert probe.read_text() == "1|1"  # capped child: one Polars thread
+    assert len(capped.claimed) == 2 and capped.claimed == default.claimed
+    assert _prepared_identity(capped) == _prepared_identity(default)
+    assert _identity(env["warehouse"]) == _identity(twin["warehouse"])
+    manifests = [sorted(w.read(REMOTE_REQUESTS_TABLE)["data_manifest_sha256"].to_list())
+                 for w in (env["warehouse"], twin["warehouse"])]
+    assert manifests[0] == manifests[1] and len(manifests[0]) == 2
+
+
+def test_a_panicking_worker_reports_the_concrete_failure(tmp_path: Path) -> None:
+    env, now = _collected(tmp_path / "rt")
+    with pytest.raises(CheckpointWorkerError) as raised:
+        prepare_due_checkpoints_in_worker(
+            **_inputs(env, now), timeout_seconds=60,
+            worker_argv=_script(tmp_path, "panic.py", PANIC_WORKER),
+        )
+    message = str(raised.value)
+    assert "without a result" not in message
+    assert "exited 1: pyo3_runtime.PanicException: could not spawn threads" in message
+    assert _lock_is_free(env)
+
+
+def test_worker_failure_result_carries_class_message_and_traceback(tmp_path: Path) -> None:
+    job = tmp_path / "job.json"
+    job.write_text("{}")
+    proc = subprocess.run([*_script(tmp_path, "panic.py", PANIC_WORKER), str(job)],
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 1
+    outcome = json.loads((tmp_path / "result.json").read_text())
+    assert outcome["ok"] is False
+    assert outcome["exception_class"] == "pyo3_runtime.PanicException"
+    assert "Resource temporarily unavailable" in outcome["message"]
+    assert "_panic" in outcome["traceback_tail"]
+    assert not (tmp_path / "result.json.tmp").exists()  # atomic
+    assert "PanicException" in proc.stderr
+
+
+@pytest.mark.parametrize("exc", ["KeyboardInterrupt()", "SystemExit(7)"])
+def test_normal_termination_is_never_converted(tmp_path: Path, exc: str) -> None:
+    script = PANIC_WORKER.replace(
+        'raise PanicException("could not spawn threads: Resource temporarily unavailable")',
+        f"raise {exc}",
+    )
+    job = tmp_path / "job.json"
+    job.write_text("{}")
+    proc = subprocess.run([*_script(tmp_path, "term.py", script), str(job)],
+                          capture_output=True, text=True, timeout=60)
+    # SystemExit keeps its code; KeyboardInterrupt still dies by SIGINT.
+    assert proc.returncode == (7 if exc.startswith("SystemExit") else -signal.SIGINT)
+    assert not (tmp_path / "result.json").exists()
+
+
+def test_a_worker_dying_without_python_reports_its_stderr(tmp_path: Path) -> None:
+    env, now = _collected(tmp_path / "rt")
+    with pytest.raises(CheckpointWorkerError,
+                       match="exited 134 without a result; stderr: fatal runtime error: boom"):
+        prepare_due_checkpoints_in_worker(
+            **_inputs(env, now), timeout_seconds=60,
+            worker_argv=_script(tmp_path, "abort.py", ABORT_WORKER),
+        )
+    assert _lock_is_free(env)

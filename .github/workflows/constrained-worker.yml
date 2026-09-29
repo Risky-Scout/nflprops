@@ -1,0 +1,67 @@
+name: Constrained Checkpoint Worker
+
+# BLOCK 3: run the REAL checkpoint-preparation parent + worker inside a
+# transient systemd service carrying nflprops-runtime.service's resource
+# limits and hardening (TasksMax=32, MemoryHigh=384M, MemoryMax=512M,
+# MemorySwapMax=0, CPUQuota=50%, one CPU, ProtectSystem=strict,
+# PrivateTmp, NoNewPrivileges). GitHub-hosted runner only; no secrets, no
+# Wizard access. The `capped` (production) variant is the gate; the
+# `default` variant (no POLARS_MAX_THREADS cap) is diagnostic.
+
+on:
+  pull_request:
+    paths:
+      - "src/nflprops/platform/**"
+      - "tools/constrained_worker_probe.py"
+      - "deploy/systemd/nflprops-runtime.service"
+      - ".github/workflows/constrained-worker.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  constrained-worker:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev,orchestration,runtime]"
+
+      - name: Build fixture + expected (unconstrained, in-process) manifests
+        run: python tools/constrained_worker_probe.py prepare "$RUNNER_TEMP/probe"
+
+      - name: Run worker under Wizard limits
+        run: |
+          set -u
+          nproc; uname -r; python -c "import polars; print('polars', polars.__version__)"
+          run_variant() {
+            # $1 = capped|default, $2 = TasksMax, $3 = report label
+            sudo systemd-run --unit="nflprops-worker-probe-$3" --wait --pipe --collect \
+              --uid="$(id -u)" --gid="$(id -g)" \
+              -p "TasksMax=$2" -p MemoryHigh=384M -p MemoryMax=512M -p MemorySwapMax=0 \
+              -p CPUQuota=50% -p AllowedCPUs=0 -p Nice=10 \
+              -p ProtectSystem=strict -p "ReadWritePaths=$RUNNER_TEMP/probe" \
+              -p PrivateTmp=true -p NoNewPrivileges=true \
+              -p "WorkingDirectory=$GITHUB_WORKSPACE" \
+              -E "HOME=$HOME" -E "PATH=$PATH" -E PYTHONDONTWRITEBYTECODE=1 \
+              "$(command -v python)" tools/constrained_worker_probe.py run "$RUNNER_TEMP/probe" "$1" "$3"
+          }
+          set +e
+          # TasksMax must match deploy/systemd/nflprops-runtime.service.
+          tasks_max="$(sed -n 's/^TasksMax=//p' deploy/systemd/nflprops-runtime.service)"
+          run_variant capped "$tasks_max" capped; capped_rc=$?
+          run_variant default "$tasks_max" default; default_rc=$?
+          set -e
+          echo "capped TasksMax=$tasks_max (gate) exit=$capped_rc"
+          echo "default TasksMax=$tasks_max (diagnostic) exit=$default_rc"
+          {
+            echo "### Constrained checkpoint worker"
+            for v in capped default; do
+              echo "#### $v"; echo '```json'; cat "$RUNNER_TEMP/probe/report-$v.json" 2>/dev/null || echo "no report"; echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$capped_rc"
