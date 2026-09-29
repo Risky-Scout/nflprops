@@ -20,7 +20,12 @@ the canonical live warehouse on the Wizard host. Each tick it:
 5. schedules/prepares due official checkpoints
    (`platform.checkpoint_prepare.prepare_due_checkpoints`) -- claim,
    immutable snapshot, pending-remote-execution request -- and NEVER runs
-   checkpoint science (no simulation, no training, no calibration);
+   checkpoint science (no simulation, no training, no calibration). Only
+   when a cheap read-only check says a pass has work
+   (`checkpoint_prepare.preparation_work_pending`), and then in a
+   short-lived child process with a hard wall-clock bound
+   (`platform.checkpoint_worker`): its memory is returned to the OS when it
+   exits, and a stuck pass is killed, fails closed and is retried later;
 6. takes a periodic immutable snapshot (deduplicated; bounded retention
    that never prunes a snapshot a pending checkpoint request references).
 
@@ -65,10 +70,18 @@ from nflprops.orchestration.checkpoints import (
 )
 from nflprops.orchestration.dispatch_plan import as_run_store_backend
 from nflprops.orchestration.run_store import checkpoint_satisfied
-from nflprops.pipelines.pregame import _latest_games_asof
+from nflprops.pipelines.games_asof import _latest_games_asof
 from nflprops.platform.checkpoint_prepare import (
+    preparation_work_pending,
     prepare_due_checkpoints,
     protected_snapshot_ids,
+)
+from nflprops.platform.checkpoint_worker import (
+    DEFAULT_WORKER_TIMEOUT_SECONDS,
+    WORKER_ARGV,
+    CheckpointWorkerError,
+    CheckpointWorkerTimeoutError,
+    prepare_due_checkpoints_in_worker,
 )
 from nflprops.platform.runtime_layout import RuntimeLayout
 from nflprops.platform.warehouse_snapshot import (
@@ -89,6 +102,7 @@ DEFAULT_SNAPSHOT_INTERVAL_SECONDS = 6 * 3600
 DEFAULT_DISCOVERY_REFRESH_SECONDS = 6 * 3600
 DEFAULT_DISCOVERY_RETRY_SECONDS = 300
 DEFAULT_MAX_CONSECUTIVE_FAILURES = 10
+DEFAULT_CHECKPOINT_RETRY_SECONDS = 60.0
 REGULAR_SEASON_TYPE = 2
 
 Clock = Callable[[], datetime]
@@ -300,6 +314,14 @@ class RuntimeLoop:
     hostname: str = field(default_factory=socket.gethostname)
     stop_event: threading.Event = field(default_factory=threading.Event)
     resolver: ScheduleResolver | None = None
+    #: Run each checkpoint-preparation pass in a short-lived, time-bounded
+    #: child process (`platform.checkpoint_worker`) so its memory never
+    #: accumulates in this long-lived process. False = in-process (tests).
+    checkpoint_worker: bool = True
+    checkpoint_timeout_seconds: float = DEFAULT_WORKER_TIMEOUT_SECONDS
+    checkpoint_retry_seconds: float = DEFAULT_CHECKPOINT_RETRY_SECONDS
+    checkpoint_worker_argv: tuple[str, ...] = WORKER_ARGV
+    _checkpoint_retry_at: datetime | None = None
     _started_at: datetime | None = None
     _last: dict[str, Any] = field(default_factory=dict)
 
@@ -363,18 +385,62 @@ class RuntimeLoop:
         return result
 
     def _prepare_checkpoints(self, target: Target, now: datetime) -> None:
-        result = prepare_due_checkpoints(
-            layout=self.layout,
+        if self._checkpoint_retry_at is not None and now < self._checkpoint_retry_at:
+            return
+        if not preparation_work_pending(
             warehouse=self.warehouse,
             config=self.config,
             season=target.season,
             week=target.week,
             now=now,
-            migration_head=self.migration_head,
-            hostname=self.hostname,
-            release_sha=self.release_sha,
-            lock_timeout_seconds=self.lock_timeout_seconds,
-        )
+        ):
+            return
+        inputs: dict[str, Any] = {
+            "layout": self.layout,
+            "warehouse": self.warehouse,
+            "config": self.config,
+            "season": target.season,
+            "week": target.week,
+            "now": now,
+            "migration_head": self.migration_head,
+            "hostname": self.hostname,
+            "release_sha": self.release_sha,
+            "lock_timeout_seconds": self.lock_timeout_seconds,
+        }
+        try:
+            if self.checkpoint_worker:
+                result = prepare_due_checkpoints_in_worker(
+                    **inputs,
+                    timeout_seconds=self.checkpoint_timeout_seconds,
+                    stop_event=self.stop_event,
+                    worker_argv=self.checkpoint_worker_argv,
+                )
+            else:
+                result = prepare_due_checkpoints(**inputs)
+        except CheckpointWorkerError as exc:
+            # Fail closed and auditable: nothing unpublished was kept, the
+            # writer lock died with the worker, and the (idempotent) pass is
+            # retried after a bounded backoff so collection keeps running.
+            timed_out = isinstance(exc, CheckpointWorkerTimeoutError)
+            self._checkpoint_retry_at = now + timedelta(seconds=self.checkpoint_retry_seconds)
+            self._last["checkpoint_preparation"] = {
+                "status": "TIMEOUT" if timed_out else "FAILED",
+                "at": now.isoformat(),
+                "season": target.season,
+                "week": target.week,
+                "error": str(exc)[:500],
+                "retry_not_before": self._checkpoint_retry_at.isoformat(),
+            }
+            _log(
+                "checkpoint_preparation_timeout" if timed_out else "checkpoint_preparation_failed",
+                logging.ERROR,
+                season=target.season,
+                week=target.week,
+                error=str(exc)[:500],
+                retry_not_before=self._checkpoint_retry_at,
+            )
+            raise
+        self._checkpoint_retry_at = None
         if result.claimed or result.missed or result.prepared or result.blocked:
             _log(
                 "checkpoints_prepared",

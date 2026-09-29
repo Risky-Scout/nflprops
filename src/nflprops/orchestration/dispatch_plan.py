@@ -24,6 +24,7 @@ remains the sole source of the one-row-per-checkpoint guarantee.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, cast
@@ -52,7 +53,7 @@ from nflprops.orchestration.run_store import (
     checkpoint_satisfied,
     compute_run_id,
 )
-from nflprops.pipelines.pregame import _latest_games_asof
+from nflprops.pipelines.games_asof import _latest_games_asof
 
 if TYPE_CHECKING:
     from nflprops.data.storage.base import StorageBackend
@@ -115,21 +116,34 @@ class PlannedCheckpoint:
     record: PredictionRunRecord
 
 
-def plan_due_checkpoints(
+@dataclass(frozen=True)
+class DueCheckpointSlot:
+    """One due-or-missed, unsatisfied official checkpoint slot -- what
+    `plan_due_checkpoints` claims, before any run identity or data manifest
+    is computed."""
+
+    game_id: str
+    kickoff_at: datetime
+    checkpoint: CheckpointName
+    scheduled_as_of: datetime
+    action: CheckpointAction
+
+
+def due_checkpoint_slots(
     *,
     warehouse: Warehouse,
     config: Config,
     season: int,
     week: int,
     now: datetime,
-    settings: DispatchSettings,
-) -> list[PlannedCheckpoint]:
-    """Every due (RUN) or missed (MISSED), unclaimed official checkpoint
-    for (season, week) as of `now`, in game order then T48H..T30M order.
-    Returns [] when `[checkpoints].enabled` is false."""
+) -> Iterator[DueCheckpointSlot]:
+    """Every due (RUN) or missed (MISSED), unsatisfied official checkpoint
+    slot for (season, week) as of `now`, in game order then T48H..T30M
+    order. Yields nothing when `[checkpoints].enabled` is false. Reads only
+    `games` and `prediction_runs` -- never the PIT data a manifest selects."""
     checkpoints_cfg = CheckpointsRuntimeConfig.from_config(config)
     if not checkpoints_cfg.enabled:
-        return []
+        return
 
     offsets = CheckpointOffsets.from_config(config)
     orchestration_cfg = OrchestrationConfig.from_config(config)
@@ -137,7 +151,6 @@ def plan_due_checkpoints(
     games = warehouse.read("games")
     current_games = _latest_games_asof(games, as_of=now, season=season, week=week)
 
-    planned: list[PlannedCheckpoint] = []
     for game in current_games.iter_rows(named=True):
         game_id = str(game["canonical_game_id"])
         kickoff_at = game["date"]
@@ -163,76 +176,105 @@ def plan_due_checkpoints(
             )
             if action is CheckpointAction.NOT_DUE:
                 continue
-
-            run_id = compute_run_id(
+            yield DueCheckpointSlot(
                 game_id=game_id,
-                checkpoint_name=checkpoint,
+                kickoff_at=kickoff_at,
+                checkpoint=checkpoint,
+                scheduled_as_of=scheduled,
+                action=action,
+            )
+
+
+def plan_due_checkpoints(
+    *,
+    warehouse: Warehouse,
+    config: Config,
+    season: int,
+    week: int,
+    now: datetime,
+    settings: DispatchSettings,
+) -> list[PlannedCheckpoint]:
+    """Every due (RUN) or missed (MISSED), unclaimed official checkpoint
+    for (season, week) as of `now`, in game order then T48H..T30M order.
+    Returns [] when `[checkpoints].enabled` is false."""
+    planned: list[PlannedCheckpoint] = []
+    for slot in due_checkpoint_slots(
+        warehouse=warehouse, config=config, season=season, week=week, now=now
+    ):
+        game_id = slot.game_id
+        kickoff_at = slot.kickoff_at
+        checkpoint = slot.checkpoint
+        scheduled = slot.scheduled_as_of
+        action = slot.action
+        run_id = compute_run_id(
+            game_id=game_id,
+            checkpoint_name=checkpoint,
+            scheduled_as_of=scheduled,
+            kickoff_at=kickoff_at,
+            model_version=settings.model_version,
+            config_sha256=settings.config_sha256,
+            source_sha256=settings.source_sha256,
+        )
+        manifest_sha = compute_data_manifest_sha256(
+            warehouse,
+            game_id=game_id,
+            scheduled_as_of=scheduled,
+            market_mode=settings.market_mode,
+        )
+
+        if action is CheckpointAction.MISSED:
+            record = PredictionRunRecord(
+                run_id=run_id,
+                season=season,
+                week=week,
+                game_id=game_id,
+                checkpoint_name=checkpoint.value,
                 scheduled_as_of=scheduled,
                 kickoff_at=kickoff_at,
+                flow_started_at=now,
+                flow_completed_at=now,
+                status=PredictionRunStatus.FAILED,
                 model_version=settings.model_version,
                 config_sha256=settings.config_sha256,
                 source_sha256=settings.source_sha256,
+                data_manifest_sha256=manifest_sha,
+                n_draws=settings.n_draws,
+                retained_joint_draws=settings.retain_joint_draws,
+                publication_status=PublicationStatus.NOT_PUBLISHED,
+                is_final_forecast=False,
+                fallback_from_checkpoint=None,
+                failure_code=FAILURE_CHECKPOINT_MISSED,
+                failure_detail=(
+                    f"{checkpoint.value} for game {game_id!r} first discovered at/after "
+                    f"kickoff ({now.isoformat()} >= {kickoff_at.isoformat()}); no pregame "
+                    "forecast was executed."
+                ),
+                created_at=now,
             )
-            manifest_sha = compute_data_manifest_sha256(
-                warehouse,
+        else:  # CheckpointAction.RUN (on-time or catch-up)
+            record = PredictionRunRecord(
+                run_id=run_id,
+                season=season,
+                week=week,
                 game_id=game_id,
+                checkpoint_name=checkpoint.value,
                 scheduled_as_of=scheduled,
-                market_mode=settings.market_mode,
+                kickoff_at=kickoff_at,
+                flow_started_at=now,
+                flow_completed_at=None,
+                status=PredictionRunStatus.SCHEDULED,
+                model_version=settings.model_version,
+                config_sha256=settings.config_sha256,
+                source_sha256=settings.source_sha256,
+                data_manifest_sha256=manifest_sha,
+                n_draws=settings.n_draws,
+                retained_joint_draws=settings.retain_joint_draws,
+                publication_status=PublicationStatus.NOT_PUBLISHED,
+                is_final_forecast=False,
+                fallback_from_checkpoint=None,
+                failure_code=None,
+                failure_detail=None,
+                created_at=now,
             )
-
-            if action is CheckpointAction.MISSED:
-                record = PredictionRunRecord(
-                    run_id=run_id,
-                    season=season,
-                    week=week,
-                    game_id=game_id,
-                    checkpoint_name=checkpoint.value,
-                    scheduled_as_of=scheduled,
-                    kickoff_at=kickoff_at,
-                    flow_started_at=now,
-                    flow_completed_at=now,
-                    status=PredictionRunStatus.FAILED,
-                    model_version=settings.model_version,
-                    config_sha256=settings.config_sha256,
-                    source_sha256=settings.source_sha256,
-                    data_manifest_sha256=manifest_sha,
-                    n_draws=settings.n_draws,
-                    retained_joint_draws=settings.retain_joint_draws,
-                    publication_status=PublicationStatus.NOT_PUBLISHED,
-                    is_final_forecast=False,
-                    fallback_from_checkpoint=None,
-                    failure_code=FAILURE_CHECKPOINT_MISSED,
-                    failure_detail=(
-                        f"{checkpoint.value} for game {game_id!r} first discovered at/after "
-                        f"kickoff ({now.isoformat()} >= {kickoff_at.isoformat()}); no pregame "
-                        "forecast was executed."
-                    ),
-                    created_at=now,
-                )
-            else:  # CheckpointAction.RUN (on-time or catch-up)
-                record = PredictionRunRecord(
-                    run_id=run_id,
-                    season=season,
-                    week=week,
-                    game_id=game_id,
-                    checkpoint_name=checkpoint.value,
-                    scheduled_as_of=scheduled,
-                    kickoff_at=kickoff_at,
-                    flow_started_at=now,
-                    flow_completed_at=None,
-                    status=PredictionRunStatus.SCHEDULED,
-                    model_version=settings.model_version,
-                    config_sha256=settings.config_sha256,
-                    source_sha256=settings.source_sha256,
-                    data_manifest_sha256=manifest_sha,
-                    n_draws=settings.n_draws,
-                    retained_joint_draws=settings.retain_joint_draws,
-                    publication_status=PublicationStatus.NOT_PUBLISHED,
-                    is_final_forecast=False,
-                    fallback_from_checkpoint=None,
-                    failure_code=None,
-                    failure_detail=None,
-                    created_at=now,
-                )
-            planned.append(PlannedCheckpoint(action=action, checkpoint=checkpoint, record=record))
+        planned.append(PlannedCheckpoint(action=action, checkpoint=checkpoint, record=record))
     return planned

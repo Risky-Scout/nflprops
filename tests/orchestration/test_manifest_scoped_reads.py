@@ -14,6 +14,7 @@ import polars as pl
 import pytest
 
 from nflprops.data.warehouse import PARTITIONED_TABLES, Warehouse
+from nflprops.domain.hashing import hash_payload
 from nflprops.orchestration import manifest as manifest_module
 from nflprops.orchestration.manifest import compute_data_manifest_sha256
 
@@ -44,6 +45,35 @@ def _batches() -> list[tuple[str, pl.DataFrame, dict]]:
         ]
     )
     out.append(("games", games, {"key": ["canonical_game_id", "available_at"]}))
+    teams = [t for _, home, away in GAMES for t in (home, away)]
+    players = pl.DataFrame(
+        [
+            {"canonical_player_id": f"{t}-p{p}", "canonical_team_id": t, "name": f"{t} {p}"}
+            for t in teams
+            for p in range(4)  # p3 is never on a roster: not in scope
+        ]
+    )
+    out.append(("players", players, {"key": ["canonical_player_id"]}))
+    stats_at = [T0 - timedelta(days=7), _ts(3)]  # one pre-, one mid-history row
+    player_stats = pl.DataFrame(
+        [
+            {
+                "canonical_game_id": f"old-{k}",
+                "canonical_team_id": t,
+                "canonical_player_id": f"{t}-p{p}",
+                "available_at": at,
+                "receiving_yards": 10.0 * p + k,
+            }
+            for k, at in enumerate(stats_at)
+            for t in teams
+            for p in range(2)
+        ]
+    )
+    team_stats = player_stats.group_by(
+        ["canonical_game_id", "canonical_team_id", "available_at"], maintain_order=True
+    ).agg(pl.col("receiving_yards").sum())
+    out.append(("player_game_stats", player_stats, {"key": None}))
+    out.append(("team_game_stats", team_stats, {"key": None}))
     for cycle in range(CYCLES):
         at = _ts(cycle)
         teams = [t for _, home, away in GAMES for t in (home, away)]
@@ -142,9 +172,9 @@ def _legacy_single_file(root: Path) -> Warehouse:
         frames.setdefault(table, []).append(frame)
         kwargs[table] = kw
     for table, parts in frames.items():
-        out = pl.concat(parts, how="diagonal_relaxed").unique(
-            subset=kwargs[table]["key"], keep="last", maintain_order=True
-        )
+        out = pl.concat(parts, how="diagonal_relaxed")
+        if kwargs[table].get("key"):
+            out = out.unique(subset=kwargs[table]["key"], keep="last", maintain_order=True)
         sort_by = kwargs[table].get("sort_by")
         if sort_by:
             out = out.sort(sort_by)
@@ -187,9 +217,15 @@ def test_scoped_reads_leave_the_manifest_hash_unchanged(
     scoped_legacy = sha(legacy)
     scoped_parted = sha(parted)
     with monkeypatch.context() as unscoped:
-        # The pre-hardening behavior: load every snapshot table whole.
+        # The pre-hardening behavior: load every table whole and hash every
+        # selected row in one `hash_payload({"rows": frame.to_dicts()})`.
         unscoped.setattr(
             manifest_module, "_read_scoped", lambda wh, table, where: wh.read(table)
+        )
+        unscoped.setattr(
+            manifest_module,
+            "_rows_sha256",
+            lambda frame: hash_payload({"rows": frame.to_dicts()}),
         )
         unscoped_legacy = sha(legacy)
     assert scoped_legacy == unscoped_legacy == scoped_parted
@@ -214,3 +250,52 @@ def test_scoped_manifest_never_loads_other_games_or_future_rows(
     # g1's props at cycles 0..2 only: 3 players x 2 vendors x 3 cycles.
     assert loaded["player_prop_snapshots"] == 18 < full_props
     assert loaded["roster_snapshots"] == 2 * 3 * 3  # g1's two teams, 3 cycles
+
+
+def test_stats_and_reference_players_are_read_scoped(
+    warehouses: tuple[Warehouse, Warehouse], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, parted = warehouses
+    cutoff = _ts(2) + timedelta(minutes=30)
+    loaded: dict[str, int] = {}
+    original = Warehouse.read
+
+    def spy(self: Warehouse, table: str, *, where: pl.Expr | None = None) -> pl.DataFrame:
+        frame = original(self, table, where=where)
+        loaded[table] = frame.height
+        return frame
+
+    monkeypatch.setattr(Warehouse, "read", spy)
+    compute_data_manifest_sha256(parted, game_id="g1", scheduled_as_of=cutoff)
+    # g1 = t2 vs t3; only the pre-history stats row is at/before the cutoff.
+    assert loaded["player_game_stats"] == 2 * 2 < original(parted, "player_game_stats").height
+    assert loaded["team_game_stats"] == 2 < original(parted, "team_game_stats").height
+    # p0..p2 of t2/t3 (roster + stats); p3 and every other team never load.
+    assert loaded["players"] == 2 * 3 < original(parted, "players").height
+    assert loaded["games"] == 1 < original(parted, "games").height
+
+
+def test_post_cutoff_rows_never_enter_the_manifest(
+    warehouses: tuple[Warehouse, Warehouse], tmp_path: Path
+) -> None:
+    import shutil
+
+    _, parted = warehouses
+    cutoff = _ts(2) + timedelta(minutes=30)
+    before = compute_data_manifest_sha256(parted, game_id="g1", scheduled_as_of=cutoff)
+    copy = Warehouse(tmp_path / "copy")
+    shutil.copytree(parted.root, copy.root, dirs_exist_ok=True)
+    late = cutoff + timedelta(microseconds=1)
+    for table, frame, kw in _batches():
+        shifted = frame
+        for column in ("available_at", "collector_received_at"):
+            if column in shifted.columns:
+                shifted = shifted.with_columns(pl.lit(late).alias(column))
+        if shifted is frame:
+            continue  # no PIT column (reference `players`)
+        if table == "collector_resource_runs":  # new, later runs -- never overwrites
+            shifted = shifted.with_columns(pl.col("resource_run_id") + "-late")
+        if table == "games":  # a post-cutoff reschedule must not move the cutoff's view
+            shifted = shifted.with_columns(pl.col("date") + timedelta(hours=2))
+        copy.append(table, shifted, **kw)
+    assert compute_data_manifest_sha256(copy, game_id="g1", scheduled_as_of=cutoff) == before

@@ -27,6 +27,7 @@ from nflprops.domain.hashing import hash_payload
 from nflprops.market.consensus import game_market_consensus, latest_prop_quotes
 from nflprops.market.current_pricing import prediction_id, price_current_markets
 from nflprops.market.timing import latest_game_market_knowledge_time
+from nflprops.pipelines.games_asof import _latest_games_asof
 from nflprops.simulation.game import (
     GameSimulationInput,
     GameSimulationResult,
@@ -130,36 +131,6 @@ def _market_frames_for_mode(
         return game_odds, prop_quotes
 
     raise ValueError(f"unsupported market_mode: {market_mode!r}")
-
-
-def _latest_games_asof(
-    games: pl.DataFrame,
-    *,
-    as_of: datetime,
-    season: int,
-    week: int,
-) -> pl.DataFrame:
-    if games.is_empty():
-        return games
-    out = games.filter(
-        (pl.col("available_at") <= as_of)
-        & (pl.col("season") == season)
-        & (pl.col("week") == week)
-    )
-    if out.is_empty():
-        return out
-    latest = (
-        out.sort("available_at")
-        .group_by("canonical_game_id", maintain_order=True)
-        .tail(1)
-    )
-    if "status_state" in latest.columns:
-        latest = latest.filter(
-            pl.col("status_state").is_in(
-                ["scheduled", "delayed", "postponed", "unknown"]
-            )
-        )
-    return latest
 
 
 def _implied_points(total: float | None, home_spread: float | None):
