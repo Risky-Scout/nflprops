@@ -39,25 +39,30 @@ jobs:
           set -u
           nproc; uname -r; python -c "import polars; print('polars', polars.__version__)"
           run_variant() {
-            sudo systemd-run --unit="nflprops-worker-probe-$1" --wait --pipe --collect \
+            # $1 = capped|default, $2 = TasksMax, $3 = report label
+            sudo systemd-run --unit="nflprops-worker-probe-$3" --wait --pipe --collect \
               --uid="$(id -u)" --gid="$(id -g)" \
-              -p TasksMax=16 -p MemoryHigh=384M -p MemoryMax=512M -p MemorySwapMax=0 \
+              -p "TasksMax=$2" -p MemoryHigh=384M -p MemoryMax=512M -p MemorySwapMax=0 \
               -p CPUQuota=50% -p AllowedCPUs=0 -p Nice=10 \
               -p ProtectSystem=strict -p "ReadWritePaths=$RUNNER_TEMP/probe" \
               -p PrivateTmp=true -p NoNewPrivileges=true \
               -p "WorkingDirectory=$GITHUB_WORKSPACE" \
               -E "HOME=$HOME" -E "PATH=$PATH" -E PYTHONDONTWRITEBYTECODE=1 \
-              "$(command -v python)" tools/constrained_worker_probe.py run "$RUNNER_TEMP/probe" "$1"
+              "$(command -v python)" tools/constrained_worker_probe.py run "$RUNNER_TEMP/probe" "$1" "$3"
           }
           set +e
-          run_variant default; default_rc=$?
-          run_variant capped; capped_rc=$?
+          run_variant capped 16 capped; capped_rc=$?
+          run_variant default 16 default; default_rc=$?
+          # Diagnostic control ONLY (never a production setting): identical
+          # except TasksMax, to attribute a failure to task exhaustion.
+          run_variant capped 64 capped-tasks64; control_rc=$?
           set -e
-          echo "default (diagnostic) exit=$default_rc"
-          echo "capped (gate) exit=$capped_rc"
+          echo "capped TasksMax=16 (gate) exit=$capped_rc"
+          echo "default TasksMax=16 (diagnostic) exit=$default_rc"
+          echo "capped TasksMax=64 (diagnostic control) exit=$control_rc"
           {
             echo "### Constrained checkpoint worker"
-            for v in capped default; do
+            for v in capped default capped-tasks64; do
               echo "#### $v"; echo '```json'; cat "$RUNNER_TEMP/probe/report-$v.json" 2>/dev/null || echo "no report"; echo '```'
             done
           } >> "$GITHUB_STEP_SUMMARY"

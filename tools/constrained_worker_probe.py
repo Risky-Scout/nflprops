@@ -48,9 +48,8 @@ def prepare(out: Path) -> None:
     from nflprops.platform.checkpoint_prepare import prepare_due_checkpoints
 
     env, now = t._collected(out / "fixture", kickoffs=KICKOFFS)
-    for name in ("expected", "capped", "default"):
-        twin = t._env(out / name)
-        shutil.copytree(env["warehouse"].root, twin["warehouse"].root, dirs_exist_ok=True)
+    expected_env = t._env(out / "expected")
+    shutil.copytree(env["warehouse"].root, expected_env["warehouse"].root, dirs_exist_ok=True)
     expected = t._env(out / "expected")
     result = prepare_due_checkpoints(**t._inputs(expected, now))
     rows = _requests(expected["warehouse"])
@@ -72,7 +71,7 @@ def _read(path: Path) -> str:
         return "n/a"
 
 
-def run(out: Path, variant: str) -> int:
+def run(out: Path, variant: str, label: str) -> int:
     from datetime import datetime
 
     import test_checkpoint_worker as t
@@ -83,7 +82,7 @@ def run(out: Path, variant: str) -> int:
         checkpoint_worker.WORKER_ENV_OVERRIDES = {}
     cg = _cgroup_dir()
     stop = threading.Event()
-    peak = {"pids_current": 0, "child_threads": 0}
+    peak: dict = {"pids_current": 0, "child_threads": 0, "child_thread_names": []}
 
     def sample() -> None:
         while not stop.is_set():
@@ -94,10 +93,12 @@ def run(out: Path, variant: str) -> int:
                 status = _read(task_dir / "status")
                 if f"PPid:\t{os.getpid()}\n" in status + "\n":
                     threads = [ln for ln in status.splitlines() if ln.startswith("Threads:")]
-                    if threads:
-                        count = int(threads[0].split()[1])
-                        peak["child_threads"] = max(peak["child_threads"], count)
-            time.sleep(0.02)
+                    if threads and int(threads[0].split()[1]) >= peak["child_threads"]:
+                        peak["child_threads"] = int(threads[0].split()[1])
+                        peak["child_thread_names"] = sorted(
+                            _read(task / "comm") for task in (task_dir / "task").iterdir()
+                        )
+            time.sleep(0.05)
 
     sampler = threading.Thread(target=sample, daemon=True)
     sampler.start()
@@ -106,7 +107,9 @@ def run(out: Path, variant: str) -> int:
     parent_nlwp = threading.active_count()
 
     expected = json.loads((out / "expected.json").read_text())
-    env = t._env(out / variant)
+    env = t._env(out / label)
+    shutil.copytree(out / "fixture" / "state" / "canonical", env["warehouse"].root,
+                    dirs_exist_ok=True)
     started = time.monotonic()
     error = None
     try:
@@ -123,6 +126,7 @@ def run(out: Path, variant: str) -> int:
     want = sorted(r["data_manifest_sha256"] for r in expected["requests"])
     report = {
         "variant": variant,
+        "label": label,
         "worker_exit": "0 (result ok)" if error is None else error,
         "result_file_produced": error is None or "without a result" not in error,
         "elapsed_seconds": round(elapsed, 2),
@@ -134,6 +138,7 @@ def run(out: Path, variant: str) -> int:
         "pids_peak": _read(cg / "pids.peak"),
         "pids_current_peak_sampled": peak["pids_current"],
         "child_threads_peak_sampled": peak["child_threads"],
+        "child_thread_names_at_peak": peak["child_thread_names"],
         "memory_high": _read(cg / "memory.high"),
         "memory_max": _read(cg / "memory.max"),
         "memory_swap_max": _read(cg / "memory.swap.max"),
@@ -145,7 +150,7 @@ def run(out: Path, variant: str) -> int:
         "requests_identical": rows == expected["requests"],
     }
     print(json.dumps(report, indent=2))
-    (out / f"report-{variant}.json").write_text(json.dumps(report, indent=2))
+    (out / f"report-{label}.json").write_text(json.dumps(report, indent=2))
     ok = error is None and report["manifest_hashes_match_expected"] and report["requests_identical"]
     return 0 if ok else 1
 
@@ -155,4 +160,4 @@ if __name__ == "__main__":
     if command == "prepare":
         prepare(directory)
         raise SystemExit(0)
-    raise SystemExit(run(directory, sys.argv[3]))
+    raise SystemExit(run(directory, sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else sys.argv[3]))
