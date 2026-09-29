@@ -29,6 +29,8 @@ sys.path[:0] = [str(ROOT / "tests"), str(ROOT / "tests" / "platform"),
 #: Production parent NLWP observed on Wizard (main + sampler + padding).
 PARENT_THREADS = 9
 KICKOFFS = 4
+#: The gate: the production runtime waits at most 180s for the worker.
+MAX_WORKER_SECONDS = 180.0
 
 
 def _requests(warehouse) -> list[dict]:  # type: ignore[no-untyped-def]
@@ -149,9 +151,25 @@ def run(out: Path, variant: str, label: str) -> int:
         "manifest_hashes_match_expected": got == want and len(got) == KICKOFFS,
         "requests_identical": rows == expected["requests"],
     }
+    events = dict(line.split() for line in _read(cg / "pids.events").splitlines() if " " in line)
+    gate = {
+        "worker_exit_0_with_result": error is None,
+        "output_identical": report["manifest_hashes_match_expected"]
+        and report["requests_identical"],
+        "pids_peak_below_max": _read(cg / "pids.peak").isdigit()
+        and int(_read(cg / "pids.peak")) < int(_read(cg / "pids.max")),
+        "no_pids_max_events": events.get("max") == "0",
+        "memory_peak_below_high": _read(cg / "memory.peak").isdigit()
+        and int(_read(cg / "memory.peak")) < int(_read(cg / "memory.high")),
+        "no_memory_high_max_oom_events": "high 0 max 0 oom 0 oom_kill 0"
+        in report["memory_events"],
+        "under_180s": elapsed < MAX_WORKER_SECONDS,
+    }
+    report["gate"] = gate
+    report["gate_pass"] = all(gate.values())
     print(json.dumps(report, indent=2))
     (out / f"report-{label}.json").write_text(json.dumps(report, indent=2))
-    ok = error is None and report["manifest_hashes_match_expected"] and report["requests_identical"]
+    ok = report["gate_pass"]
     return 0 if ok else 1
 
 

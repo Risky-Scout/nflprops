@@ -635,5 +635,5 @@ def test_systemd_unit_is_a_long_running_service_with_bounded_restarts() -> None:
 def test_systemd_unit_keeps_the_lightweight_limits() -> None:
     assert _unit_value("MemoryMax") == "512M"
     assert _unit_value("MemorySwapMax") == "0"
-    assert _unit_value("TasksMax") == "16"
+    assert _unit_value("TasksMax") == "32"
     assert _unit_value("CPUQuota") == "50%"
