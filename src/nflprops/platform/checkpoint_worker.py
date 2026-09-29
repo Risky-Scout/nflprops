@@ -46,7 +46,8 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Sequence
+import traceback
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -78,6 +79,17 @@ _POLL_SECONDS = 0.2
 _REAP_SECONDS = 10.0
 
 WORKER_ARGV: tuple[str, ...] = (sys.executable, "-m", "nflprops.platform.checkpoint_worker")
+#: Environment forced on the CHILD only (never the runtime, never GitHub
+#: science jobs). Polars sizes its Rayon pool from the host CPU count at
+#: first use; under the unit's `TasksMax` every extra thread is a task the
+#: whole cgroup shares, and on Wizard's 1 vCPU they buy no parallelism.
+#: Thread count changes scheduling only -- every checkpoint-preparation
+#: output is explicitly sorted and hashed, so results are identical.
+WORKER_ENV_OVERRIDES: Mapping[str, str] = {"POLARS_MAX_THREADS": "1"}
+#: How much of the child's stderr / traceback a failure report carries.
+_TAIL_CHARS = 4000
+#: At most this much of one pass's child stderr is passed through to ours.
+_FORWARD_BYTES = 256 * 1024
 
 
 class CheckpointWorkerError(CheckpointPrepareError):
@@ -203,6 +215,24 @@ def run_job(job_path: Path) -> PreparePassResult:
     )
 
 
+def worker_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The child's environment: the parent's, plus `WORKER_ENV_OVERRIDES`
+    (applied before the child can import Polars)."""
+    return {**(os.environ if base is None else base), **WORKER_ENV_OVERRIDES}
+
+
+def _failure_payload(exc: BaseException) -> dict[str, Any]:
+    exception_class = f"{type(exc).__module__}.{type(exc).__qualname__}"
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    return {
+        "ok": False,
+        "error": f"{exception_class}: {exc}"[:2000],
+        "exception_class": exception_class,
+        "message": str(exc)[:2000],
+        "traceback_tail": tb[-_TAIL_CHARS:],
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if len(args) != 1:
@@ -215,16 +245,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     result_path = job_path.with_name("result.json")
     try:
         result = run_job(job_path)
-    except Exception as exc:
-        _write_json_atomically(
-            result_path, {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:2000]}
-        )
+    except (KeyboardInterrupt, SystemExit):
+        raise  # normal termination semantics are never converted
+    except BaseException as exc:  # incl. pyo3 PanicException, a direct BaseException subclass
+        _write_json_atomically(result_path, _failure_payload(exc))
+        traceback.print_exc()  # also to stderr -> the parent's log
         return 1
     _write_json_atomically(result_path, {"ok": True, "result": _result_payload(result)})
     return 0
 
 
 # ------------------------------------------------------------------ parent
+
+
+def _forward_stderr(path: Path) -> str:
+    """Copy the child's captured stderr (bounded) to ours; return its tail."""
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - _FORWARD_BYTES))
+            data = handle.read()
+    except OSError:
+        return ""
+    with contextlib.suppress(OSError, ValueError):
+        sys.stderr.flush()
+        sys.stderr.buffer.write(data)
+        sys.stderr.buffer.flush()
+    return data.decode("utf-8", errors="replace")[-_TAIL_CHARS:]
 
 
 def _kill_group(proc: subprocess.Popen[bytes]) -> None:
@@ -297,14 +344,18 @@ def prepare_due_checkpoints_in_worker(
                 market_mode=market_mode,
             ),
         )
+        stderr_path = Path(tmp) / "worker.stderr"
         started = time.monotonic()
         try:
-            proc = subprocess.Popen(
-                [*worker_argv, str(job_path)],
-                stdin=subprocess.DEVNULL,
-                close_fds=True,
-                start_new_session=True,  # its own process group: killed as a unit
-            )
+            with stderr_path.open("wb") as stderr_file:
+                proc = subprocess.Popen(
+                    [*worker_argv, str(job_path)],
+                    stdin=subprocess.DEVNULL,
+                    stderr=stderr_file,
+                    env=worker_env(),
+                    close_fds=True,
+                    start_new_session=True,  # its own process group: killed as a unit
+                )
         except OSError as exc:
             raise CheckpointWorkerError(
                 f"could not start the checkpoint preparation worker: {exc}"
@@ -321,6 +372,10 @@ def prepare_due_checkpoints_in_worker(
                 break
             time.sleep(_POLL_SECONDS)
         elapsed = time.monotonic() - started
+        # The child's stderr (its JSON logs, any traceback or Rust panic
+        # message) is captured so a failure can be reported concretely, and
+        # passed through so it still reaches the runtime journal.
+        stderr_tail = _forward_stderr(stderr_path)
         if reason is not None:
             removed = _remove_staging_leftovers(layout, lock_timeout_seconds=lock_timeout_seconds)
             raise CheckpointWorkerTimeoutError(
@@ -333,9 +388,11 @@ def prepare_due_checkpoints_in_worker(
             outcome = json.loads(result_path.read_text())
         except (FileNotFoundError, json.JSONDecodeError) as exc:
             _remove_staging_leftovers(layout, lock_timeout_seconds=lock_timeout_seconds)
+            lines = stderr_tail.strip().splitlines()
             raise CheckpointWorkerError(
                 f"checkpoint preparation worker pid={proc.pid} exited {proc.returncode} "
-                "without a result"
+                "without a result; "
+                + (f"stderr: {lines[-1][:500]}" if lines else "no stderr")
             ) from exc
         if proc.returncode != 0 or not outcome.get("ok"):
             raise CheckpointWorkerError(
