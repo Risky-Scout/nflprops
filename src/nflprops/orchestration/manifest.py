@@ -32,6 +32,8 @@ checkpoint actually used, not the whole mutable warehouse.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -42,7 +44,6 @@ from nflprops.data.injury_availability import injury_feed_available_at
 from nflprops.data.warehouse import Warehouse
 from nflprops.domain.hashing import hash_payload
 from nflprops.features.asof import filter_pit
-from nflprops.pipelines.pregame import _market_frames_for_mode
 
 _INJURY_RESOURCE_TYPE = "INJURIES"
 
@@ -74,6 +75,35 @@ class ManifestComponent:
         }
 
 
+#: Rows converted to Python objects at a time by `_rows_sha256`.
+_HASH_CHUNK_ROWS = 2_048
+
+
+def _rows_sha256(ordered: pl.DataFrame) -> str:
+    """Exactly `hash_payload({"rows": ordered.to_dicts()})`, streamed.
+
+    `hash_payload` hashes `json.dumps({"rows": [...]}, sort_keys=True,
+    default=str, separators=(",", ":"))`; a list encodes as "[" + the
+    ","-joined encodings of its elements + "]", so feeding SHA-256 the same
+    bytes one bounded slice of rows at a time yields the identical digest
+    without ever holding every row as Python objects (plus one giant JSON
+    string) at once -- that was the live runtime's multi-GiB peak for a
+    game's full pre-cutoff prop/roster history."""
+    digest = hashlib.sha256(b'{"rows":[')
+    separator = b""
+    for chunk in ordered.iter_slices(_HASH_CHUNK_ROWS):
+        for row in chunk.to_dicts():
+            digest.update(separator)
+            digest.update(
+                json.dumps(row, sort_keys=True, default=str, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+            )
+            separator = b","
+    digest.update(b"]}")
+    return digest.hexdigest()
+
+
 def _content_component(
     frame: pl.DataFrame,
     *,
@@ -101,7 +131,7 @@ def _content_component(
 
     usable_sort_keys = [key for key in sort_keys if key in frame.columns]
     ordered = frame.sort(usable_sort_keys) if usable_sort_keys else frame
-    content_sha256 = hash_payload({"rows": ordered.to_dicts()})
+    content_sha256 = _rows_sha256(ordered)
 
     min_at = max_at = None
     if timestamp_column in frame.columns:
@@ -159,8 +189,9 @@ def _read_scoped(warehouse: Warehouse, table: str, where: pl.Expr) -> pl.DataFra
     be loaded whole on the lightweight runtime. Every `where` used here is
     the conjunction of this module's own PIT filter (`filter_pit`,
     `available_at <= scheduled_as_of`) and the game/team/player scope it
-    applies right after, so the selected rows (and the manifest hash) are
-    unchanged. Falls back to the plain read if the table lacks a filtered
+    applies right after (the reference `players` table: the player scope
+    alone, exactly as before), so the selected rows (and the manifest hash)
+    are unchanged. Falls back to the plain read if the table lacks a filtered
     column, so the unchanged downstream checks behave exactly as before."""
     try:
         return warehouse.read(table, where=where)
@@ -196,23 +227,14 @@ def build_checkpoint_manifest(
     is actually called (catch-up-safe by construction: the filter depends
     only on `scheduled_as_of`, never on wall-clock time).
     """
-    games = warehouse.read("games")
-    player_stats = warehouse.read("player_game_stats")
-    team_stats = warehouse.read("team_game_stats")
-    players = warehouse.read("players")
-    injury_runs = warehouse.read(RESOURCE_RUNS_TABLE)
     pit = pl.col("available_at") <= scheduled_as_of
-    if market_mode == "live":
-        # `_market_frames_for_mode`'s live branch, scoped to this game.
-        game_odds = _read_scoped(
-            warehouse, "game_odds_snapshots", (pl.col("canonical_game_id") == game_id) & pit
-        )
-        prop_quotes = _read_scoped(
-            warehouse, "player_prop_snapshots", (pl.col("canonical_game_id") == game_id) & pit
-        )
-    else:
-        game_odds, prop_quotes = _market_frames_for_mode(warehouse, market_mode=market_mode)
+    games = _read_scoped(warehouse, "games", (pl.col("canonical_game_id") == game_id) & pit)
+    injury_runs = warehouse.read(RESOURCE_RUNS_TABLE)
 
+    # Each component's frames are released as soon as it is hashed (and the
+    # market tables are read only when needed), so peak memory is the
+    # largest single component, not the sum of all of them. Reads, filters,
+    # sort inputs and hashes are unchanged.
     target_game_row = _select_target_game_row(
         games, game_id=game_id, scheduled_as_of=scheduled_as_of
     )
@@ -234,15 +256,16 @@ def build_checkpoint_manifest(
             return eligible.head(0)
         return eligible.filter(pl.col("canonical_team_id").is_in(team_ids))
 
-    player_stats_scoped = _scoped_by_team(player_stats)
-    team_stats_scoped = _scoped_by_team(team_stats)
-    roster = (
-        _read_scoped(
-            warehouse, "roster_snapshots", pl.col("canonical_team_id").is_in(list(team_ids)) & pit
+    def _read_team_scoped(table: str) -> pl.DataFrame:
+        return (
+            _read_scoped(warehouse, table, pl.col("canonical_team_id").is_in(list(team_ids)) & pit)
+            if team_ids
+            else pl.DataFrame()  # _scoped_by_team selects nothing without team ids
         )
-        if team_ids
-        else pl.DataFrame()  # _scoped_by_team selects nothing without team ids
-    )
+
+    player_stats_scoped = _scoped_by_team(_read_team_scoped("player_game_stats"))
+    team_stats_scoped = _scoped_by_team(_read_team_scoped("team_game_stats"))
+    roster = _read_team_scoped("roster_snapshots")
     roster_scoped = _scoped_by_team(roster)
 
     player_stats_component = _content_component(
@@ -256,6 +279,7 @@ def build_checkpoint_manifest(
     )
 
     player_ids = _relevant_player_ids(player_stats_scoped, roster_scoped)
+    del player_stats_scoped, team_stats_scoped, roster, roster_scoped
 
     injuries = (
         _read_scoped(
@@ -276,6 +300,7 @@ def build_checkpoint_manifest(
     injuries_component = _content_component(
         injuries_scoped, sort_keys=["canonical_player_id", "available_at"]
     )
+    del injuries, injuries_eligible, injuries_scoped
 
     injury_feed_available = injury_feed_available_at(injury_runs, as_of=scheduled_as_of)
     injury_runs_scoped = injury_runs
@@ -301,17 +326,37 @@ def build_checkpoint_manifest(
             return eligible.head(0)
         return eligible.filter(pl.col("canonical_game_id") == game_id)
 
-    game_odds_scoped = _scoped_by_game(game_odds)
-    prop_quotes_scoped = _scoped_by_game(prop_quotes)
+    if market_mode == "live":
+        # `_market_frames_for_mode`'s live branch, scoped to this game.
+        game_odds = _read_scoped(
+            warehouse, "game_odds_snapshots", (pl.col("canonical_game_id") == game_id) & pit
+        )
+        prop_quotes = _read_scoped(
+            warehouse, "player_prop_snapshots", (pl.col("canonical_game_id") == game_id) & pit
+        )
+    else:
+        # Historical market modes only (never the live runtime): imported
+        # here so the live path never loads the model stack pregame pulls in.
+        from nflprops.pipelines.pregame import _market_frames_for_mode
 
+        game_odds, prop_quotes = _market_frames_for_mode(warehouse, market_mode=market_mode)
     game_odds_component = _content_component(
-        game_odds_scoped, sort_keys=["canonical_game_id", "vendor", "available_at"]
+        _scoped_by_game(game_odds), sort_keys=["canonical_game_id", "vendor", "available_at"]
     )
+    del game_odds
+    prop_quotes_scoped = _scoped_by_game(prop_quotes)
+    del prop_quotes
     player_props_component = _content_component(
         prop_quotes_scoped,
         sort_keys=["canonical_game_id", "canonical_player_id", "prop_type", "vendor", "available_at"],
     )
+    del prop_quotes_scoped
 
+    players = (
+        _read_scoped(warehouse, "players", pl.col("canonical_player_id").is_in(sorted(player_ids)))
+        if player_ids
+        else pl.DataFrame()  # selects nothing without player ids (below)
+    )
     reference_players = (
         players.filter(pl.col("canonical_player_id").is_in(player_ids))
         if player_ids and not players.is_empty() and "canonical_player_id" in players.columns

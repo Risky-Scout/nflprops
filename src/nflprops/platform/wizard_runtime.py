@@ -372,6 +372,7 @@ def _build_loop(
     import os
 
     from nflprops.pipelines.lean import LeanIngestor
+    from nflprops.platform.checkpoint_worker import DEFAULT_WORKER_TIMEOUT_SECONDS
     from nflprops.platform.runtime_layout import current_migration_head
     from nflprops.platform.runtime_loop import (
         DEFAULT_SNAPSHOT_INTERVAL_SECONDS,
@@ -397,6 +398,11 @@ def _build_loop(
         ),
         snapshot_retention=snapshot_retention(),
         reference_bootstrap=_bootstrap,
+        checkpoint_timeout_seconds=float(
+            os.environ.get(
+                "NFLPROPS_CHECKPOINT_PREPARE_TIMEOUT_SECONDS", DEFAULT_WORKER_TIMEOUT_SECONDS
+            )
+        ),
     )
 
 

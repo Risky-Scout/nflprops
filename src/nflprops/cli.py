@@ -290,8 +290,8 @@ def checkpoint_due_cmd(
         scheduled_as_of as compute_scheduled_as_of,
     )
     from nflprops.orchestration.run_store import checkpoint_satisfied
+    from nflprops.pipelines.games_asof import _latest_games_asof
     from nflprops.pipelines.lean import open_warehouse
-    from nflprops.pipelines.pregame import _latest_games_asof
 
     now = datetime.fromisoformat(at.replace("Z", "+00:00"))
     if now.tzinfo is None:

@@ -348,7 +348,9 @@ def test_runtime_modules_never_import_prefect() -> None:
 # =================================================== checkpoint preparation
 
 
-def _checkpoint_env(env: dict, kickoff: datetime) -> tuple[RuntimeLoop, Clock]:
+def _checkpoint_env(
+    env: dict, kickoff: datetime, **kwargs: object
+) -> tuple[RuntimeLoop, Clock]:
     clock = Clock(BASE)
     provider = _provider(kickoff)
     # Every required feed (incl. ROSTERS) is successfully collected before
@@ -356,7 +358,7 @@ def _checkpoint_env(env: dict, kickoff: datetime) -> tuple[RuntimeLoop, Clock]:
     for team in ("t1", "t2"):
         provider.seed_player(f"{team}-p1")
         provider.seed_roster_entry(team_native_id=team, player_native_id=f"{team}-p1")
-    loop = _loop(env, provider, clock)
+    loop = _loop(env, provider, clock, **kwargs)
     loop.tick()  # collect the game into the live warehouse
     return loop, clock
 
@@ -688,7 +690,10 @@ def test_already_pending_catch_ups_are_blocked_on_the_next_pass(
     kickoff = BASE + 20 * H + 2 * M
     with monkeypatch.context() as ungated:
         ungated.setattr(prepare_module, "remote_execution_blocker", lambda *a, **k: None)
-        loop, clock = _checkpoint_env(env, kickoff)
+        # the previous release, simulated in-process (the patch cannot
+        # reach a worker process)
+        loop, clock = _checkpoint_env(env, kickoff, checkpoint_worker=False)
+    loop.checkpoint_worker = True  # the gated release: the real worker
     requests = _requests_by_name(env)
     assert {requests[n]["state"] for n in ("T48H", "T24H")} == {STATE_PENDING_REMOTE_EXECUTION}
     snapshot_id = requests["T48H"]["snapshot_id"]
@@ -721,9 +726,11 @@ def test_already_pending_stale_catch_ups_are_blocked_on_the_next_pass(
     kickoff = BASE + 48 * H + 90 * M  # T48H cutoff ~95m after the collection
     with monkeypatch.context() as ungated:
         ungated.setattr(prepare_module, "remote_execution_blocker", lambda *a, **k: None)
-        loop, clock = _checkpoint_env(env, kickoff)
+        # the previous release, simulated in-process (see above)
+        loop, clock = _checkpoint_env(env, kickoff, checkpoint_worker=False)
         clock.advance(minutes=93)  # the scheduler wakes up late: T48H is due
         loop.tick()
+    loop.checkpoint_worker = True
     requests = _requests_by_name(env)
     assert requests["T48H"]["state"] == STATE_PENDING_REMOTE_EXECUTION
     run_id = requests["T48H"]["run_id"]

@@ -54,6 +54,7 @@ from nflprops.orchestration.dispatch_plan import (
     DispatchSettings,
     PlannedCheckpoint,
     as_run_store_backend,
+    due_checkpoint_slots,
     plan_due_checkpoints,
 )
 from nflprops.orchestration.manifest import (
@@ -475,6 +476,45 @@ def _finish_preparing(
                 )
             )
     return snapshot, prepared
+
+
+def preparation_work_pending(
+    *,
+    warehouse: Warehouse,
+    config: Config,
+    season: int,
+    week: int,
+    now: datetime,
+    market_mode: str = "live",
+) -> bool:
+    """Cheap, read-only: would `prepare_due_checkpoints` claim, record,
+    gate or finish anything for (season, week) as of `now`? True when an
+    official checkpoint slot is due/missed and unclaimed, a SCHEDULED run
+    lacks its request row, a request is still PREPARING, or a PENDING
+    request fails the (unchanged) execution gate. Reads only `games`,
+    `prediction_runs`, the request table and `collector_resource_runs` --
+    never the PIT data a manifest selects -- so the always-on runtime can
+    decide whether to start a preparation worker without touching it."""
+    for _slot in due_checkpoint_slots(
+        warehouse=warehouse, config=config, season=season, week=week, now=now
+    ):
+        return True
+    requests = _read_requests(warehouse)
+    if not requests.filter(pl.col("state") == STATE_PREPARING).is_empty():
+        return True
+    if warehouse.exists(PREDICTION_RUNS_TABLE):
+        scheduled = warehouse.read(PREDICTION_RUNS_TABLE).filter(
+            pl.col("status") == PredictionRunStatus.SCHEDULED.value
+        )
+        known = set(requests["request_id"].to_list())
+        if any(run_id not in known for run_id in scheduled["run_id"].to_list()):
+            return True
+    return any(
+        remote_execution_blocker(warehouse, request, market_mode=market_mode) is not None
+        for request in requests.filter(
+            pl.col("state") == STATE_PENDING_REMOTE_EXECUTION
+        ).iter_rows(named=True)
+    )
 
 
 def prepare_due_checkpoints(
