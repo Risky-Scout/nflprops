@@ -321,3 +321,24 @@ def test_repeated_worker_passes_do_not_accumulate_parent_memory(tmp_path: Path) 
     assert runs.height == 15
     # after the first pass warms imports/caches, the parent does not grow
     assert samples[-1] - samples[1] < 25, samples
+
+
+def test_default_timeout_bounds_a_blocked_collection_to_three_minutes() -> None:
+    assert checkpoint_worker.DEFAULT_WORKER_TIMEOUT_SECONDS == 180.0
+    loop_default = RuntimeLoop.__dataclass_fields__["checkpoint_timeout_seconds"].default
+    assert loop_default == 180.0
+
+
+@pytest.mark.parametrize(("env_value", "expected"), [(None, 180.0), ("45", 45.0)])
+def test_runtime_timeout_env_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_value: str | None, expected: float
+) -> None:
+    from nflprops.platform.wizard_runtime import _build_loop
+
+    if env_value is None:
+        monkeypatch.delenv("NFLPROPS_CHECKPOINT_PREPARE_TIMEOUT_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("NFLPROPS_CHECKPOINT_PREPARE_TIMEOUT_SECONDS", env_value)
+    env = _env(tmp_path)
+    loop = _build_loop(env["layout"], env["config"], env["warehouse"], FakeProvider(), None)
+    assert loop.checkpoint_timeout_seconds == expected

@@ -68,7 +68,10 @@ from nflprops.platform.writer_lock import WriterLock
 logger = logging.getLogger("nflprops.runtime")
 
 JOB_SCHEMA_VERSION = "nflprops.platform.checkpoint_worker_job/v1"
-DEFAULT_WORKER_TIMEOUT_SECONDS = 600.0
+#: The runtime waits for the child synchronously, so a hung pass blocks
+#: collection for at most this long (near T90M/T30M the cadence is 1-2 min).
+#: Override with NFLPROPS_CHECKPOINT_PREPARE_TIMEOUT_SECONDS.
+DEFAULT_WORKER_TIMEOUT_SECONDS = 180.0
 #: How often the parent checks the child and its own stop request.
 _POLL_SECONDS = 0.2
 #: SIGKILLed children are reaped within this bound (never an unbounded wait).
