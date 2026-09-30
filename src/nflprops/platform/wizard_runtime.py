@@ -78,12 +78,9 @@ def _layout() -> RuntimeLayout:
 def _protected_snapshots(layout: RuntimeLayout) -> frozenset[str]:
     """Snapshot ids a pending checkpoint request references (never
     pruned). Read-only; never creates the warehouse directory."""
-    if not layout.warehouse_root.is_dir():
-        return frozenset()
-    from nflprops.data.warehouse import Warehouse
-    from nflprops.platform.checkpoint_prepare import protected_snapshot_ids
+    from nflprops.platform.checkpoint_prepare import protected_snapshot_ids_at
 
-    return protected_snapshot_ids(Warehouse(layout.warehouse_root))
+    return protected_snapshot_ids_at(layout.warehouse_root)
 
 
 def _warehouse_and_snapshot_roots() -> tuple[Path, Path]:
