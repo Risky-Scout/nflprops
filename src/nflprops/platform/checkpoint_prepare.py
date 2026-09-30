@@ -193,6 +193,15 @@ def protected_snapshot_ids(warehouse: Warehouse) -> frozenset[str]:
     return frozenset(v for v in requests["snapshot_id"].drop_nulls().to_list() if v)
 
 
+def protected_snapshot_ids_at(warehouse_root: Path) -> frozenset[str]:
+    """`protected_snapshot_ids` for a warehouse directory -- the one set
+    both snapshot pruning and the storage_growth health check honor.
+    Read-only; never creates the warehouse directory."""
+    if not warehouse_root.is_dir():
+        return frozenset()
+    return protected_snapshot_ids(Warehouse(warehouse_root))
+
+
 def missing_pre_cutoff_feeds(
     warehouse: Warehouse, *, scheduled_as_of: datetime, market_mode: str = "live"
 ) -> list[str]:

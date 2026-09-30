@@ -834,15 +834,12 @@ def platform_health(
     cfg = load_config()
     layout = resolve_layout_from_config(cfg)
     retention = snapshot_retention()
-    requests_path = layout.warehouse_root / "remote_checkpoint_requests.parquet"
-    protected: frozenset[str] = frozenset()
-    if requests_path.is_file():
-        import polars as pl
+    # The SAME protected set snapshot pruning honors (PENDING and retained
+    # NOT_EXECUTABLE requests), so health never counts a snapshot the
+    # runtime is forbidden to prune against retention.
+    from nflprops.platform.checkpoint_prepare import protected_snapshot_ids_at
 
-        pending = pl.read_parquet(requests_path).filter(
-            pl.col("state") == "PENDING_REMOTE_EXECUTION"
-        )
-        protected = frozenset(v for v in pending["snapshot_id"].drop_nulls().to_list() if v)
+    protected = protected_snapshot_ids_at(layout.warehouse_root)
 
     running_sha = _running_release_sha()
     checks["runtime_version"] = runtime_version_check(running_sha)

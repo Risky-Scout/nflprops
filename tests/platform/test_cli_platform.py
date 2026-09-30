@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
+from pathlib import Path
 
+import polars as pl
 import pytest
 from typer.testing import CliRunner
 
@@ -66,3 +69,64 @@ def test_platform_health_never_raises_out_of_the_cli(
     payload = json.loads(result.output)
     database_check = next(c for c in payload["checks"] if c["name"] == "database")
     assert database_check["healthy"] is False
+
+
+def _storage_growth(output: str) -> dict[str, object]:
+    checks = {check["name"]: check for check in json.loads(output)["checks"]}
+    return checks["storage_growth"]
+
+
+def test_platform_health_storage_growth_honors_the_pruning_protected_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression (live 2026-09-30): health counted snapshots referenced by
+    retained NOT_EXECUTABLE requests against retention although pruning
+    protects them, so a correctly pruned runtime failed the deploy gate."""
+    from nflprops.platform.checkpoint_prepare import (
+        REMOTE_REQUESTS_TABLE,
+        STATE_NOT_EXECUTABLE,
+        STATE_PENDING_REMOTE_EXECUTION,
+    )
+    from nflprops.platform.health import DEPLOY_GATE_NONCRITICAL
+    from nflprops.platform.warehouse_snapshot import create_snapshot
+
+    data_root = tmp_path / "data"
+    warehouse_root = data_root / "canonical"
+    warehouse_root.mkdir(parents=True)
+    monkeypatch.setenv("NFLPROPS_DATA_ROOT", str(data_root))
+    monkeypatch.delenv("NFLPROPS_RUNTIME_ROOT", raising=False)
+    monkeypatch.delenv("NFLPROPS_SNAPSHOT_RETENTION", raising=False)
+
+    def snapshot(day: int) -> str:
+        # Distinct content per snapshot (identical content is deduplicated).
+        pl.DataFrame({"x": list(range(day))}).write_parquet(warehouse_root / "t.parquet")
+        return create_snapshot(
+            warehouse_root=warehouse_root, snapshot_root=data_root / "snapshots",
+            migration_head="0009_compact_pmf_payload", hostname="h",
+            created_at=datetime(2026, 9, day, tzinfo=UTC),
+        ).snapshot_id
+
+    not_executable = [snapshot(1), snapshot(2)]
+    pending = [snapshot(3)]
+    ordinary = [snapshot(day) for day in range(4, 11)]  # exactly retention (7)
+    pl.DataFrame(
+        {
+            "request_id": ["n1", "n2", "p1"],
+            "state": [STATE_NOT_EXECUTABLE, STATE_NOT_EXECUTABLE, STATE_PENDING_REMOTE_EXECUTION],
+            "snapshot_id": [*not_executable, *pending],
+        }
+    ).write_parquet(warehouse_root / f"{REMOTE_REQUESTS_TABLE}.parquet")
+    assert len(ordinary) == 7
+
+    # storage_growth is deploy-gate critical, so a false failure here would
+    # fail every deploy/restart gate.
+    assert "storage_growth" not in DEPLOY_GATE_NONCRITICAL
+    check = _storage_growth(runner.invoke(app, ["platform", "health"]).output)
+    assert check["healthy"] is True, check
+    assert "snapshots=7/7 (+3 pending-protected" in str(check["detail"])
+
+    # A genuinely excessive UNPROTECTED snapshot still fails.
+    snapshot(11)
+    check = _storage_growth(runner.invoke(app, ["platform", "health"]).output)
+    assert check["healthy"] is False, check
+    assert "8 snapshots exceed retention 7" in str(check["detail"])
