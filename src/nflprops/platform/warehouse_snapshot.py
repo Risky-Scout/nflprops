@@ -36,6 +36,8 @@ verify_directory_against_manifest` this module used to build it.
 
 from __future__ import annotations
 
+import logging
+import os
 import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -44,8 +46,10 @@ from typing import Any
 
 from nflprops.errors import NflpropsError
 from nflprops.platform.immutable_bundle import (
+    BundleError,
     BundleIntegrityError,
     BundleManifest,
+    _sha256_file,
     build_manifest,
     publish_atomically,
     read_manifest,
@@ -54,6 +58,8 @@ from nflprops.platform.immutable_bundle import (
     write_manifest,
 )
 from nflprops.platform.writer_lock import WriterLock, default_lock_path
+
+logger = logging.getLogger(__name__)
 
 #: Bumped only if the snapshot's own manifest shape changes -- independent
 #: of `nflprops.distributions.pmf_codec.CODEC_VERSION` or the Alembic
@@ -125,6 +131,71 @@ def _snapshot_id(*, created_at: datetime, content_fingerprint: str) -> str:
     return f"{stamp}-{content_fingerprint[:12]}"
 
 
+def _is_transient(path: Path, warehouse_root: Path) -> bool:
+    """Never part of the logical warehouse (reads use only `<table>.parquet`
+    and `<table>.parts/part-*.parquet`): in-flight/abandoned `*.tmp` files
+    and a `<table>.parts.replaced` directory parked during a rewrite."""
+    if path.name.endswith(".tmp"):
+        return True
+    return any(part.endswith(".parts.replaced") for part in path.relative_to(warehouse_root).parts)
+
+
+def _reusable_files(snapshot_root: Path) -> dict[str, tuple[Path, int, str]]:
+    """relative path -> (file in the NEWEST published snapshot, size, sha256)
+    from that snapshot's own manifest. Immutable snapshot files are what a
+    new snapshot may hard-link instead of copying."""
+    snapshots = list_snapshots(snapshot_root)
+    if not snapshots:
+        return {}
+    latest = snapshot_root / snapshots[-1].snapshot_id
+    try:
+        manifest = read_manifest(latest)
+    except BundleError:
+        return {}
+    return {f.relative_path: (latest / f.relative_path, f.byte_count, f.sha256) for f in manifest.files}
+
+
+def _link_or_copy(source: Path, dest: Path, prior: tuple[Path, int, str] | None) -> None:
+    """Content-addressed dedup with re-verification.
+
+    The live file is hashed first. If the same path in the newest snapshot
+    is recorded with the same size + SHA-256, that EXISTING snapshot file is
+    re-hashed now and hard-linked only if it still matches the recorded
+    hash -- a corrupted earlier file is never linked. Otherwise (no prior,
+    content changed, or the prior file failed re-verification) the live file
+    is copied and the copy itself must hash to the live file's SHA-256, else
+    snapshot creation fails closed. Snapshots never modify their files
+    (restore copies OUT), and the finished snapshot is still re-verified
+    against its own manifest before publication."""
+    source_sha = _sha256_file(source)
+    if prior is not None:
+        prior_path, prior_size, prior_sha = prior
+        if (
+            source.stat().st_size == prior_size
+            and source_sha == prior_sha
+            and prior_path.is_file()
+            and prior_path.stat().st_size == prior_size
+        ):
+            if _sha256_file(prior_path) == prior_sha:
+                try:
+                    os.link(prior_path, dest)
+                    return
+                except OSError:
+                    pass  # e.g. cross-device: fall through to a verified copy
+            else:
+                logger.warning(
+                    "snapshot dedup: %s no longer matches its manifest hash; "
+                    "copying %s from the live warehouse instead of linking",
+                    prior_path,
+                    source,
+                )
+    shutil.copy2(source, dest)
+    if _sha256_file(dest) != source_sha:
+        raise WarehouseSnapshotError(
+            f"snapshot copy of {source} does not match the source hash; refusing"
+        )
+
+
 def create_snapshot(
     *,
     warehouse_root: Path,
@@ -155,13 +226,14 @@ def create_snapshot(
         staging = stage_bundle_dir(snapshot_root / "_pending", bundle_id="pending")
         try:
             if warehouse_root.exists():
+                reusable = _reusable_files(snapshot_root)
                 for path in warehouse_root.rglob("*"):
-                    if not path.is_file():
+                    if not path.is_file() or _is_transient(path, warehouse_root):
                         continue
                     relative = path.relative_to(warehouse_root)
                     dest = staging / relative
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(path, dest)
+                    _link_or_copy(path, dest, reusable.get(relative.as_posix()))
             if checkpointed_duckdb_path is not None:
                 shutil.copy2(checkpointed_duckdb_path, staging / QUERY_CACHE_SNAPSHOT_FILENAME)
 

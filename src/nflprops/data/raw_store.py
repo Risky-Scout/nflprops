@@ -2,18 +2,62 @@
 
 This is intentionally small: every provider response is persisted before any
 transformation so model training can be reproduced without calling a live API.
+
+Storage format (bounded-storage change): payloads are written as
+`<sha256>.json.zst` -- lossless zstd of the exact canonical JSON bytes, whose
+SHA-256 is still the content address. Decompression returns those exact
+bytes. Legacy uncompressed `<sha256>.json` payloads stay readable and are
+converted by `compress_legacy_payloads`, which removes a legacy file only
+after its compressed copy decompresses byte-identically AND re-hashes to the
+content address. Metadata (`<sha256>.meta.json`, first-seen record) is
+unchanged.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import zstandard
+
 from nflprops.errors import DataQualityError
+
+#: zstd level for raw payloads. Measured per file at level 3 (estimates,
+#: not guarantees): live/opening player-prop payloads ~17.9-20.2:1, a
+#: 1,093-payload sampled mix ~19.4:1, injuries ~5.6:1, rosters ~7:1; every
+#: sampled round trip byte-identical.
+ZSTD_LEVEL = 3
+COMPRESSED_SUFFIX = ".json.zst"
+LEGACY_SUFFIX = ".json"
+META_SUFFIX = ".meta.json"
+
+
+def compress_bytes(body: bytes) -> bytes:
+    return zstandard.ZstdCompressor(level=ZSTD_LEVEL, write_checksum=True).compress(body)
+
+
+def decompress_bytes(blob: bytes) -> bytes:
+    return zstandard.ZstdDecompressor().decompress(blob)
+
+
+def _write_verified(path: Path, body: bytes, digest: str) -> None:
+    """Atomically publish `body` compressed at `path`, after proving the
+    compressed bytes decompress to `body` exactly and hash to `digest`."""
+    blob = compress_bytes(body)
+    restored = decompress_bytes(blob)
+    if restored != body or hashlib.sha256(restored).hexdigest() != digest:
+        raise DataQualityError(f"zstd round trip failed for {path}; nothing written")
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("wb") as handle:
+        handle.write(blob)
+        handle.flush()
+        os.fsync(handle.fileno())
+    tmp.replace(path)
 
 
 def _iso(dt: datetime | None) -> str | None:
@@ -81,18 +125,23 @@ class RawStore:
         target_dir = self.root / provider / _safe_endpoint(endpoint)
         target_dir.mkdir(parents=True, exist_ok=True)
 
-        payload_path = target_dir / f"{digest}.json"
-        metadata_path = target_dir / f"{digest}.meta.json"
+        payload_path = target_dir / f"{digest}{COMPRESSED_SUFFIX}"
+        legacy_path = target_dir / f"{digest}{LEGACY_SUFFIX}"
+        metadata_path = target_dir / f"{digest}{META_SUFFIX}"
 
-        if payload_path.exists() and payload_path.read_bytes() != body:
-            raise DataQualityError(
-                f"raw object collision at {payload_path}; immutable store violated"
-            )
-
-        if not payload_path.exists():
-            tmp = payload_path.with_suffix(".json.tmp")
-            tmp.write_bytes(body)
-            tmp.replace(payload_path)
+        if payload_path.exists():
+            if decompress_bytes(payload_path.read_bytes()) != body:
+                raise DataQualityError(
+                    f"raw object collision at {payload_path}; immutable store violated"
+                )
+        elif legacy_path.exists():
+            if legacy_path.read_bytes() != body:
+                raise DataQualityError(
+                    f"raw object collision at {legacy_path}; immutable store violated"
+                )
+            payload_path = legacy_path
+        else:
+            _write_verified(payload_path, body, digest)
 
         safe_params = dict(request_params or {})
         for key in list(safe_params):
@@ -134,9 +183,19 @@ class RawStore:
             received_at=_iso(received_at) or "",
         )
 
-    def read_json(self, ref: RawResponseRef | str | Path) -> Any:
+    def read_bytes(self, ref: RawResponseRef | str | Path) -> bytes:
+        """The exact stored payload bytes, whichever format holds them (a
+        legacy `.json` path resolves to its compressed copy once migrated)."""
         path = Path(ref.payload_path if isinstance(ref, RawResponseRef) else ref)
-        return json.loads(path.read_text())
+        if path.name.endswith(COMPRESSED_SUFFIX):
+            return decompress_bytes(path.read_bytes())
+        if path.exists():
+            return path.read_bytes()
+        compressed = path.with_name(path.name[: -len(LEGACY_SUFFIX)] + COMPRESSED_SUFFIX)
+        return decompress_bytes(compressed.read_bytes())
+
+    def read_json(self, ref: RawResponseRef | str | Path) -> Any:
+        return json.loads(self.read_bytes(ref))
 
 
 def make_raw_hook(store: RawStore, *, provider: str, spec_sha256: str | None):
@@ -163,3 +222,56 @@ def make_raw_hook(store: RawStore, *, provider: str, spec_sha256: str | None):
         )
 
     return hook
+
+
+@dataclass
+class CompressionStats:
+    converted: int = 0
+    bytes_before: int = 0
+    bytes_after: int = 0
+    skipped_mismatched_address: list[str] = field(default_factory=list)
+    remaining: int = 0
+
+
+def _legacy_payloads(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    return sorted(
+        p
+        for p in root.rglob(f"*{LEGACY_SUFFIX}")
+        if p.is_file() and not p.name.endswith(META_SUFFIX)
+    )
+
+
+def compress_legacy_payloads(root: Path, *, max_files: int | None = None) -> CompressionStats:
+    """Convert legacy `<sha>.json` payloads to `<sha>.json.zst`, oldest path
+    order, at most `max_files` per call. Per file, fail closed: the legacy
+    bytes must hash to their own content address (else the file is left
+    untouched and reported), the compressed copy must decompress to exactly
+    those bytes, and only then is the legacy file removed. Idempotent and
+    crash-safe: a `.zst` left by an interrupted run is re-verified against
+    the legacy bytes before the legacy file is removed. Callers hold the
+    writer lock (raw payloads are only written inside a locked collection)."""
+    stats = CompressionStats()
+    pending = _legacy_payloads(Path(root))
+    batch = pending if max_files is None else pending[:max_files]
+    for legacy in batch:
+        digest = legacy.name[: -len(LEGACY_SUFFIX)]
+        body = legacy.read_bytes()
+        if hashlib.sha256(body).hexdigest() != digest:
+            stats.skipped_mismatched_address.append(str(legacy))
+            continue
+        compressed = legacy.with_name(digest + COMPRESSED_SUFFIX)
+        if compressed.exists():
+            if decompress_bytes(compressed.read_bytes()) != body:
+                raise DataQualityError(
+                    f"{compressed} exists but does not decompress to {legacy}; refusing"
+                )
+        else:
+            _write_verified(compressed, body, digest)
+        stats.bytes_before += len(body)
+        stats.bytes_after += compressed.stat().st_size
+        legacy.unlink()
+        stats.converted += 1
+    stats.remaining = len(pending) - stats.converted - len(stats.skipped_mismatched_address)
+    return stats

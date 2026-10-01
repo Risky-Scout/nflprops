@@ -260,10 +260,12 @@ anything yet):
      rule exists, and ≥ 3 GiB is free.
    - Extract into the immutable `releases/<release-id>/` and write
      `RELEASE_SHA`.
-   - Build that release's **own** `.venv` and install
-     `-e .[orchestration,runtime]`. The core dependencies plus Prefect and
-     alembic only; no `challenger` (lightgbm/shap), no database driver,
-     no object-store client.
+   - Build that release's **own** `.venv` and install `-e .[runtime]`:
+     the lightweight core (polars, duckdb, pydantic, httpx, typer, PyYAML,
+     zstandard) plus alembic only. The numerical science stack (`science`
+     extra: numpy/scipy/pyarrow/scikit-learn/statsmodels/joblib), Prefect,
+     `challenger`, database drivers and object-store clients are never
+     installed on Wizard (measured: 337 MB venv vs 1,035 MB before).
    - Run the pre-activation checks from the candidate venv: `import
      nflprops`, `platform health --help`, `wizard_runtime --help`,
      `wizard_runtime snapshot --help`, a read-only `snapshot list`, and
@@ -523,6 +525,64 @@ collector rewrites a whole table's Parquet on each append, and raw
 payloads accumulate under `state/raw` (637 MiB in the dev checkout vs
 4 MiB canonical). Near kickoff (1-minute cadence, props per game) both
 grow fastest. Health reports both; season-long capacity is not claimed.
+
+## Bounded Wizard storage
+
+Measured 2026-10-01 (read-only `inventory` op): 4.5 GiB free on a 49 GB
+root; nflprops 2.8 GiB, of which releases 1.9 GiB (two ~1 GB venvs), raw
+provider payloads 0.41 GiB growing ~240 MiB/day (uncompressed), snapshots
+0.29 GiB (full copies pinned by requests). Nothing was obsolete; the growth
+was structural. The runtime now bounds it:
+
+- **Raw payloads** are written as `<sha256>.json.zst` (lossless zstd of the
+  exact canonical bytes; the SHA-256 content address is unchanged; every
+  write is decompressed and re-hashed before publication). Measured per
+  file at level 3 (estimates, not guarantees): player-prop payloads, 93% of
+  Wizard raw bytes, ~17.9-20.2:1; a 1,093-payload sampled mix ~19.4:1;
+  injuries ~5.6:1, rosters ~7:1; all sampled round trips byte-identical.
+  Legacy `.json` payloads are converted in bounded batches (500 per
+  10-minute housekeeping pass); each legacy file is removed only after its
+  compressed copy decompresses byte-identically and re-hashes to its
+  address. Estimated for the current Wizard state: ~454 MB raw on disk ->
+  ~41 MB (compressed payloads plus one 4 KB block per uncompressed
+  metadata file), ~0.38 GiB reclaimed; future raw growth ~240 MiB/day
+  uncompressed -> ~20 MiB/day on disk before retention. No inference, PIT,
+  settlement, training or calibration code reads raw payloads (they are
+  the forensic record).
+- **Raw retention is finite and always on**: a content-addressed payload
+  (+ metadata) is removed once its first receipt is older than 30 days if
+  it was canonicalized (received inside a SUCCESS collection cycle) or a
+  schedule-discovery read (outside every cycle); payloads from a failed or
+  unfinished cycle, or with unreadable metadata (aged by file mtime), have
+  a 45-day absolute cap. `NFLPROPS_RAW_RETENTION_DAYS` may only SHORTEN
+  the 30-day window (longer, non-positive or malformed values are clamped
+  to 30 and reported). Retention touches only files under `state/raw`
+  named exactly `<64-hex>.json[.zst]` / `<64-hex>.meta.json`; it never
+  touches canonical tables, snapshots or bundles.
+- **Snapshots**: only executable requests (PREPARING /
+  PENDING_REMOTE_EXECUTION) pin their snapshot. Terminal requests
+  (NOT_EXECUTABLE today) keep their immutable request bundle (identity,
+  full PIT data manifest + SHA, snapshot id + manifest SHA) and their
+  snapshot returns to ordinary retention; a NOT_EXECUTABLE run never
+  executed, so no prediction depends on that snapshot (its exact input
+  bytes are no longer replayable once pruned). Dedup: when a live file
+  matches (size + SHA-256) the same path in the newest snapshot, that
+  earlier snapshot file is RE-HASHED and hard-linked only if it still
+  matches its manifest hash; otherwise the live file is copied and the copy
+  must hash to the live file's SHA-256 or snapshot creation fails closed.
+  Every snapshot is still verified against its own manifest.
+  `*.tmp` and `*.parts.replaced` are never snapshotted.
+- **Orphan sweeper** (housekeeping, every 10 min, under the writer lock,
+  1 h age floor): warehouse/raw `*.tmp`, `*.parts.replaced`, abandoned
+  `snapshots/_pending` and `.*.tmp-*` bundle staging, and
+  `publications/_incoming` uploads older than 24 h. Never touches a
+  published snapshot or bundle.
+- **Disk guardrails** (`storage_guard`): WARNING < 8 GiB, CRITICAL < 5 GiB
+  (housekeeping + snapshot retention; reported in health and
+  `runtime-status.json`), FAIL_CLOSED < 3 GiB: no new snapshot and no
+  checkpoint preparation (the certified planner catches up or records a
+  miss later); collection continues. `disk_free` health fails only below
+  3 GiB. Canonical history is never deleted because disk is low.
 
 ## One-time root setup (Block 3 bootstrap)
 

@@ -62,6 +62,7 @@ from nflprops.collection.cadence import cadence_for_games
 from nflprops.collection.due import _latest_started_at, collection_due
 from nflprops.collection.service import _cadence_config_from_toml, collect_once
 from nflprops.config import Config
+from nflprops.data.raw_store import compress_legacy_payloads
 from nflprops.data.warehouse import Warehouse, records_to_frame
 from nflprops.orchestration.checkpoints import (
     OFFICIAL_CHECKPOINTS,
@@ -84,6 +85,16 @@ from nflprops.platform.checkpoint_worker import (
     prepare_due_checkpoints_in_worker,
 )
 from nflprops.platform.runtime_layout import RuntimeLayout
+from nflprops.platform.storage_guard import (
+    LEVEL_FAIL_CLOSED,
+    LEVEL_OK,
+    RAW_FAILED_HARD_CAP_DAYS,
+    RAW_RETENTION_DAYS,
+    disk_level,
+    free_gib,
+    prune_raw_payloads,
+    sweep_orphans,
+)
 from nflprops.platform.warehouse_snapshot import (
     create_snapshot,
     list_snapshots,
@@ -103,6 +114,12 @@ DEFAULT_DISCOVERY_REFRESH_SECONDS = 6 * 3600
 DEFAULT_DISCOVERY_RETRY_SECONDS = 300
 DEFAULT_MAX_CONSECUTIVE_FAILURES = 10
 DEFAULT_CHECKPOINT_RETRY_SECONDS = 60.0
+DEFAULT_HOUSEKEEPING_INTERVAL_SECONDS = 600.0
+#: Legacy raw payloads converted per housekeeping pass (bounded lock hold;
+#: ~5k legacy files clear in about ten passes).
+DEFAULT_RAW_COMPRESS_BATCH = 500
+#: Raw retention is evaluated at most this often (it walks raw metadata).
+DEFAULT_RAW_RETENTION_INTERVAL_SECONDS = 3600.0
 REGULAR_SEASON_TYPE = 2
 
 Clock = Callable[[], datetime]
@@ -321,7 +338,17 @@ class RuntimeLoop:
     checkpoint_timeout_seconds: float = DEFAULT_WORKER_TIMEOUT_SECONDS
     checkpoint_retry_seconds: float = DEFAULT_CHECKPOINT_RETRY_SECONDS
     checkpoint_worker_argv: tuple[str, ...] = WORKER_ARGV
+    housekeeping_interval_seconds: float = DEFAULT_HOUSEKEEPING_INTERVAL_SECONDS
+    raw_compress_batch: int = DEFAULT_RAW_COMPRESS_BATCH
+    #: Finite raw retention, always on: <= 30 days (an override may only
+    #: shorten; see `storage_guard.resolve_raw_retention_days`), 45-day hard
+    #: cap for failed-cycle payloads.
+    raw_retention_days: int = RAW_RETENTION_DAYS
+    raw_retention_interval_seconds: float = DEFAULT_RAW_RETENTION_INTERVAL_SECONDS
+    _raw_retention_at: datetime | None = None
     _checkpoint_retry_at: datetime | None = None
+    _housekeeping_at: datetime | None = None
+    _disk_level: str = LEVEL_OK
     _started_at: datetime | None = None
     _last: dict[str, Any] = field(default_factory=dict)
 
@@ -452,6 +479,58 @@ class RuntimeLoop:
             )
             self._prune()
 
+    def _housekeeping(self, now: datetime) -> None:
+        """Bounded storage, every `housekeeping_interval_seconds`, under the
+        writer lock: sweep abandoned temp/staging files, convert a batch of
+        legacy raw payloads to verified zstd, apply finite raw retention (hourly), and
+        enforce snapshot retention. Never touches canonical history."""
+        self._disk_level = disk_level(free_gib(self.layout.root))
+        if (
+            self._housekeeping_at is not None
+            and (now - self._housekeeping_at).total_seconds() < self.housekeeping_interval_seconds
+        ):
+            return
+        self._housekeeping_at = now
+        with WriterLock(self.layout.writer_lock, timeout_seconds=self.lock_timeout_seconds):
+            swept = sweep_orphans(self.layout, now=now)
+            compressed = compress_legacy_payloads(
+                self.layout.raw_root, max_files=self.raw_compress_batch
+            )
+            retained = None
+            if (
+                self._raw_retention_at is None
+                or (now - self._raw_retention_at).total_seconds()
+                >= self.raw_retention_interval_seconds
+            ):
+                self._raw_retention_at = now
+                retained = prune_raw_payloads(
+                    self.layout, retention_days=self.raw_retention_days, now=now
+                )
+        self._prune()
+        free = free_gib(self.layout.root)
+        self._disk_level = disk_level(free)
+        self._last["storage"] = {
+            "at": now.isoformat(),
+            "free_gib": round(free, 3),
+            "level": self._disk_level,
+            "orphans_removed": len(swept.removed),
+            "orphan_bytes_removed": swept.bytes_removed,
+            "raw_converted": compressed.converted,
+            "raw_bytes_before": compressed.bytes_before,
+            "raw_bytes_after": compressed.bytes_after,
+            "raw_legacy_remaining": compressed.remaining,
+            "raw_address_mismatches": len(compressed.skipped_mismatched_address),
+            "raw_retention_days": self.raw_retention_days,
+            "raw_failed_cycle_cap_days": RAW_FAILED_HARD_CAP_DAYS,
+            "raw_pruned": retained.removed if retained else 0,
+            "raw_pruned_bytes": retained.bytes_removed if retained else 0,
+        }
+        storage = {("disk_level" if k == "level" else k): v for k, v in self._last["storage"].items()}
+        if swept.removed or compressed.converted or (retained and retained.removed):
+            _log("storage_housekeeping", **storage)
+        if self._disk_level != LEVEL_OK:
+            _log("disk_level", logging.WARNING, disk_level=self._disk_level, free_gib=round(free, 3))
+
     def _prune(self) -> None:
         pruned = prune_snapshots(
             self.layout.snapshots,
@@ -572,8 +651,17 @@ class RuntimeLoop:
                 config=self.config,
             ):
                 self.collect(target, now, trigger=TRIGGER_SCHEDULED)
-            self._prepare_checkpoints(target, self.clock())
-        self._periodic_snapshot(self.clock())
+        self._housekeeping(self.clock())
+        if self._disk_level == LEVEL_FAIL_CLOSED:
+            # Fail closed: no new snapshot copy and no checkpoint claim on a
+            # nearly full disk. Collection (above) continues -- live prop
+            # history is irreplaceable. Unprepared official checkpoints are
+            # caught up or recorded missed by the certified planner later.
+            _log("storage_fail_closed", logging.ERROR, free_gib=self._last.get("storage", {}).get("free_gib"))
+        else:
+            if target is not None:
+                self._prepare_checkpoints(target, self.clock())
+            self._periodic_snapshot(self.clock())
         self._write_status(self.clock(), target, state="running")
         return target
 

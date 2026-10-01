@@ -248,7 +248,7 @@ def test_prepare_installs_only_the_lightweight_runtime_extras(host: Host) -> Non
     host.prepare(SHA_A)
     pip = [line for line in host.log_lines() if "-m pip install" in line]
     assert len(pip) == 1
-    assert pip[0].endswith(f"-e {host.release_dir(SHA_A)}[orchestration,runtime]")
+    assert pip[0].endswith(f"-e {host.release_dir(SHA_A)}[runtime]")
 
 
 def test_prepare_runs_every_pre_activation_check_from_the_candidate_venv(host: Host) -> None:

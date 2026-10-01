@@ -382,6 +382,13 @@ def _build_loop(
             provider, warehouse, goat=bool(cfg.get_path("provider.bdl.tier.goat", False))
         ).bootstrap()
 
+    from nflprops.platform.storage_guard import resolve_raw_retention_days
+
+    retention_days, retention_warning = resolve_raw_retention_days(
+        os.environ.get("NFLPROPS_RAW_RETENTION_DAYS")
+    )
+    if retention_warning:
+        typer.echo(f"WARNING: {retention_warning}", err=True)
     return RuntimeLoop(
         layout=layout,
         warehouse=warehouse,
@@ -400,6 +407,7 @@ def _build_loop(
                 "NFLPROPS_CHECKPOINT_PREPARE_TIMEOUT_SECONDS", DEFAULT_WORKER_TIMEOUT_SECONDS
             )
         ),
+        raw_retention_days=retention_days,
     )
 
 

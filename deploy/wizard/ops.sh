@@ -271,11 +271,29 @@ root = Path(sys.argv[1])
 canonical = root / "state" / "canonical"
 snap_root = root / "snapshots"
 
+SEEN = set()  # (dev, inode): hard-linked snapshot files count once overall
+
+
 def tree_bytes(path):
     return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
 
+
+def physical_bytes(path):
+    total = 0
+    for p in path.rglob("*"):
+        if p.is_file():
+            st = p.stat()
+            if (st.st_dev, st.st_ino) not in SEEN:
+                SEEN.add((st.st_dev, st.st_ino))
+                total += st.st_size
+    return total
+
 requests = read_table(canonical, "remote_checkpoint_requests")
-protecting_states = ("PENDING_REMOTE_EXECUTION", "NOT_EXECUTABLE")
+try:  # the deployed release's own protection rule
+    from nflprops.platform.checkpoint_prepare import SNAPSHOT_PROTECTING_STATES as protecting_states
+except ImportError:  # releases before bounded storage
+    protecting_states = ("PENDING_REMOTE_EXECUTION", "NOT_EXECUTABLE")
+print(f"protecting_states={list(protecting_states)}")
 by_snapshot = {}
 if requests.height:
     for row in requests.iter_rows(named=True):
@@ -288,10 +306,12 @@ snapshots = list_snapshots(snap_root)
 unprotected = [s.snapshot_id for s in snapshots if s.snapshot_id not in protected]
 kept_by_policy = set(unprotected[-keep:])
 listed = {s.snapshot_id for s in snapshots}
-totals = {"all": 0, "not_executable_only": 0, "beyond_policy_unprotected": 0}
+totals = {"all": 0, "physical": 0, "not_executable_only": 0, "beyond_policy_unprotected": 0}
 print(f"retention_keep={keep}")
 for s in snapshots:
     size = tree_bytes(snap_root / s.snapshot_id)
+    unique = physical_bytes(snap_root / s.snapshot_id)
+    totals["physical"] += unique
     states = sorted(by_snapshot.get(s.snapshot_id, []))
     prot = s.snapshot_id in protected
     ne_only = prot and all(st in ("NOT_EXECUTABLE", "COMPLETED") for st in states) and "NOT_EXECUTABLE" in states
@@ -301,7 +321,8 @@ for s in snapshots:
     if not prot and s.snapshot_id not in kept_by_policy:
         totals["beyond_policy_unprotected"] += size
     print(json.dumps({
-        "snapshot_id": s.snapshot_id, "bytes": size, "created_at": str(s.created_at),
+        "snapshot_id": s.snapshot_id, "bytes": size, "new_physical_bytes": unique,
+        "created_at": str(s.created_at),
         "retained_by_policy": s.snapshot_id in kept_by_policy, "protected_by_request": prot,
         "request_states": states, "protected_only_by_not_executable": ne_only,
     }, sort_keys=True))
