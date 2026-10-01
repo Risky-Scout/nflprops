@@ -7,6 +7,7 @@ name: Wizard Runtime Ops
 # the operation is a choice input and every argument is format-validated.
 #
 #   status / report / verify-snapshot   read-only
+#   inventory                           read-only RUNTIME_ROOT disk inventory
 #   collect-once                        ONE explicit MANUAL collection cycle
 #   manual-checkpoint                   claim + PREPARE one MANUAL checkpoint
 #                                       (never science, never publication)
@@ -30,6 +31,7 @@ on:
           - manual-checkpoint
           - verify-snapshot
           - restart
+          - inventory
       game_id:
         description: "manual-checkpoint: canonical game id (UUID)"
         required: false

@@ -534,6 +534,7 @@ def test_ops_workflow_is_main_only_fixed_menu() -> None:
     options = doc[True]["workflow_dispatch"]["inputs"]["operation"]["options"]
     assert options == [
         "status", "report", "collect-once", "manual-checkpoint", "verify-snapshot", "restart",
+        "inventory",
     ]
     assert "refs/heads/main" in WIZARD_OPS.read_text()
     assert doc["jobs"]["ops"]["environment"] == "wizardofodds.com"
