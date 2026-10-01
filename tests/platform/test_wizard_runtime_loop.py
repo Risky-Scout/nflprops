@@ -366,14 +366,19 @@ def _checkpoint_env(
 def test_due_official_checkpoint_is_prepared_never_executed(
     env: dict, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    import nflprops.pipelines.pregame as pregame
+    import importlib.util
 
-    def _forbidden(*args: object, **kwargs: object) -> None:
-        raise AssertionError("checkpoint science must never run on the Wizard runtime")
+    if importlib.util.find_spec("numpy") is not None:
+        import nflprops.pipelines.pregame as pregame
 
-    monkeypatch.setattr(pregame, "compute_game_prediction", _forbidden)
-    monkeypatch.setattr(pregame, "predict_game", _forbidden)
-    monkeypatch.setattr(pregame, "predict_week", _forbidden)
+        def _forbidden(*args: object, **kwargs: object) -> None:
+            raise AssertionError("checkpoint science must never run on the Wizard runtime")
+
+        monkeypatch.setattr(pregame, "compute_game_prediction", _forbidden)
+        monkeypatch.setattr(pregame, "predict_game", _forbidden)
+        monkeypatch.setattr(pregame, "predict_week", _forbidden)
+    # else: a slim Wizard runtime venv (no science extra) cannot even import
+    # checkpoint science -- the guarantee holds structurally.
 
     kickoff = BASE + 48 * H + 2 * M
     loop, clock = _checkpoint_env(env, kickoff)
@@ -684,7 +689,9 @@ def test_already_pending_catch_ups_are_blocked_on_the_next_pass(
 ) -> None:
     """The live warehouse today: catch-ups prepared PENDING by the previous
     release (bundle published, snapshot taken). The first pass of the gated
-    release retains them NOT_EXECUTABLE; the bundle and its snapshot stay."""
+    release retains them NOT_EXECUTABLE; the request bundle (identity + full
+    PIT data manifest + snapshot reference) stays, and the terminal request
+    no longer pins its full-copy snapshot (bounded storage)."""
     import nflprops.platform.checkpoint_prepare as prepare_module
 
     kickoff = BASE + 20 * H + 2 * M
@@ -710,7 +717,7 @@ def test_already_pending_catch_ups_are_blocked_on_the_next_pass(
         assert requests[name]["snapshot_id"] == snapshot_id
         assert runs[name]["failure_code"] == FAILURE_INSUFFICIENT_PRE_CUTOFF_PIT_DATA
     assert bundle_dir.is_dir()  # never deleted
-    assert snapshot_id in protected_snapshot_ids(env["warehouse"])
+    assert snapshot_id not in protected_snapshot_ids(env["warehouse"])
     assert executable_requests(env["warehouse"]).is_empty()
 
 

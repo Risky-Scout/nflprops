@@ -9,7 +9,7 @@
 # Expects the release archive already uploaded to
 # RUNTIME_ROOT/releases/RELEASE_ID.tar.gz. On success the release
 # RUNTIME_ROOT/releases/RELEASE_ID/ contains the source tree, its OWN
-# virtualenv (.venv, `.[orchestration,runtime]` only -- no training-only
+# virtualenv (.venv, `.[runtime]` only -- no science stack, no Prefect, no training-only
 # extras), a RELEASE_SHA marker, and finally a .prepared marker that
 # activate_release.sh requires. On ANY failure the partial release is
 # deleted and RUNTIME_ROOT/current is never touched (it is only ever
@@ -101,7 +101,7 @@ main() {
   local vpy="$release_dir/.venv/bin/python"
   [ -x "$vpy" ] || fail "$vpy was not created"
   "$vpy" -m pip install --no-cache-dir --disable-pip-version-check --quiet \
-    -e "${release_dir}[orchestration,runtime]" \
+    -e "${release_dir}[runtime]" \
     || fail "dependency installation failed"
 
   # The env file is installed (only if absent, never overwritten) by the

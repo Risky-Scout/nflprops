@@ -834,10 +834,14 @@ def platform_health(
     cfg = load_config()
     layout = resolve_layout_from_config(cfg)
     retention = snapshot_retention()
-    # The SAME protected set snapshot pruning honors (PENDING and retained
-    # NOT_EXECUTABLE requests), so health never counts a snapshot the
-    # runtime is forbidden to prune against retention.
-    from nflprops.platform.checkpoint_prepare import protected_snapshot_ids_at
+    # The SAME protected set snapshot pruning honors (executable PREPARING /
+    # PENDING requests), so health never counts a snapshot the runtime is
+    # forbidden to prune against retention; snapshots released by terminal
+    # requests are reported as awaiting the next prune.
+    from nflprops.platform.checkpoint_prepare import (
+        protected_snapshot_ids_at,
+        request_snapshot_ids_at,
+    )
 
     protected = protected_snapshot_ids_at(layout.warehouse_root)
 
@@ -858,7 +862,7 @@ def platform_health(
     )
     checks["collection_freshness"] = collection_freshness_check(layout.warehouse_root, config=cfg)
     checks["latest_snapshot"] = latest_snapshot_check(layout.snapshots)
-    checks["disk_free"] = disk_free_check(layout.root, minimum_free_gb=2.0)
+    checks["disk_free"] = disk_free_check(layout.root)
     checks["storage_growth"] = storage_growth_check(
         warehouse_root=layout.warehouse_root,
         snapshot_root=layout.snapshots,
@@ -866,6 +870,7 @@ def platform_health(
         retention_limit=retention,
         raw_root=layout.raw_root,
         protected_snapshot_ids=protected,
+        request_snapshot_ids=request_snapshot_ids_at(layout.warehouse_root),
     )
     checks["memory_pressure"] = memory_pressure_check()
     checks["migration_storage_version"] = migration_storage_version_check()
