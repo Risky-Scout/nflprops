@@ -1,0 +1,268 @@
+name: Checkpoint Execute (BLOCK 4)
+
+# BLOCK 4 production round trip for ONE prepared checkpoint request:
+#
+#   Wizard PENDING_REMOTE_EXECUTION
+#     -> select (read-only, runtime owner: `checkpoint executable`)
+#     -> download the immutable request bundle + snapshot, verify both SHAs
+#     -> verify identity/config/PIT manifest/strict-PIT evidence against the
+#        snapshot, run the certified flow at exactly 20,000 draws HERE (never
+#        on Wizard): projections, threshold events, exact PMFs, pricing --
+#        all from the same simulation draws
+#     -> fail-closed calibration / PUBLIC_READY decision
+#     -> immutable result bundle (deterministic manifest + SHA-256, also kept
+#        as a workflow artifact)
+#     -> upload to publications/_incoming, atomic publish by the Wizard
+#        runtime owner, then result-ingest by the runtime owner under the
+#        writer lock (idempotent, crash-resumable) -> request COMPLETED.
+#
+# GitHub never opens the live Wizard warehouse/DuckDB: every Wizard-side
+# write is a fixed `deploy/wizard/ops.sh` operation executed by the runtime
+# owner. If a result bundle for the request is already published (an
+# earlier run died before ingest), this run only resumes the ingest. A
+# request the verification deterministically refuses is recorded
+# NOT_EXECUTABLE (fail closed) so it never blocks the queue.
+#
+# Triggers: workflow_dispatch (optionally an explicit run_id), and a
+# schedule that is OFF until the repository variable
+# CHECKPOINT_EXECUTE_ENABLED is set to 'true' after a Block-4 deploy.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Optional exact pending run_id (64 hex). Empty = the next executable request."
+        required: false
+        type: string
+      verify_only:
+        description: "Verify the request against its immutable snapshot, then stop (no simulation). A deterministic refusal is still recorded NOT_EXECUTABLE. Requires run_id."
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: read
+
+env:
+  RUNTIME_ROOT: /home/wizard-deploy/nflprops
+  WIZARD_RELEASE_PYTHON: /home/wizard-deploy/nflprops/current/.venv/bin/python
+
+concurrency:
+  group: checkpoint-execute
+  cancel-in-progress: false
+
+jobs:
+  execute:
+    name: Execute one pending checkpoint (20,000 draws)
+    if: github.event_name == 'workflow_dispatch' || vars.CHECKPOINT_EXECUTE_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    environment: wizardofodds.com
+    timeout-minutes: 240
+    steps:
+      - name: Enforce main-only + validate input
+        env:
+          RUN_ID: ${{ inputs.run_id }}
+          VERIFY_ONLY: ${{ inputs.verify_only }}
+        run: |
+          if [ "$VERIFY_ONLY" = "true" ] && [ -z "$RUN_ID" ]; then
+            echo "::error::verify_only requires an explicit run_id"; exit 1
+          fi
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::checkpoint execution may only run from main (got $GITHUB_REF)"; exit 1
+          fi
+          if [ -n "$RUN_ID" ] && ! [[ "$RUN_ID" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::run_id must be 64 lowercase hex"; exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -e ".[science,orchestration]"
+
+      - name: Install SSH key and verified known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${{ secrets.WIZARD_SSH_PRIVATE_KEY }}" > ~/.ssh/wizard_deploy_key
+          chmod 600 ~/.ssh/wizard_deploy_key
+          printf '%s\n' "${{ secrets.WIZARD_SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Select the request (read-only)
+        id: select
+        env:
+          SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+          REMOTE: ${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          # shellcheck disable=SC2086
+          ssh $SSH_OPTS "$REMOTE" bash -s -- checkpoint-select "$RUNTIME_ROOT" \
+            < deploy/wizard/ops.sh > "$RUNNER_TEMP/executable.json"
+          python -m nflprops.platform.checkpoint_select \
+            --executable-json "$RUNNER_TEMP/executable.json" \
+            --run-id "$RUN_ID" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Download + verify the immutable request bundle and snapshot
+        if: steps.select.outputs.found == 'true' && steps.select.outputs.published_sha256 == ''
+        env:
+          SCP_OPTS: -i ~/.ssh/wizard_deploy_key -P ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+          REMOTE: ${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}
+          RUN_ID: ${{ steps.select.outputs.run_id }}
+          REQUEST_SHA: ${{ steps.select.outputs.request_bundle_sha256 }}
+          SNAPSHOT_ID: ${{ steps.select.outputs.snapshot_id }}
+          SNAPSHOT_SHA: ${{ steps.select.outputs.snapshot_manifest_sha256 }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/snapshots"
+          # shellcheck disable=SC2086
+          scp -r $SCP_OPTS "$REMOTE:$RUNTIME_ROOT/publications/checkpoint_requests/$RUN_ID" \
+            "$RUNNER_TEMP/request"
+          # shellcheck disable=SC2086
+          scp -r $SCP_OPTS "$REMOTE:$RUNTIME_ROOT/snapshots/$SNAPSHOT_ID" \
+            "$RUNNER_TEMP/snapshots/$SNAPSHOT_ID"
+          python -m nflprops.platform.wizard_runtime bundle-verify \
+            --bundle-dir "$RUNNER_TEMP/request" --expected-manifest-sha256 "$REQUEST_SHA"
+          python -m nflprops.platform.wizard_runtime bundle-verify \
+            --bundle-dir "$RUNNER_TEMP/snapshots/$SNAPSHOT_ID" --expected-manifest-sha256 "$SNAPSHOT_SHA"
+
+      - name: Verify + execute at 20,000 draws (GitHub only)
+        id: execute
+        if: steps.select.outputs.found == 'true' && steps.select.outputs.published_sha256 == ''
+        env:
+          REQUEST_SHA: ${{ steps.select.outputs.request_bundle_sha256 }}
+          VERIFY_ONLY: ${{ inputs.verify_only }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/work" "$RUNNER_TEMP/out"
+          extra=()
+          [ "$VERIFY_ONLY" = "true" ] && extra=(--verify-only)
+          set +e
+          python -m nflprops.platform.wizard_runtime execute-checkpoint "${extra[@]}" \
+            --request-dir "$RUNNER_TEMP/request" \
+            --expected-request-sha256 "$REQUEST_SHA" \
+            --snapshot-root "$RUNNER_TEMP/snapshots" \
+            --work-dir "$RUNNER_TEMP/work" \
+            --out-dir "$RUNNER_TEMP/out" \
+            --science-sha "$GITHUB_SHA" \
+            --workflow-run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          code=$?
+          set -e
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -eq 3 ]; then
+            echo "::warning::verification refused this request; recording it NOT_EXECUTABLE"
+            exit 0
+          fi
+          exit "$code"
+
+      - name: Record a deterministic verification refusal (NOT_EXECUTABLE)
+        if: steps.execute.outputs.exit_code == '3'
+        env:
+          SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+          REMOTE: ${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}
+          RUN_ID: ${{ steps.select.outputs.run_id }}
+        run: |
+          # shellcheck disable=SC2086
+          ssh $SSH_OPTS "$REMOTE" bash -s -- checkpoint-refuse "$RUNTIME_ROOT" \
+            "$RUN_ID" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            < deploy/wizard/ops.sh
+
+      - name: Build the immutable result bundle (deterministic manifest)
+        id: bundle
+        if: steps.execute.outputs.exit_code == '0' && inputs.verify_only != true
+        env:
+          BUNDLE_ID: ${{ steps.select.outputs.bundle_id }}
+          SNAPSHOT_ID: ${{ steps.select.outputs.snapshot_id }}
+        run: |
+          out="$(python -m nflprops.platform.wizard_runtime result-bundle build \
+            --bundle-id "$BUNDLE_ID" \
+            --source-dir "$RUNNER_TEMP/out" \
+            --staging-dir "$RUNNER_TEMP/bundle/$BUNDLE_ID" \
+            --science-sha "$GITHUB_SHA" \
+            --workflow-sha "$GITHUB_SHA" \
+            --data-snapshot-id "$SNAPSHOT_ID")"
+          echo "$out"
+          sha="$(printf '%s\n' "$out" | sed -n 's/.*manifest_sha256=\([0-9a-f]\{64\}\).*/\1/p')"
+          [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::no manifest SHA reported"; exit 1; }
+          echo "manifest_sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Keep the result bundle as a workflow artifact
+        if: steps.execute.outputs.exit_code == '0' && inputs.verify_only != true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.select.outputs.bundle_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bundle/${{ steps.select.outputs.bundle_id }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload + atomic publish by the Wizard runtime owner
+        if: steps.execute.outputs.exit_code == '0' && inputs.verify_only != true
+        env:
+          SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+          SCP_OPTS: -i ~/.ssh/wizard_deploy_key -P ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+          REMOTE: ${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}
+          BUNDLE_ID: ${{ steps.select.outputs.bundle_id }}
+          MANIFEST_SHA: ${{ steps.bundle.outputs.manifest_sha256 }}
+        run: |
+          incoming="$RUNTIME_ROOT/publications/_incoming"
+          staging="$incoming/$BUNDLE_ID.$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
+          final="$RUNTIME_ROOT/publications/$BUNDLE_ID"
+          # Client-side expansion is intended: every interpolated value is
+          # pre-validated (fixed root, checkpoint-result-<64 hex>, numeric
+          # run id/attempt, 64-hex SHA).
+          # shellcheck disable=SC2086,SC2029
+          ssh $SSH_OPTS "$REMOTE" "mkdir -p '$incoming' && rm -rf '$staging'"
+          # shellcheck disable=SC2086
+          scp -r $SCP_OPTS "$RUNNER_TEMP/bundle/$BUNDLE_ID" "$REMOTE:$staging"
+          # shellcheck disable=SC2086,SC2029
+          ssh $SSH_OPTS "$REMOTE" \
+            "$WIZARD_RELEASE_PYTHON -m nflprops.platform.wizard_runtime bundle-verify --bundle-dir '$staging' --expected-manifest-sha256 '$MANIFEST_SHA' && $WIZARD_RELEASE_PYTHON -m nflprops.platform.wizard_runtime bundle-publish --staging-dir '$staging' --final-dir '$final'"
+
+      - name: Ingest the result on Wizard (runtime owner, writer lock, idempotent)
+        id: ingest
+        if: inputs.verify_only != true && (steps.execute.outputs.exit_code == '0' || (steps.select.outputs.found == 'true' && steps.select.outputs.published_sha256 != ''))
+        env:
+          SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+          REMOTE: ${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}
+          BUNDLE_ID: ${{ steps.select.outputs.bundle_id }}
+          MANIFEST_SHA: ${{ steps.bundle.outputs.manifest_sha256 || steps.select.outputs.published_sha256 }}
+        run: |
+          [[ "$MANIFEST_SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::no result manifest SHA"; exit 1; }
+          # shellcheck disable=SC2086
+          ssh $SSH_OPTS "$REMOTE" bash -s -- result-ingest "$RUNTIME_ROOT" "$BUNDLE_ID" "$MANIFEST_SHA" \
+            < deploy/wizard/ops.sh | tee "$RUNNER_TEMP/ingest.json"
+
+      - name: Report
+        if: always()
+        env:
+          FOUND: ${{ steps.select.outputs.found }}
+          RUN_ID: ${{ steps.select.outputs.run_id }}
+          CHECKPOINT: ${{ steps.select.outputs.checkpoint_name }}
+          BUNDLE_ID: ${{ steps.select.outputs.bundle_id }}
+          EXIT_CODE: ${{ steps.execute.outputs.exit_code }}
+          MANIFEST_SHA: ${{ steps.bundle.outputs.manifest_sha256 || steps.select.outputs.published_sha256 }}
+          INGEST: ${{ steps.ingest.outcome }}
+        run: |
+          {
+            echo "## Checkpoint execute"
+            if [ "$FOUND" != "true" ]; then echo "No executable pending request."; exit 0; fi
+            echo "- run_id: \`$RUN_ID\` ($CHECKPOINT)"
+            echo "- execute exit code: \`${EXIT_CODE:-resume-only}\`"
+            echo "- result bundle: \`$BUNDLE_ID\`"
+            echo "- result manifest sha256: \`${MANIFEST_SHA:-none}\`"
+            echo "- Wizard ingest: \`${INGEST:-skipped}\`"
+            if [ -f "$RUNNER_TEMP/out/result.json" ]; then
+              echo '```json'
+              python -c "import json,sys; r=json.load(open(sys.argv[1])); print(json.dumps({k: r[k] for k in ('decision','decision_reasons','calibration_gate','row_counts','n_draws','run')}, indent=2, sort_keys=True))" "$RUNNER_TEMP/out/result.json"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cleanup SSH material and workspace
+        if: always()
+        run: |
+          rm -f ~/.ssh/wizard_deploy_key ~/.ssh/known_hosts
+          rm -rf "$RUNNER_TEMP/request" "$RUNNER_TEMP/snapshots" "$RUNNER_TEMP/work"

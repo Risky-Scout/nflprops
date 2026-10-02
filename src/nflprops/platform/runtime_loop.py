@@ -27,7 +27,13 @@ the canonical live warehouse on the Wizard host. Each tick it:
    (`platform.checkpoint_worker`): its memory is returned to the OS when it
    exits, and a stuck pass is killed, fails closed and is retried later;
 6. takes a periodic immutable snapshot (deduplicated; bounded retention
-   that never prunes a snapshot a pending checkpoint request references).
+   that never prunes a snapshot a pending checkpoint request references);
+7. (BLOCK 4) every few hours, appends completed-game outcome versions for
+   recently finished games of the target season (`ingest-stats`, genuine
+   receipt time, immutable versions) in a short-lived, time-bounded child
+   process -- never within `outcome_ingest_quiet_seconds` of a kickoff, so
+   it can never delay near-game collection; a failure is logged and retried,
+   never fatal.
 
 Nothing here imports Prefect: calling a Prefect flow outside a Prefect
 server starts a temporary local API server (memory + a listening port),
@@ -48,6 +54,7 @@ import logging
 import os
 import signal
 import socket
+import subprocess
 import sys
 import threading
 from collections.abc import Callable
@@ -121,6 +128,26 @@ DEFAULT_RAW_COMPRESS_BATCH = 500
 #: Raw retention is evaluated at most this often (it walks raw metadata).
 DEFAULT_RAW_RETENTION_INTERVAL_SECONDS = 3600.0
 REGULAR_SEASON_TYPE = 2
+
+#: BLOCK 4 recurring outcome ingest (final games -> versioned
+#: player/team_game_stats). 0 disables it.
+DEFAULT_OUTCOME_INGEST_INTERVAL_SECONDS = 3 * 3600.0
+DEFAULT_OUTCOME_INGEST_RETRY_SECONDS = 900.0
+DEFAULT_OUTCOME_INGEST_TIMEOUT_SECONDS = 600.0
+#: Never start within this long of the nearest upcoming kickoff.
+DEFAULT_OUTCOME_INGEST_QUIET_SECONDS = 3 * 3600.0
+#: Final games played this recently are (re)fetched -- recent results plus
+#: any provider correction to them (versioned, never overwritten).
+OUTCOME_INGEST_RECENT_DAYS = 10
+OUTCOME_INGEST_ARGV: tuple[str, ...] = (
+    sys.executable, "-m", "nflprops.platform.wizard_runtime", "ingest-stats",
+)
+#: Operator hold: while `<runtime_root>/state/<this file>` exists the
+#: recurring ingest never starts (wizard-ops outcome-ingest-hold/-release;
+#: plain files, so the hold works before and across deploys).
+OUTCOME_INGEST_HOLD_FILE = "outcome_ingest.hold"
+#: Same thread bound as the checkpoint-preparation child (TasksMax).
+OUTCOME_INGEST_ENV_OVERRIDES: dict[str, str] = {"POLARS_MAX_THREADS": "1"}
 
 Clock = Callable[[], datetime]
 
@@ -345,6 +372,14 @@ class RuntimeLoop:
     #: cap for failed-cycle payloads.
     raw_retention_days: int = RAW_RETENTION_DAYS
     raw_retention_interval_seconds: float = DEFAULT_RAW_RETENTION_INTERVAL_SECONDS
+    #: 0 = off (tests and any other embedding); the production runtime
+    #: (`wizard_runtime run`) enables it at DEFAULT_OUTCOME_INGEST_INTERVAL_SECONDS.
+    outcome_ingest_interval_seconds: float = 0.0
+    outcome_ingest_retry_seconds: float = DEFAULT_OUTCOME_INGEST_RETRY_SECONDS
+    outcome_ingest_timeout_seconds: float = DEFAULT_OUTCOME_INGEST_TIMEOUT_SECONDS
+    outcome_ingest_quiet_seconds: float = DEFAULT_OUTCOME_INGEST_QUIET_SECONDS
+    outcome_ingest_argv: tuple[str, ...] = OUTCOME_INGEST_ARGV
+    _outcome_ingest_due_at: datetime | None = None
     _raw_retention_at: datetime | None = None
     _checkpoint_retry_at: datetime | None = None
     _housekeeping_at: datetime | None = None
@@ -563,6 +598,57 @@ class RuntimeLoop:
              bytes=info.total_bytes)
         self._prune()
 
+    def _ingest_outcomes(self, target: Target | None, now: datetime) -> None:
+        """BLOCK 4 step 7: bounded, synchronous, short-lived child (memory
+        returned on exit; never overlaps the checkpoint child). The child
+        takes the writer lock itself, only for its appends."""
+        if self.outcome_ingest_interval_seconds <= 0 or target is None:
+            return
+        if (self.layout.state / OUTCOME_INGEST_HOLD_FILE).exists():
+            self._last["outcome_ingest"] = {"held": True, "at": now.isoformat()}
+            return
+        if self._outcome_ingest_due_at is not None and now < self._outcome_ingest_due_at:
+            return
+        until_kickoff = (target.nearest_kickoff - now).total_seconds()
+        if 0 <= until_kickoff < self.outcome_ingest_quiet_seconds:
+            return  # near-game collection always wins
+        argv = [
+            *self.outcome_ingest_argv,
+            "--seasons", str(target.season),
+            "--recent-days", str(OUTCOME_INGEST_RECENT_DAYS),
+        ]
+        record: dict[str, Any] = {"at": now.isoformat(), "season": target.season}
+        try:
+            completed = subprocess.run(
+                argv,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=self.outcome_ingest_timeout_seconds,
+                env={**os.environ, **OUTCOME_INGEST_ENV_OVERRIDES},
+                check=False,
+            )
+            record["exit_code"] = completed.returncode
+            record["ok"] = completed.returncode == 0
+            tail = (completed.stdout if record["ok"] else completed.stderr)[-2000:]
+            record["detail"] = tail.decode("utf-8", errors="replace").strip()
+        except subprocess.TimeoutExpired:
+            record.update(ok=False, exit_code=None,
+                          detail=f"exceeded {self.outcome_ingest_timeout_seconds:.0f}s")
+        except OSError as exc:
+            record.update(ok=False, exit_code=None, detail=f"could not start: {exc}")
+        wait = (
+            self.outcome_ingest_interval_seconds
+            if record["ok"]
+            else self.outcome_ingest_retry_seconds
+        )
+        self._outcome_ingest_due_at = now + timedelta(seconds=wait)
+        self._last["outcome_ingest"] = record
+        _log(
+            "outcome_ingest",
+            logging.INFO if record["ok"] else logging.WARNING,
+            **{k: v for k, v in record.items() if k != "detail"},
+        )
+
     # -- schedule introspection (read-only) ----------------------------
 
     def next_collection_due_at(self, target: Target | None, now: datetime) -> datetime | None:
@@ -662,6 +748,7 @@ class RuntimeLoop:
             if target is not None:
                 self._prepare_checkpoints(target, self.clock())
             self._periodic_snapshot(self.clock())
+            self._ingest_outcomes(target, self.clock())
         self._write_status(self.clock(), target, state="running")
         return target
 

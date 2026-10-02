@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 
 import polars as pl
 
+from nflprops.data.outcome_versions import latest_final
 from nflprops.market.odds import american_to_decimal
 from nflprops.market.rules import (
     SettlementRuleSet,
@@ -60,6 +61,9 @@ def reconcile_settlement_stats(
     team_stats: pl.DataFrame,
 ) -> pl.DataFrame:
     """Fill only player stat zeroes mathematically proved by team accounting."""
+    # Settlement truth is the latest corrected/final version of each outcome.
+    player_stats = latest_final(player_stats, "player_game_stats")
+    team_stats = latest_final(team_stats, "team_game_stats")
     if player_stats.is_empty():
         return player_stats
 
@@ -200,6 +204,7 @@ def settle_predictions(
     *,
     rules: SettlementRuleSet | None = None,
 ) -> pl.DataFrame:
+    player_stats = latest_final(player_stats, "player_game_stats")
     if predictions.is_empty() or player_stats.is_empty():
         return pl.DataFrame()
 

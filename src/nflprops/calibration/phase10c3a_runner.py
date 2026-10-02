@@ -79,6 +79,7 @@ from nflprops.calibration.historical_runner import (
     compute_training_manifest_sha256,
     list_final_games,
     load_warehouse_tables,
+    official_tables,
     replay_games,
 )
 from nflprops.calibration.joint_feature_contract import (
@@ -87,6 +88,7 @@ from nflprops.calibration.joint_feature_contract import (
 )
 from nflprops.calibration.scoring import skill_score
 from nflprops.calibration.weighted_pmf import build_weighted_first_td_simplex
+from nflprops.data.evidence_policy import EvidenceClass, classify_tables, official_view
 from nflprops.data.warehouse import Warehouse
 from nflprops.domain.enums import PropType
 
@@ -157,10 +159,19 @@ class RunnerConfig:
     regularization_lambda: float
     max_fit_iterations: int
     expect_data_manifest_sha256: str | None
+    #: "official" (default): RESEARCH_ONLY estimated-availability rows are
+    #: dropped before replay, so only genuinely PIT-known data is used.
+    #: "research": every row is used, and the run can NEVER be promotion,
+    #: recalibration-approval or certification evidence.
+    evidence: str = "official"
 
     def __post_init__(self) -> None:
         if self.mode not in ("production", "smoke"):
             raise ConfigurationError(f"--mode must be 'production' or 'smoke', got {self.mode!r}")
+        if self.evidence not in ("official", "research"):
+            raise ConfigurationError(
+                f"--evidence must be 'official' or 'research', got {self.evidence!r}"
+            )
         if self.mode == "production" and self.n_draws != PRODUCTION_N_DRAWS:
             raise ConfigurationError(
                 f"--mode production requires --n-draws {PRODUCTION_N_DRAWS} exactly "
@@ -194,6 +205,11 @@ def parse_args(argv: list[str] | None = None) -> RunnerConfig:
         help="production: locked to --n-draws 20000, may report ELIGIBLE_FOR_PROMOTION. "
              "smoke: any draw count, always reports INSUFFICIENT_EVIDENCE.",
     )
+    parser.add_argument(
+        "--evidence", choices=("official", "research"), default="official",
+        help="official: only genuinely PIT-known rows (RESEARCH_ONLY estimated-availability "
+             "rows are excluded). research: all rows; never promotion evidence.",
+    )
     parser.add_argument("--model-version", default="phase10c3a-real-run-v1")
     parser.add_argument("--regularization-lambda", type=float, default=0.01)
     parser.add_argument("--max-fit-iterations", type=int, default=200)
@@ -215,6 +231,7 @@ def parse_args(argv: list[str] | None = None) -> RunnerConfig:
         regularization_lambda=ns.regularization_lambda,
         max_fit_iterations=ns.max_fit_iterations,
         expect_data_manifest_sha256=ns.expect_data_manifest_sha256,
+        evidence=ns.evidence,
     )
 
 
@@ -468,6 +485,16 @@ def run(config: RunnerConfig) -> dict[str, Any]:
         season_min=config.season_min,
         season_max=config.season_max,
     )
+    source_class, estimated_rows = classify_tables(tables.as_mapping())
+    if config.evidence == "official":
+        # Official evidence: only what was genuinely known at each cutoff.
+        tables = official_tables(tables)
+        games = official_view(games)
+        evidence_class = EvidenceClass.OFFICIAL_PIT_FAITHFUL
+    else:
+        evidence_class = EvidenceClass.RESEARCH_ONLY
+    log(f"evidence={config.evidence} class={evidence_class} source={source_class} "
+        f"estimated_rows={estimated_rows}")
     log(f"total final games: {games.height}")
 
     def progress(i: int, total: int, _gid: str) -> None:
@@ -585,8 +612,8 @@ def run(config: RunnerConfig) -> dict[str, Any]:
     overall_promo = evaluate_promotion_gate(list(fold_results), games_by_fold)
     faithful_evidence_exists = any(fr["pit_faithful_scoring_game_count"] > 0 for fr in fold_reports)
 
-    if config.mode == "smoke":
-        promotion_decision = "INSUFFICIENT_EVIDENCE"
+    if config.mode == "smoke" or evidence_class is not EvidenceClass.OFFICIAL_PIT_FAITHFUL:
+        promotion_decision = "INSUFFICIENT_EVIDENCE"  # never promotable
     elif not faithful_evidence_exists:
         promotion_decision = "INSUFFICIENT_EVIDENCE"  # INSUFFICIENT_PIT_FAITHFUL_EVIDENCE
     elif overall_promo is None:
@@ -648,6 +675,13 @@ def run(config: RunnerConfig) -> dict[str, Any]:
         "model_version": config.model_version,
         "data_root": str(config.data_root),
         "data_root_manifest_sha256": data_manifest_sha256,
+        "evidence_class": str(evidence_class),
+        "evidence_policy": {
+            "requested": config.evidence,
+            "source_data_class": str(source_class),
+            "estimated_rows_in_source": estimated_rows,
+            "estimated_rows_excluded": estimated_rows if config.evidence == "official" else {},
+        },
         "season_min": config.season_min,
         "season_max": config.season_max,
         "replay_seconds": replay_seconds,

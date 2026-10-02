@@ -51,12 +51,18 @@ from nflprops.backtest.leakage import LeakageError as BacktestLeakageError
 from nflprops.backtest.provenance import StateProvenanceContext
 from nflprops.config import Config
 from nflprops.data.warehouse import Warehouse
+from nflprops.distributions.build import build_player_prop_distributions
 from nflprops.errors import LeakageError as CoreLeakageError
 from nflprops.orchestration.checkpoints import (
     CheckpointAction,
     CheckpointName,
 )
-from nflprops.orchestration.dispatch_plan import DispatchSettings, plan_due_checkpoints
+from nflprops.orchestration.dispatch_plan import (
+    DispatchSettings,
+    as_run_store_backend,
+    plan_due_checkpoints,
+)
+from nflprops.orchestration.distribution_store import persist_player_prop_distributions
 from nflprops.orchestration.pricing_store import persist_player_prop_pricing
 from nflprops.orchestration.projection_store import persist_player_game_projections
 from nflprops.orchestration.run_store import (
@@ -110,6 +116,12 @@ class CheckpointRunContext:
     simulation_config: SimulationConfig | None = None
     player_state_config: PlayerStateConfig | None = None
     team_state_config: TeamStateConfig | None = None
+    #: BLOCK 4: also persist the canonical Phase-10B exact-PMF product
+    #: (`player_prop_distributions`) from the SAME simulation, after the
+    #: threshold artifact and before any pricing. Off by default so every
+    #: pre-Block-4 caller is unchanged; the GitHub checkpoint executor
+    #: turns it on.
+    persist_distributions: bool = False
 
 
 def _classify_exception(exc: BaseException) -> tuple[str, str]:
@@ -179,6 +191,12 @@ class _CheckpointExecution:
     legacy_mirror_failed: bool
     legacy_mirror_failure_code: str | None
     legacy_mirror_failure_detail: str | None
+    #: BLOCK 4 (only when `ctx.persist_distributions`): the exact-PMF
+    #: build/persist raised AFTER both canonical model artifacts persisted
+    #: -> PARTIAL / NOT_PUBLISHED, model artifacts retained, no pricing ran.
+    distribution_rows_persisted: int = 0
+    distribution_failed: bool = False
+    distribution_failure_detail: str | None = None
 
 
 @task(
@@ -330,6 +348,48 @@ def _run_game_checkpoint_task(
             legacy_mirror_failure_detail=None,
         )
 
+    # --- BLOCK 4: exact PMFs from the SAME simulation (failure -> PARTIAL) --
+    # Phase-10B builder + certified store (E*25 distributions, parent
+    # provenance / completeness against the just-persisted projections,
+    # immutability, atomicity). Runs before pricing so a run is never
+    # priced without its exact PMF product when one was requested.
+    distribution_rows = 0
+    if ctx.persist_distributions:
+        try:
+            distributions = build_player_prop_distributions(
+                simulation, player_states=computation.player_states
+            )
+            distribution_result = persist_player_prop_distributions(
+                as_run_store_backend(ctx.warehouse),
+                distributions,
+                run_id=ctx.run_id,
+                season=ctx.season,
+                week=ctx.week,
+                created_at=datetime.now(UTC),
+            )
+            distribution_rows = distribution_result.distribution_count
+        except Exception as exc:
+            code, detail = _classify_exception(exc)
+            return _CheckpointExecution(
+                game_modeled=True,
+                eligible_players=len(eligible),
+                projection_rows_persisted=projections.height,
+                threshold_rows_persisted=threshold_result.total,
+                priced_row_count=0,
+                threshold_failed=False,
+                threshold_failure_code=None,
+                threshold_failure_detail=None,
+                pricing_failed=False,
+                pricing_failure_code=None,
+                pricing_failure_detail=None,
+                canonical_pricing_persisted=False,
+                legacy_mirror_failed=False,
+                legacy_mirror_failure_code=None,
+                legacy_mirror_failure_detail=None,
+                distribution_failed=True,
+                distribution_failure_detail=f"{code}: {detail}",
+            )
+
     def _failed_execution(
         *, pricing_failure_code: str, pricing_failure_detail: str
     ) -> _CheckpointExecution:
@@ -349,6 +409,7 @@ def _run_game_checkpoint_task(
             legacy_mirror_failed=False,
             legacy_mirror_failure_code=None,
             legacy_mirror_failure_detail=None,
+            distribution_rows_persisted=distribution_rows,
         )
 
     # --- PHASE 6/9B: price current sportsbook markets, exactly once -------
@@ -413,6 +474,7 @@ def _run_game_checkpoint_task(
             legacy_mirror_failed=True,
             legacy_mirror_failure_code="LEGACY_PRICING_MIRROR_ERROR",
             legacy_mirror_failure_detail=f"{code}: {detail}",
+            distribution_rows_persisted=distribution_rows,
         )
 
     return _CheckpointExecution(
@@ -431,6 +493,7 @@ def _run_game_checkpoint_task(
         legacy_mirror_failed=False,
         legacy_mirror_failure_code=None,
         legacy_mirror_failure_detail=None,
+        distribution_rows_persisted=distribution_rows,
     )
 
 
@@ -612,6 +675,20 @@ def game_checkpoint_flow(ctx: CheckpointRunContext, *, now: datetime) -> Predict
             publication_status=PublicationStatus.NOT_PUBLISHED,
             failure_code=execution.threshold_failure_code,
             failure_detail=execution.threshold_failure_detail,
+            flow_completed_at=now,
+        )
+
+    if execution.distribution_failed:
+        # BLOCK 4: both canonical model artifacts persisted; the requested
+        # exact-PMF product then failed (the certified store is atomic, so
+        # nothing partial exists) and no pricing ran.
+        return update_run_status(
+            as_run_store_backend(ctx.warehouse),
+            ctx.run_id,
+            status=PredictionRunStatus.PARTIAL,
+            publication_status=PublicationStatus.NOT_PUBLISHED,
+            failure_code="DISTRIBUTION_ERROR",
+            failure_detail=execution.distribution_failure_detail,
             flow_completed_at=now,
         )
 
