@@ -9,12 +9,16 @@ availability only, corrections appended, nothing ever fabricated.
 
 from __future__ import annotations
 
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import polars as pl
 import pytest
-from tests.orchestration._fixtures import (
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "orchestration"))
+
+from _fixtures import (
     HOME_PLAYER_ID,
     TARGET_GAME_ID,
     _player_game_row,

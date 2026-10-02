@@ -9,13 +9,17 @@
 
 from __future__ import annotations
 
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import polars as pl
 import pytest
-from tests.calibration.test_phase10c3a_runner import _build_two_season_warehouse
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "calibration"))
+
+from test_phase10c3a_runner import _build_two_season_warehouse
 
 from nflprops.calibration.historical_runner import WarehouseTables, official_tables
 from nflprops.calibration.phase10c3a_runner import (
