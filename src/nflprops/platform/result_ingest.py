@@ -154,7 +154,9 @@ def _validate(
     return result, bundle_run, tables, manifest.bundle_id, manifest.manifest_sha256
 
 
-def _check_live_request(warehouse: Warehouse, result: dict[str, Any], bundle_run: dict) -> dict:
+def _check_live_request(
+    warehouse: Warehouse, result: dict[str, Any], bundle_run: dict[str, Any]
+) -> dict[str, Any]:
     requests = _read_requests(warehouse).filter(pl.col("run_id") == result["run_id"])
     if requests.height != 1:
         raise ResultIngestError(f"no live checkpoint request for run {result['run_id']}")

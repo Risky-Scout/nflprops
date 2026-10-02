@@ -273,7 +273,7 @@ class FakeProvider:
     def player_season_stats(self, season, player_ids=None) -> list[PlayerSeasonStat]:
         return []
 
-    def team_game_stats(self, seasons=None, game_ids=None, team_ids=None) -> list[TeamGameStat]:
+    def team_game_stats(self, seasons=None, game_ids=None, team_ids=None, season_type=None) -> list[TeamGameStat]:
         return []
 
     def team_season_stats(self, season, team_ids) -> list[TeamSeasonStat]:

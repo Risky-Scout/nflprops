@@ -24,6 +24,7 @@ from nflprops.data.availability import (
     reconstruct_game_result_availability,
     use_event_time_as_available,
 )
+from nflprops.data.evidence_policy import estimated_availability_allowed
 from nflprops.data.outcome_versions import append_outcome_versions
 from nflprops.data.quality import enforce, validate_core
 from nflprops.data.raw_store import RawStore, make_raw_hook
@@ -258,14 +259,15 @@ class LeanIngestor:
         historical_backfill: bool = True,
     ) -> None:
         season_types = [2, 3] if include_postseason else [2]
+        # Reconstructed (estimated) availability is RESEARCH_ONLY and is
+        # never written for STRICT_PIT_FIRST_SEASON or later: those seasons
+        # keep the provider boundary's genuine receipt time everywhere.
+        estimate = historical_backfill and estimated_availability_allowed(season)
         games_records = self.provider.games(
             seasons=[season], season_types=season_types
         )
         games = records_to_frame(games_records)
-        if historical_backfill:
-            games_to_store = _game_backfill_snapshots(games)
-        else:
-            games_to_store = games
+        games_to_store = _game_backfill_snapshots(games) if estimate else games
         self.warehouse.append(
             "games",
             games_to_store,
@@ -289,22 +291,22 @@ class LeanIngestor:
             )
         ps = records_to_frame(ps_records)
         ts = records_to_frame(ts_records)
-        if historical_backfill:
+        if estimate:
             ps = reconstruct_game_result_availability(ps, games, lag_hours=12)
             ts = reconstruct_game_result_availability(ts, games, lag_hours=12)
 
         # Immutable versioned outcome history: a provider correction is a
         # new version (visible only from when it was first seen); a stored
         # version is never replaced. The historical first version keeps its
-        # explicitly flagged availability estimate.
+        # explicitly flagged RESEARCH_ONLY availability estimate (pre-2026 only).
         ingest_run_id = f"lean-ingest-{season}-{datetime.now(UTC).isoformat()}"
         append_outcome_versions(
             self.warehouse, "player_game_stats", ps,
-            ingest_run_id=ingest_run_id, allow_estimated=historical_backfill,
+            ingest_run_id=ingest_run_id, allow_estimated=estimate, season=season,
         )
         append_outcome_versions(
             self.warehouse, "team_game_stats", ts,
-            ingest_run_id=ingest_run_id, allow_estimated=historical_backfill,
+            ingest_run_id=ingest_run_id, allow_estimated=estimate, season=season,
         )
 
         # QA-only season aggregates.
@@ -353,7 +355,7 @@ class LeanIngestor:
                             continue
                     if rows:
                         frame = records_to_frame(rows)
-                        if historical_backfill:
+                        if estimate:
                             frame = _set_weekly_availability(
                                 frame, available_at=available
                             )

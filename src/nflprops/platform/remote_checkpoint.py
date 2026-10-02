@@ -42,6 +42,10 @@ from typing import Any
 import polars as pl
 
 from nflprops.config import Config, config_sha256
+from nflprops.data.evidence_policy import (
+    EvidencePolicyError,
+    require_official_warehouse,
+)
 from nflprops.data.warehouse import Warehouse
 from nflprops.errors import NflpropsError
 from nflprops.orchestration.checkpoints import CheckpointName
@@ -202,6 +206,12 @@ def verify_request_against_snapshot(
     )
     if blocker is not None:
         raise RemoteExecutionError(blocker)
+    # Official checkpoint evidence is strict PIT: a snapshot holding any
+    # RESEARCH_ONLY (estimated-availability) row is never executed.
+    try:
+        require_official_warehouse(warehouse, context=f"checkpoint {run.run_id}")
+    except EvidencePolicyError as exc:
+        raise RemoteExecutionError(str(exc)) from exc
     return run
 
 
@@ -212,7 +222,7 @@ def evaluate_calibration_gate(warehouse: Warehouse, run: PredictionRunRecord) ->
     from nflprops.calibration.joint_feature_contract import FEATURE_CONTRACT_VERSION
     from nflprops.calibration.registry import resolve_calibration_champion
 
-    base = {
+    base: dict[str, Any] = {
         "scope_type": CALIBRATION_SCOPE_TYPE,
         "base_model_version": run.model_version,
         "simulation_config_version": SIMULATION_CONFIG_VERSION,
@@ -230,7 +240,15 @@ def evaluate_calibration_gate(warehouse: Warehouse, run: PredictionRunRecord) ->
 
     for scope in (run.checkpoint_name, "ALL_PREGAME_CHECKPOINTS"):
         artifact = resolve_calibration_champion(
-            as_run_store_backend(warehouse), checkpoint_scope=scope, contract=contract, **base
+            as_run_store_backend(warehouse),
+            scope_type=CALIBRATION_SCOPE_TYPE,
+            checkpoint_scope=scope,
+            base_model_version=run.model_version,
+            simulation_config_version=SIMULATION_CONFIG_VERSION,
+            feature_contract_version=FEATURE_CONTRACT_VERSION,
+            prop_contract_version=PROP_CONTRACT_VERSION,
+            calibration_contract_version=CALIBRATION_CONTRACT_VERSION,
+            contract=contract,
         )
         if artifact is not None:
             # A champion resolves, but live application of a joint-game

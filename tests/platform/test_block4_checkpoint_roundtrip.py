@@ -226,6 +226,32 @@ def test_executor_refuses_a_snapshot_whose_pit_data_changed(
         )
 
 
+def test_executor_refuses_a_snapshot_with_research_only_estimates(
+    wizard: dict, tmp_path: Path
+) -> None:
+    """Official checkpoint evidence is strict PIT: one estimated-availability
+    row anywhere in the PIT tables -- even for an unrelated game that leaves
+    the checkpoint's own data manifest unchanged -- refuses execution."""
+    prepared = wizard["prepared"]
+    request, _sha = load_verified_request(prepared.request_bundle_dir)
+    scratch = tmp_path / "runner" / "warehouse"
+    info = restore_snapshot(wizard["layout"].snapshots, request["snapshot_id"], scratch)
+    warehouse = Warehouse(scratch)
+    stats = warehouse.read("player_game_stats")
+    assert "available_at_is_estimated" in stats.columns  # schema unchanged below
+    research_row = stats.head(1).with_columns(
+        pl.lit("research:other-game").alias("canonical_game_id"),
+        pl.lit("research:other-team").alias("canonical_team_id"),
+        pl.lit(True).alias("available_at_is_estimated"),
+    )
+    warehouse.write("player_game_stats", pl.concat([stats, research_row]))
+    with pytest.raises(RemoteExecutionError, match="RESEARCH_ONLY"):
+        verify_request_against_snapshot(
+            request, warehouse, wizard["config"], snapshot_id=info.snapshot_id,
+            snapshot_manifest_sha256=info.manifest_sha256,
+        )
+
+
 def test_ingest_refuses_a_result_for_a_request_not_pending(
     wizard: dict, tmp_path: Path
 ) -> None:

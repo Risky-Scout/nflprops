@@ -76,6 +76,7 @@ class StatisticsProvider(Protocol):
         seasons: Sequence[int] | None = None,
         game_ids: Sequence[str] | None = None,
         team_ids: Sequence[str] | None = None,
+        season_type: int | None = None,
     ) -> Sequence[TeamGameStat]: ...
 
     def team_season_stats(

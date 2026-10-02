@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -45,6 +45,7 @@ import polars as pl
 from nflprops.backtest.provenance import build_state_provenance_context
 from nflprops.calibration.artifact import DIRECTLY_LABELED_PROP_TYPES
 from nflprops.calibration.challenger import LabeledGame, PropLabel
+from nflprops.data.evidence_policy import official_view
 from nflprops.data.outcome_versions import latest_final
 from nflprops.domain.enums import PropType
 from nflprops.market.rules import (
@@ -98,6 +99,18 @@ class WarehouseTables:
     injuries: pl.DataFrame
     injury_runs: pl.DataFrame
     game_odds: pl.DataFrame
+
+    def as_mapping(self) -> dict[str, pl.DataFrame]:
+        return {f.name: getattr(self, f.name) for f in fields(self)}
+
+
+def official_tables(tables: WarehouseTables) -> WarehouseTables:
+    """`tables` without any RESEARCH_ONLY (estimated-availability) row --
+    the only view official replay/recalibration/promotion may consume
+    (`nflprops.data.evidence_policy`)."""
+    return WarehouseTables(
+        **{name: official_view(frame) for name, frame in tables.as_mapping().items()}
+    )
 
 
 def load_warehouse_tables(backend: StorageBackend) -> WarehouseTables:

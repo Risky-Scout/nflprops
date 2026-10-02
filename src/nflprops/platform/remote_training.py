@@ -285,7 +285,11 @@ def _adapt_structured_runner(
                 "reproducibility_check": result.get("reproducibility_check"),
             },
             "promotion_eligibility_result": {
-                "eligible": result.get("promotion_decision") == "ELIGIBLE_FOR_PROMOTION",
+                # Promotion evidence must be OFFICIAL (strict PIT): a run
+                # reporting no evidence class, or RESEARCH_ONLY, never is.
+                "eligible": result.get("promotion_decision") == "ELIGIBLE_FOR_PROMOTION"
+                and result.get("evidence_class") == "OFFICIAL_PIT_FAITHFUL",
+                "evidence_class": result.get("evidence_class"),
                 "decision": result.get("promotion_decision"),
                 "overall_promotion_gate": result.get("overall_promotion_gate"),
             },

@@ -475,12 +475,6 @@
       "path": "src/nflprops/pipelines/lean.py"
     },
     {
-      "code": "call-arg",
-      "count": 1,
-      "message": "Unexpected keyword argument \"season_type\" for \"team_game_stats\" of \"StatisticsProvider\"",
-      "path": "src/nflprops/pipelines/lean.py"
-    },
-    {
       "code": "no-untyped-def",
       "count": 2,
       "message": "Function is missing a return type annotation",
@@ -717,6 +711,6 @@
   ],
   "mypy_target_python": "3.11",
   "mypy_version": "mypy 2.3.1 (compiled: yes)",
-  "total_findings": 175,
+  "total_findings": 174,
   "version": 1
 }

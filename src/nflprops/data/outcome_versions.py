@@ -54,6 +54,7 @@ from typing import Any
 
 import polars as pl
 
+from nflprops.data.evidence_policy import estimated_availability_allowed
 from nflprops.data.warehouse import Warehouse
 from nflprops.features.asof import filter_pit
 
@@ -236,6 +237,7 @@ def append_outcome_versions(
     ingest_run_id: str,
     source_status: pl.Series | Sequence[str | None] | None = None,
     allow_estimated: bool = False,
+    season: int | None = None,
 ) -> VersionAppendResult:
     """Append each materially changed outcome in `frame` as a new immutable
     version of `table`. The caller holds the writer lock.
@@ -246,7 +248,8 @@ def append_outcome_versions(
     * Identical content to the latest stored version -> nothing written.
 
     Fails closed (nothing written) on: missing key/timestamp columns, an
-    estimated `available_at` unless `allow_estimated`, two different
+    estimated `available_at` unless `allow_estimated` (never for a
+    `season` at or after `STRICT_PIT_FIRST_SEASON`), two different
     contents for one key in one batch, a batch observed no later than the
     stored version it would supersede, or any stored version not
     reproduced byte-identically in the rewritten table.
@@ -263,6 +266,8 @@ def append_outcome_versions(
         raise OutcomeVersionError(f"{table}: batch has null natural-key values")
     if frame["ingested_at"].null_count() or frame["available_at"].null_count():
         raise OutcomeVersionError(f"{table}: batch has null available_at/ingested_at")
+    if season is not None and not estimated_availability_allowed(season):
+        allow_estimated = False  # never for STRICT_PIT_FIRST_SEASON or later
     estimated = (
         frame["available_at_is_estimated"].fill_null(False).any()
         if "available_at_is_estimated" in frame.columns
@@ -272,6 +277,7 @@ def append_outcome_versions(
         raise OutcomeVersionError(
             f"{table}: estimated available_at is not allowed for this ingest; "
             "outcome availability must be the genuine receipt time"
+            + (f" (season {season} is strict-PIT)" if season is not None else "")
         )
 
     batch = frame.drop([c for c in VERSION_COLUMNS if c in frame.columns])

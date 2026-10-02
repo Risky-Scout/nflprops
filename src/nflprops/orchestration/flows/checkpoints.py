@@ -57,7 +57,11 @@ from nflprops.orchestration.checkpoints import (
     CheckpointAction,
     CheckpointName,
 )
-from nflprops.orchestration.dispatch_plan import DispatchSettings, plan_due_checkpoints
+from nflprops.orchestration.dispatch_plan import (
+    DispatchSettings,
+    as_run_store_backend,
+    plan_due_checkpoints,
+)
 from nflprops.orchestration.distribution_store import persist_player_prop_distributions
 from nflprops.orchestration.pricing_store import persist_player_prop_pricing
 from nflprops.orchestration.projection_store import persist_player_game_projections
@@ -356,7 +360,7 @@ def _run_game_checkpoint_task(
                 simulation, player_states=computation.player_states
             )
             distribution_result = persist_player_prop_distributions(
-                ctx.warehouse,
+                as_run_store_backend(ctx.warehouse),
                 distributions,
                 run_id=ctx.run_id,
                 season=ctx.season,
@@ -679,7 +683,7 @@ def game_checkpoint_flow(ctx: CheckpointRunContext, *, now: datetime) -> Predict
         # exact-PMF product then failed (the certified store is atomic, so
         # nothing partial exists) and no pricing ran.
         return update_run_status(
-            ctx.warehouse,
+            as_run_store_backend(ctx.warehouse),
             ctx.run_id,
             status=PredictionRunStatus.PARTIAL,
             publication_status=PublicationStatus.NOT_PUBLISHED,
