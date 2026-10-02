@@ -45,6 +45,7 @@ import polars as pl
 from nflprops.backtest.provenance import build_state_provenance_context
 from nflprops.calibration.artifact import DIRECTLY_LABELED_PROP_TYPES
 from nflprops.calibration.challenger import LabeledGame, PropLabel
+from nflprops.data.outcome_versions import latest_final
 from nflprops.domain.enums import PropType
 from nflprops.market.rules import (
     SettlementRuleError,
@@ -146,6 +147,16 @@ def list_final_games(
         & (pl.col("season") >= season_min)
         & (pl.col("season") <= season_max)
     ).sort(["season", "week", "date"])
+
+
+def final_outcome_rows_for_game(player_stats: pl.DataFrame, game_id: str) -> pl.DataFrame:
+    """The training/recalibration TARGET rows for one game: the latest
+    corrected/final version of each player's outcome (versioned outcome
+    history), never an earlier superseded version and never two versions
+    of one player."""
+    return latest_final(
+        player_stats.filter(pl.col("canonical_game_id") == game_id), "player_game_stats"
+    )
 
 
 def build_prop_labels_for_game(
@@ -256,9 +267,8 @@ def build_labeled_game(
     simulated_player_ids = set(
         prepared.result.real_player_draws()["player_id"].unique().to_list()
     )
-    this_game_stats = player_stats.filter(
-        (pl.col("canonical_game_id") == game_id)
-        & pl.col("canonical_player_id").is_in(list(simulated_player_ids))
+    this_game_stats = final_outcome_rows_for_game(player_stats, game_id).filter(
+        pl.col("canonical_player_id").is_in(list(simulated_player_ids))
     )
     labels = build_prop_labels_for_game(this_game_stats, rules=settlement_rules)
     if not labels:

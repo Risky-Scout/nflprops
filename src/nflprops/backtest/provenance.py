@@ -27,6 +27,7 @@ from nflprops.backtest.leakage import (
     assert_no_leakage,
 )
 from nflprops.data.injury_availability import injury_feed_available_at
+from nflprops.data.outcome_versions import as_known_at
 from nflprops.features.asof import filter_pit
 
 LINEAGE_VERSION = "2026.1"
@@ -215,8 +216,8 @@ def build_state_provenance_context(
 
     _require_aware(as_of, "as_of")
 
-    ps = _pit(player_stats, as_of)
-    ts = _pit(team_stats, as_of)
+    ps = as_known_at(player_stats, "player_game_stats", as_of)
+    ts = as_known_at(team_stats, "team_game_stats", as_of)
     rr = _pit(roster, as_of)
     ii = _pit(injuries, as_of)
     gg = _pit(games, as_of)

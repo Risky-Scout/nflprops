@@ -1,0 +1,319 @@
+"""BLOCK 4: Wizard-prepared checkpoint -> GitHub execution -> result bundle
+-> Wizard ingest, end to end on the certified PIT fixture warehouse.
+
+`PRODUCTION_N_DRAWS` is patched down to keep the suite fast; the
+production value (20,000) and its enforcement are asserted separately.
+"""
+
+from __future__ import annotations
+
+import json
+import shutil
+import sys
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import polars as pl
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "orchestration"))
+
+from _fixtures import TARGET_GAME_ID, build_pit_fixture_warehouse
+
+from nflprops.config import load
+from nflprops.data.warehouse import Warehouse
+from nflprops.orchestration.dispatch_plan import DispatchSettings
+from nflprops.orchestration.run_store import get_run
+from nflprops.platform import remote_checkpoint, result_ingest
+from nflprops.platform.checkpoint_prepare import (
+    REMOTE_REQUESTS_TABLE,
+    prepare_manual_checkpoint,
+)
+from nflprops.platform.immutable_bundle import (
+    BundleIntegrityError,
+    build_manifest,
+    publish_atomically,
+    stage_bundle_dir,
+    write_manifest,
+)
+from nflprops.platform.remote_checkpoint import (
+    DECISION_NOT_PUBLIC_READY,
+    RemoteExecutionError,
+    execute_checkpoint,
+    load_verified_request,
+    verify_request_against_snapshot,
+)
+from nflprops.platform.remote_training import PRODUCTION_N_DRAWS
+from nflprops.platform.result_ingest import (
+    RESULTS_TABLE,
+    STATE_COMPLETED,
+    ResultIngestError,
+    ingest_result_bundle,
+    result_bundle_id,
+)
+from nflprops.platform.runtime_layout import resolve_runtime_layout
+from nflprops.platform.stats_backfill import backfill_outcome_history
+from nflprops.platform.warehouse_snapshot import restore_snapshot
+
+KICKOFF = datetime(2025, 9, 15, 17, 0, 0, tzinfo=UTC)
+AS_OF = KICKOFF - timedelta(minutes=30)
+TEST_DRAWS = 200
+SEASON, WEEK = 2025, 2
+
+
+@pytest.fixture()
+def draws(monkeypatch: pytest.MonkeyPatch) -> int:
+    monkeypatch.setattr(remote_checkpoint, "PRODUCTION_N_DRAWS", TEST_DRAWS)
+    monkeypatch.setattr(result_ingest, "PRODUCTION_N_DRAWS", TEST_DRAWS)
+    original = DispatchSettings.resolve.__func__
+
+    def _resolve(cls, config, **kwargs):
+        return original(cls, config, **{**kwargs, "n_draws": TEST_DRAWS})
+
+    monkeypatch.setattr(DispatchSettings, "resolve", classmethod(_resolve))
+    return TEST_DRAWS
+
+
+@pytest.fixture()
+def wizard(tmp_path: Path, draws: int) -> dict:
+    root = tmp_path / "wizard"
+    warehouse = build_pit_fixture_warehouse(
+        root / "state",
+        kickoff_at=KICKOFF,
+        quote_visible_at=AS_OF - timedelta(seconds=1),
+        quote_hidden_at=AS_OF + timedelta(seconds=1),
+    )
+    layout = resolve_runtime_layout(warehouse.root, {"NFLPROPS_RUNTIME_ROOT": str(root)})
+    config = load()
+    prepared = prepare_manual_checkpoint(
+        layout=layout, warehouse=warehouse, config=config, season=SEASON, week=WEEK,
+        game_id=TARGET_GAME_ID, as_of=AS_OF, now=AS_OF + timedelta(minutes=1),
+        migration_head="0009_compact_pmf_payload", hostname="h", release_sha="a" * 40,
+    )
+    return {"root": root, "warehouse": warehouse, "layout": layout, "config": config,
+            "prepared": prepared}
+
+
+def _github_execute(wizard: dict, tmp_path: Path, *, config=None) -> dict:
+    """What checkpoint-execute.yml does after its downloads."""
+    prepared = wizard["prepared"]
+    request, request_sha = load_verified_request(
+        prepared.request_bundle_dir, expected_manifest_sha256=prepared.request_bundle_sha256
+    )
+    scratch = tmp_path / "runner" / "warehouse"
+    info = restore_snapshot(wizard["layout"].snapshots, request["snapshot_id"], scratch)
+    warehouse = Warehouse(scratch, tmp_path / "runner" / "scratch.duckdb")
+    cfg = config or wizard["config"]
+    run = verify_request_against_snapshot(
+        request, warehouse, cfg, snapshot_id=info.snapshot_id,
+        snapshot_manifest_sha256=info.manifest_sha256,
+    )
+    out = tmp_path / "runner" / "out"
+    execute_checkpoint(
+        request, run, warehouse, cfg, out_dir=out, request_bundle_sha256=request_sha,
+        science_sha="b" * 40, workflow_run="test",
+    )
+    return {"out": out, "result": json.loads((out / "result.json").read_text())}
+
+
+def _publish(wizard: dict, out: Path, run_id: str) -> tuple[Path, str]:
+    """What upload-result-bundle does: stage, manifest, atomic publish."""
+    bundle_id = result_bundle_id(run_id)
+    final = wizard["layout"].publications / bundle_id
+    staging = stage_bundle_dir(final, bundle_id=bundle_id)
+    shutil.copytree(out, staging, dirs_exist_ok=True)
+    manifest = build_manifest(
+        bundle_id=bundle_id, source_identity={"science_sha": "b" * 40},
+        schema_version="nflprops.platform.wizard_runtime.result_bundle/v1", root_dir=staging,
+    )
+    write_manifest(manifest, staging)
+    publish_atomically(staging, final)
+    return final, manifest.manifest_sha256
+
+
+def test_production_draw_count_is_twenty_thousand() -> None:
+    assert PRODUCTION_N_DRAWS == 20_000
+
+
+def test_full_roundtrip_installs_result_and_fails_public_ready_closed(
+    wizard: dict, tmp_path: Path
+) -> None:
+    run_id = wizard["prepared"].run_id
+    executed = _github_execute(wizard, tmp_path)
+    result = executed["result"]
+
+    assert result["run"]["status"] == "SUCCESS"
+    assert result["n_draws"] == TEST_DRAWS
+    counts = result["row_counts"]
+    for table in ("player_game_projections", "player_game_threshold_events",
+                  "player_prop_distributions", "player_prop_distribution_artifacts",
+                  "player_prop_pricing_artifacts"):
+        assert counts[table] > 0, table
+    # exact PMFs: E*25 distributions for the E*30-row projection product
+    assert counts["player_prop_distributions"] * 30 == counts["player_game_projections"] * 25
+    # MANUAL can never be public and no calibration scope applies: fail closed
+    assert result["decision"] == DECISION_NOT_PUBLIC_READY
+    assert "MANUAL_CHECKPOINT_NEVER_PUBLIC" in result["decision_reasons"]
+    assert result["calibration_gate"]["approved"] is False
+
+    # The live warehouse was never touched by the execution.
+    live = wizard["warehouse"]
+    assert get_run(live, run_id).status.value == "SCHEDULED"
+    assert not live.exists("player_game_projections")
+
+    final, manifest_sha = _publish(wizard, executed["out"], run_id)
+    summary = ingest_result_bundle(
+        live, final, expected_manifest_sha256=manifest_sha,
+        lock_path=wizard["layout"].writer_lock, now=datetime.now(UTC),
+    )
+    assert summary["status"] == "INGESTED"
+    assert summary["decision"] == DECISION_NOT_PUBLIC_READY
+
+    installed = get_run(live, run_id)
+    assert installed.status.value == "SUCCESS"
+    assert installed.publication_status.value == result["run"]["publication_status"]
+    request = live.read(REMOTE_REQUESTS_TABLE).filter(pl.col("run_id") == run_id).row(0, named=True)
+    assert request["state"] == STATE_COMPLETED
+    for table, count in counts.items():
+        stored = live.read(table).filter(pl.col("run_id") == run_id) if count else pl.DataFrame()
+        assert stored.height == count, table
+    results = live.read(RESULTS_TABLE)
+    assert results["decision"].to_list() == [DECISION_NOT_PUBLIC_READY]
+
+    # idempotent re-ingest; a different expected SHA is refused
+    again = ingest_result_bundle(
+        live, final, expected_manifest_sha256=manifest_sha,
+        lock_path=wizard["layout"].writer_lock, now=datetime.now(UTC),
+    )
+    assert again["status"] == "ALREADY_INGESTED"
+    with pytest.raises(BundleIntegrityError):
+        ingest_result_bundle(
+            live, final, expected_manifest_sha256="0" * 64,
+            lock_path=wizard["layout"].writer_lock, now=datetime.now(UTC),
+        )
+
+
+def test_executor_refuses_config_drift(wizard: dict, tmp_path: Path) -> None:
+    drifted = load(cli_overrides={"run.log_level": "DEBUG"})
+    with pytest.raises(RemoteExecutionError, match="config SHA"):
+        _github_execute(wizard, tmp_path, config=drifted)
+
+
+def test_executor_refuses_non_production_draw_count(
+    wizard: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(remote_checkpoint, "PRODUCTION_N_DRAWS", 20_000)
+    with pytest.raises(RemoteExecutionError, match="n_draws"):
+        _github_execute(wizard, tmp_path)
+
+
+def test_executor_refuses_a_snapshot_whose_pit_data_changed(
+    wizard: dict, tmp_path: Path
+) -> None:
+    prepared = wizard["prepared"]
+    request, _sha = load_verified_request(prepared.request_bundle_dir)
+    scratch = tmp_path / "runner" / "warehouse"
+    info = restore_snapshot(wizard["layout"].snapshots, request["snapshot_id"], scratch)
+    warehouse = Warehouse(scratch)
+    props = warehouse.read("player_prop_snapshots")
+    warehouse.write(
+        "player_prop_snapshots", props.with_columns(pl.col("line_value") + 1.0)
+    )
+    with pytest.raises(RemoteExecutionError, match="PIT data manifest"):
+        verify_request_against_snapshot(
+            request, warehouse, wizard["config"], snapshot_id=info.snapshot_id,
+            snapshot_manifest_sha256=info.manifest_sha256,
+        )
+
+
+def test_ingest_refuses_a_result_for_a_request_not_pending(
+    wizard: dict, tmp_path: Path
+) -> None:
+    run_id = wizard["prepared"].run_id
+    executed = _github_execute(wizard, tmp_path)
+    final, manifest_sha = _publish(wizard, executed["out"], run_id)
+    live = wizard["warehouse"]
+    requests = live.read(REMOTE_REQUESTS_TABLE).with_columns(
+        pl.when(pl.col("run_id") == run_id).then(pl.lit("NOT_EXECUTABLE"))
+        .otherwise(pl.col("state")).alias("state")
+    )
+    live.write(REMOTE_REQUESTS_TABLE, requests)
+    with pytest.raises(ResultIngestError, match="not PENDING"):
+        ingest_result_bundle(
+            live, final, expected_manifest_sha256=manifest_sha,
+            lock_path=wizard["layout"].writer_lock, now=datetime.now(UTC),
+        )
+    assert get_run(live, run_id).status.value == "SCHEDULED"
+    assert not live.exists(RESULTS_TABLE)
+
+
+# ------------------------------------------------------------ stats backfill
+
+
+class _StatsProvider:
+    """Records carry the provider boundary's genuine receipt time, exactly
+    like `BDLProvider` (`MappingContext.effective_available_at`)."""
+
+    def __init__(self, now: datetime) -> None:
+        self.now = now
+        self.received_at = now - timedelta(minutes=1)
+
+    def games(self, seasons=None, season_types=None, **_kw):
+        base = {"season": 2026, "season_type": 2, "week": 1, "postseason": False,
+                "home_canonical_team_id": "h", "visitor_canonical_team_id": "v"}
+        return [
+            {**base, "canonical_game_id": "final-old", "status": "Final",
+             "date": self.now - timedelta(days=3)},
+            {**base, "canonical_game_id": "final-recent", "status": "Final/OT",
+             "date": self.now - timedelta(hours=2)},
+            {**base, "canonical_game_id": "live", "status": "3rd Quarter",
+             "date": self.now - timedelta(days=1)},
+        ]
+
+    def _pit(self) -> dict:
+        return {"available_at": self.received_at, "ingested_at": self.received_at,
+                "available_at_is_estimated": False, "provider": "bdl"}
+
+    def player_game_stats(self, seasons=None, season_type=None, **_kw):
+        if season_type != 2:
+            return []
+        return [{"canonical_game_id": g, "canonical_player_id": "p1",
+                 "canonical_team_id": "h", "receiving_yards": 50, **self._pit()}
+                for g in ("final-old", "final-recent", "live")]
+
+    def team_game_stats(self, seasons=None, season_type=None, **_kw):
+        if season_type != 2:
+            return []
+        return [{"canonical_game_id": g, "canonical_team_id": "h", "total_points": 21,
+                 **self._pit()}
+                for g in ("final-old", "final-recent", "live")]
+
+
+def test_stats_backfill_is_final_only_genuine_receipt_time_and_versioned(
+    tmp_path: Path,
+) -> None:
+    now = datetime(2026, 9, 30, 22, 0, tzinfo=UTC)
+    warehouse = Warehouse(tmp_path / "canonical")
+    lock = tmp_path / "writer.lock"
+    provider = _StatsProvider(now)
+    results = backfill_outcome_history(
+        provider, warehouse, seasons=[2026], lock_path=lock, now=now
+    )
+    assert results[0].season.final_games == 2
+    assert results[0].season.held_back_rows == 0
+    for table in ("player_game_stats", "team_game_stats"):
+        stored = warehouse.read(table).sort("canonical_game_id")
+        assert stored["canonical_game_id"].to_list() == ["final-old", "final-recent"]
+        # Never a game-date estimate: the real receipt time, unflagged.
+        assert stored["available_at_is_estimated"].to_list() == [False, False]
+        assert stored["available_at"].to_list() == [provider.received_at] * 2
+        assert stored["outcome_source_status"].to_list() == ["Final", "Final/OT"]
+    before = warehouse.read("player_game_stats")
+
+    later = now + timedelta(hours=11)
+    again = backfill_outcome_history(
+        _StatsProvider(later), warehouse, seasons=[2026], lock_path=lock, now=later
+    )
+    # Identical provider content: no new version, stored rows untouched.
+    assert (again[0].player.new_keys, again[0].player.corrections) == (0, 0)
+    assert warehouse.read("player_game_stats").equals(before)

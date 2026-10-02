@@ -8,6 +8,7 @@ from enum import StrEnum
 
 import polars as pl
 
+from nflprops.data.outcome_versions import VERSION_ID, latest_final
 from nflprops.errors import DataQualityError
 
 
@@ -52,6 +53,24 @@ def validate_core(
     player_stats = player_stats if player_stats is not None else pl.DataFrame()
     team_stats = team_stats if team_stats is not None else pl.DataFrame()
     issues: list[QualityIssue] = []
+
+    # Versioned outcome history: every stored version must be unique, and
+    # the remaining checks apply to the logical (latest final) outcome per
+    # natural key. Unversioned frames keep the strict per-key checks.
+    for frame, table, code in (
+        (player_stats, "player_game_stats", "DUPLICATE_PLAYER_GAME_VERSION"),
+        (team_stats, "team_game_stats", "DUPLICATE_TEAM_GAME_VERSION"),
+    ):
+        if not frame.is_empty() and VERSION_ID in frame.columns:
+            dupes = frame.height - frame[VERSION_ID].n_unique()
+            if dupes:
+                issues.append(
+                    QualityIssue(code, Severity.BLOCK, f"{dupes} duplicate {table} versions")
+                )
+    if VERSION_ID in player_stats.columns:
+        player_stats = latest_final(player_stats, "player_game_stats")
+    if VERSION_ID in team_stats.columns:
+        team_stats = latest_final(team_stats, "team_game_stats")
 
     if not player_stats.is_empty():
         key = ["canonical_game_id", "canonical_player_id"]

@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 import numpy as np
 import polars as pl
 
+from nflprops.data.outcome_versions import as_known_at
 from nflprops.features.asof import filter_pit
 
 
@@ -281,8 +282,9 @@ def build_player_states(
     if config is None:
         config = PlayerStateConfig()
 
-    ps = filter_pit(player_stats, as_of, strict=strict)
-    ts = filter_pit(team_stats, as_of, strict=strict)
+    # One version per outcome: the latest genuinely known at as_of.
+    ps = as_known_at(player_stats, "player_game_stats", as_of, strict=strict)
+    ts = as_known_at(team_stats, "team_game_stats", as_of, strict=strict)
     if ps.is_empty():
         return {}
 

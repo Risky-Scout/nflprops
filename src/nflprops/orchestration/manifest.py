@@ -41,6 +41,7 @@ import polars as pl
 
 from nflprops.collection.models import RESOURCE_RUNS_TABLE
 from nflprops.data.injury_availability import injury_feed_available_at
+from nflprops.data.outcome_versions import as_known_at
 from nflprops.data.warehouse import Warehouse
 from nflprops.domain.hashing import hash_payload
 from nflprops.features.asof import filter_pit
@@ -263,8 +264,18 @@ def build_checkpoint_manifest(
             else pl.DataFrame()  # _scoped_by_team selects nothing without team ids
         )
 
-    player_stats_scoped = _scoped_by_team(_read_team_scoped("player_game_stats"))
-    team_stats_scoped = _scoped_by_team(_read_team_scoped("team_game_stats"))
+    # Versioned outcome history: one version per outcome, the latest
+    # genuinely known at scheduled_as_of (identity on single-version rows).
+    player_stats_scoped = as_known_at(
+        _scoped_by_team(_read_team_scoped("player_game_stats")),
+        "player_game_stats",
+        scheduled_as_of,
+    )
+    team_stats_scoped = as_known_at(
+        _scoped_by_team(_read_team_scoped("team_game_stats")),
+        "team_game_stats",
+        scheduled_as_of,
+    )
     roster = _read_team_scoped("roster_snapshots")
     roster_scoped = _scoped_by_team(roster)
 
