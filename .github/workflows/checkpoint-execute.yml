@@ -34,6 +34,11 @@ on:
         description: "Optional exact pending run_id (64 hex). Empty = the next executable request."
         required: false
         type: string
+      verify_only:
+        description: "Verify the request against its immutable snapshot, then stop (no simulation). A deterministic refusal is still recorded NOT_EXECUTABLE. Requires run_id."
+        required: false
+        type: boolean
+        default: false
   schedule:
     - cron: "*/15 * * * *"
 
@@ -59,7 +64,11 @@ jobs:
       - name: Enforce main-only + validate input
         env:
           RUN_ID: ${{ inputs.run_id }}
+          VERIFY_ONLY: ${{ inputs.verify_only }}
         run: |
+          if [ "$VERIFY_ONLY" = "true" ] && [ -z "$RUN_ID" ]; then
+            echo "::error::verify_only requires an explicit run_id"; exit 1
+          fi
           if [ "$GITHUB_REF" != "refs/heads/main" ]; then
             echo "::error::checkpoint execution may only run from main (got $GITHUB_REF)"; exit 1
           fi
@@ -126,10 +135,13 @@ jobs:
         if: steps.select.outputs.found == 'true' && steps.select.outputs.published_sha256 == ''
         env:
           REQUEST_SHA: ${{ steps.select.outputs.request_bundle_sha256 }}
+          VERIFY_ONLY: ${{ inputs.verify_only }}
         run: |
           mkdir -p "$RUNNER_TEMP/work" "$RUNNER_TEMP/out"
+          extra=()
+          [ "$VERIFY_ONLY" = "true" ] && extra=(--verify-only)
           set +e
-          python -m nflprops.platform.wizard_runtime execute-checkpoint \
+          python -m nflprops.platform.wizard_runtime execute-checkpoint "${extra[@]}" \
             --request-dir "$RUNNER_TEMP/request" \
             --expected-request-sha256 "$REQUEST_SHA" \
             --snapshot-root "$RUNNER_TEMP/snapshots" \
@@ -160,7 +172,7 @@ jobs:
 
       - name: Build the immutable result bundle (deterministic manifest)
         id: bundle
-        if: steps.execute.outputs.exit_code == '0'
+        if: steps.execute.outputs.exit_code == '0' && inputs.verify_only != true
         env:
           BUNDLE_ID: ${{ steps.select.outputs.bundle_id }}
           SNAPSHOT_ID: ${{ steps.select.outputs.snapshot_id }}
@@ -178,7 +190,7 @@ jobs:
           echo "manifest_sha256=$sha" >> "$GITHUB_OUTPUT"
 
       - name: Keep the result bundle as a workflow artifact
-        if: steps.execute.outputs.exit_code == '0'
+        if: steps.execute.outputs.exit_code == '0' && inputs.verify_only != true
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.select.outputs.bundle_id }}-${{ github.run_attempt }}
@@ -187,7 +199,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload + atomic publish by the Wizard runtime owner
-        if: steps.execute.outputs.exit_code == '0'
+        if: steps.execute.outputs.exit_code == '0' && inputs.verify_only != true
         env:
           SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
           SCP_OPTS: -i ~/.ssh/wizard_deploy_key -P ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
@@ -211,7 +223,7 @@ jobs:
 
       - name: Ingest the result on Wizard (runtime owner, writer lock, idempotent)
         id: ingest
-        if: steps.execute.outputs.exit_code == '0' || (steps.select.outputs.found == 'true' && steps.select.outputs.published_sha256 != '')
+        if: inputs.verify_only != true && (steps.execute.outputs.exit_code == '0' || (steps.select.outputs.found == 'true' && steps.select.outputs.published_sha256 != ''))
         env:
           SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
           REMOTE: ${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}

@@ -455,3 +455,30 @@ def test_backfill_never_writes_games_or_checkpoint_tables(tmp_path: Path) -> Non
     backfill_outcome_history(_WeeksProvider(received), wh, seasons=[2026], weeks=[1, 2, 3, 4],
                              lock_path=tmp_path / "l", now=received)
     assert set(wh.tables()) <= {"player_game_stats", "team_game_stats"}
+
+
+def test_outcome_report_certifies_versions_and_pit_visibility(tmp_path: Path) -> None:
+    from nflprops.platform.stats_backfill import outcome_report
+
+    received = datetime(2026, 10, 2, 15, 0, tzinfo=UTC)
+    later = received + timedelta(days=2)
+    wh = Warehouse(tmp_path / "canonical")
+    wh.write("games", pl.DataFrame([
+        {"canonical_game_id": f"w{w}", "season": 2026, "week": w,
+         "available_at": received, "date": received} for w in range(1, 6)
+    ]))
+    lock = tmp_path / "writer.lock"
+    backfill_outcome_history(_WeeksProvider(received), wh, seasons=[2026], weeks=[1, 2, 3, 4],
+                             lock_path=lock, now=received)
+    backfill_outcome_history(_WeeksProvider(later, yards={"w2": 99}), wh, seasons=[2026],
+                             weeks=[1, 2, 3, 4], lock_path=lock, now=later)
+    report = outcome_report(wh, as_of_probes=[received - timedelta(seconds=1), received, later])
+    ps = report["player_game_stats"]
+    assert ps["rows"] == 5 and ps["natural_keys"] == 4 and ps["multi_version_keys"] == 1
+    assert ps["duplicate_version_ids"] == 0
+    assert ps["estimated_rows"] == 0 and ps["visible_before_first_seen_rows"] == 0
+    assert ps["provider_observed_at_non_null"] == 0
+    assert list(ps["visible_at"].values()) == [0, 4, 4]
+    assert [(r["week"], r["games"]) for r in ps["final_by_season_week"]] == [
+        (1, 1), (2, 1), (3, 1), (4, 1)]
+    assert report["team_game_stats"]["natural_keys"] == 8

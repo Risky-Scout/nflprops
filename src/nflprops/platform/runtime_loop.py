@@ -142,6 +142,10 @@ OUTCOME_INGEST_RECENT_DAYS = 10
 OUTCOME_INGEST_ARGV: tuple[str, ...] = (
     sys.executable, "-m", "nflprops.platform.wizard_runtime", "ingest-stats",
 )
+#: Operator hold: while `<runtime_root>/state/<this file>` exists the
+#: recurring ingest never starts (wizard-ops outcome-ingest-hold/-release;
+#: plain files, so the hold works before and across deploys).
+OUTCOME_INGEST_HOLD_FILE = "outcome_ingest.hold"
 #: Same thread bound as the checkpoint-preparation child (TasksMax).
 OUTCOME_INGEST_ENV_OVERRIDES: dict[str, str] = {"POLARS_MAX_THREADS": "1"}
 
@@ -599,6 +603,9 @@ class RuntimeLoop:
         returned on exit; never overlaps the checkpoint child). The child
         takes the writer lock itself, only for its appends."""
         if self.outcome_ingest_interval_seconds <= 0 or target is None:
+            return
+        if (self.layout.state / OUTCOME_INGEST_HOLD_FILE).exists():
+            self._last["outcome_ingest"] = {"held": True, "at": now.isoformat()}
             return
         if self._outcome_ingest_due_at is not None and now < self._outcome_ingest_due_at:
             return

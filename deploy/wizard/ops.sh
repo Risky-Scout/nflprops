@@ -30,6 +30,11 @@
 #   checkpoint-refuse RUN_ID WORKFLOW_RUN_URL
 #                          BLOCK 4: the executor's verification refused this
 #                          request -> NOT_EXECUTABLE (fail closed; idempotent)
+#   outcome-ingest-hold    BLOCK 4: create $ROOT/state/outcome_ingest.hold --
+#                          the runtime's recurring outcome ingest never starts
+#   outcome-ingest-release BLOCK 4: remove that hold file
+#   outcome-report [AS_OF] READ-ONLY (BLOCK 4): versioned outcome-table
+#                          certification (+ what a cutoff AS_OF could see)
 #   ingest-stats SEASON [WEEKS]
 #                          BLOCK 4: append final-game outcome versions
 #                          (genuine receipt time; never fabricated PIT)
@@ -403,6 +408,25 @@ main() {
       [ -d "$ROOT/publications/$1" ] || die "no published bundle $1"
       runtime_python -m nflprops.platform.wizard_runtime result-ingest \
         --bundle-id "$1" --expected-manifest-sha256 "$2" || die "result ingest failed"
+      ;;
+    outcome-ingest-hold)
+      touch "$ROOT/state/outcome_ingest.hold" || die "could not create hold file"
+      echo "HELD: $ROOT/state/outcome_ingest.hold"
+      ;;
+    outcome-ingest-release)
+      rm -f "$ROOT/state/outcome_ingest.hold" || die "could not remove hold file"
+      echo "RELEASED: recurring outcome ingest may run"
+      ;;
+    outcome-report)
+      [ "$#" -le 1 ] || die "outcome-report takes at most one AS_OF"
+      if [ "$#" -eq 1 ]; then
+        [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\+00:00|Z)$ ]] || die "as_of format"
+        runtime_python -m nflprops.platform.wizard_runtime outcome-report --as-of "$1" \
+          || die "outcome report failed"
+      else
+        runtime_python -m nflprops.platform.wizard_runtime outcome-report || die "outcome report failed"
+      fi
+      echo "hold_file_present=$([ -e "$ROOT/state/outcome_ingest.hold" ] && echo yes || echo no)"
       ;;
     checkpoint-refuse)
       [ "$#" -eq 2 ] || die "checkpoint-refuse needs RUN_ID WORKFLOW_RUN_URL"

@@ -45,10 +45,18 @@ from typing import Any
 
 import polars as pl
 
+from nflprops.data.evidence_policy import estimated_mask
 from nflprops.data.outcome_versions import (
+    FIRST_SEEN_AT,
+    INGEST_RUN_ID,
+    OUTCOME_TABLE_KEYS,
+    PROVIDER_OBSERVED_AT,
+    VERSION_ID,
     OutcomeVersionError,
     VersionAppendResult,
     append_outcome_versions,
+    as_known_at,
+    latest_final,
 )
 from nflprops.data.warehouse import Warehouse, records_to_frame
 from nflprops.domain.protocols import FullProvider
@@ -204,3 +212,77 @@ def backfill_outcome_history(
                 )
             )
     return results
+
+
+def _iso(value: Any) -> str | None:
+    return value.isoformat() if isinstance(value, datetime) else None
+
+
+def outcome_report(
+    warehouse: Warehouse, *, as_of_probes: Sequence[datetime] = ()
+) -> dict[str, Any]:
+    """Read-only certification of the versioned outcome tables (the
+    Weeks 1-4 backfill check). `as_of_probes` report how many outcomes a
+    checkpoint at each cutoff could see (PIT: only versions genuinely
+    known by then)."""
+    games = warehouse.read("games") if warehouse.exists("games") else pl.DataFrame()
+    weeks = (
+        games.select("canonical_game_id", "season", "week")
+        .unique(subset=["canonical_game_id"], keep="last", maintain_order=True)
+        if not games.is_empty()
+        else pl.DataFrame()
+    )
+    report: dict[str, Any] = {}
+    for table in OUTCOME_TABLE_KEYS:
+        frame = warehouse.read(table) if warehouse.exists(table) else pl.DataFrame()
+        if frame.is_empty():
+            report[table] = {"rows": 0}
+            continue
+        final = latest_final(frame, table)
+        keys = list(OUTCOME_TABLE_KEYS[table])
+        estimated = (
+            int(frame["available_at_is_estimated"].fill_null(False).sum())
+            if "available_at_is_estimated" in frame.columns
+            else 0
+        )
+        early = 0
+        if FIRST_SEEN_AT in frame.columns:
+            genuine = frame.filter(~estimated_mask(frame))
+            early = genuine.filter(pl.col("available_at") < pl.col(FIRST_SEEN_AT)).height
+        entry: dict[str, Any] = {
+            "rows": frame.height,
+            "natural_keys": final.height,
+            "multi_version_keys": frame.group_by(keys).len().filter(pl.col("len") > 1).height,
+            "duplicate_version_ids": (
+                frame.height - frame[VERSION_ID].n_unique() if VERSION_ID in frame.columns else None
+            ),
+            "estimated_rows": estimated,
+            "visible_before_first_seen_rows": early,
+            "first_seen_min": _iso(frame[FIRST_SEEN_AT].min()) if FIRST_SEEN_AT in frame.columns else None,
+            "first_seen_max": _iso(frame[FIRST_SEEN_AT].max()) if FIRST_SEEN_AT in frame.columns else None,
+            "provider_observed_at_non_null": (
+                frame.height - frame[PROVIDER_OBSERVED_AT].null_count()
+                if PROVIDER_OBSERVED_AT in frame.columns
+                else None
+            ),
+            "ingest_runs": (
+                dict(frame.group_by(INGEST_RUN_ID).len().sort(INGEST_RUN_ID).iter_rows())
+                if INGEST_RUN_ID in frame.columns
+                else {}
+            ),
+            "visible_at": {
+                probe.isoformat(): as_known_at(frame, table, probe).height for probe in as_of_probes
+            },
+        }
+        if not weeks.is_empty():
+            by_week = (
+                final.select(pl.col("canonical_game_id").cast(pl.Utf8))
+                .join(weeks.with_columns(pl.col("canonical_game_id").cast(pl.Utf8)),
+                      on="canonical_game_id", how="left")
+                .group_by("season", "week")
+                .agg(pl.len().alias("outcomes"), pl.col("canonical_game_id").n_unique().alias("games"))
+                .sort("season", "week")
+            )
+            entry["final_by_season_week"] = by_week.to_dicts()
+        report[table] = entry
+    return report

@@ -651,6 +651,28 @@ def checkpoint_refuse(
 # ------------------------------------------------------------ BLOCK 4
 
 
+@app.command("outcome-report")
+def outcome_report_cmd(
+    as_of: list[str] = typer.Option(  # noqa: B008
+        [], help="ISO-8601 UTC cutoff(s): how many outcomes a checkpoint then could see."
+    ),
+) -> None:
+    """Read-only: certify the versioned outcome tables (rows, versions,
+    receipt times, never-visible-before-first-seen, per-week coverage)."""
+    import json
+    from datetime import datetime
+
+    from nflprops.data.warehouse import Warehouse
+    from nflprops.platform.stats_backfill import outcome_report
+
+    probes = [datetime.fromisoformat(value.replace("Z", "+00:00")) for value in as_of]
+    if any(p.tzinfo is None for p in probes):
+        raise typer.BadParameter("--as-of must carry a UTC offset")
+    layout = _layout()
+    report = outcome_report(Warehouse(layout.warehouse_root), as_of_probes=probes)
+    typer.echo(json.dumps(report, indent=2, sort_keys=True, default=str))
+
+
 @app.command("ingest-stats")
 def ingest_stats(
     seasons: str = typer.Option(..., help="Comma-separated seasons, e.g. 2024,2025,2026."),
@@ -702,6 +724,9 @@ def execute_checkpoint_cmd(
     out_dir: str = typer.Option(..., help="Empty directory to write the result files into."),
     science_sha: str = typer.Option(..., help="Git SHA of the executing checkout."),
     workflow_run: str = typer.Option(..., help="GitHub run id/url, for provenance."),
+    verify_only: bool = typer.Option(
+        False, help="Verify the request against its snapshot, then stop (no simulation)."
+    ),
 ) -> None:
     """GITHUB SIDE ONLY: verify one prepared checkpoint against its
     snapshot, run the certified 20,000-draw checkpoint flow on a scratch
@@ -746,6 +771,9 @@ def execute_checkpoint_cmd(
             # (never retried, never blocks the queue).
             typer.echo(f"REFUSED: {exc}", err=True)
             raise typer.Exit(3) from exc
+        if verify_only:
+            typer.echo(f"VERIFIED: run {run.run_id} is executable against snapshot {info.snapshot_id}")
+            return
         executed = execute_checkpoint(
             request,
             run,

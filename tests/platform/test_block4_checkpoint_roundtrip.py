@@ -301,6 +301,33 @@ def test_execute_cli_exits_3_on_a_deterministic_verification_refusal(
     assert not (tmp_path / "out" / "result.json").exists()
 
 
+def test_execute_cli_verify_only_never_simulates(
+    wizard: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from typer.testing import CliRunner
+
+    from nflprops.platform.wizard_runtime import app
+
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.delenv("NFLPROPS_RUNTIME_ROOT", raising=False)
+    prepared = wizard["prepared"]
+    (tmp_path / "work").mkdir()
+    (tmp_path / "out").mkdir()
+    result = CliRunner().invoke(app, [
+        "execute-checkpoint", "--verify-only",
+        "--request-dir", str(prepared.request_bundle_dir),
+        "--expected-request-sha256", prepared.request_bundle_sha256,
+        "--snapshot-root", str(wizard["layout"].snapshots),
+        "--work-dir", str(tmp_path / "work"),
+        "--out-dir", str(tmp_path / "out"),
+        "--science-sha", "b" * 40,
+        "--workflow-run", "test",
+    ])
+    assert result.exit_code == 0, result.output
+    assert "VERIFIED" in result.output
+    assert not any((tmp_path / "out").iterdir())  # nothing simulated or exported
+
+
 def test_refusal_marks_not_executable_idempotently_and_never_touches_completed(
     wizard: dict, tmp_path: Path
 ) -> None:

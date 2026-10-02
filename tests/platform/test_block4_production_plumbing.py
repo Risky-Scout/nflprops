@@ -20,7 +20,7 @@ from nflprops.platform.checkpoint_select import (
     select_request,
 )
 from nflprops.platform.runtime_layout import resolve_runtime_layout
-from nflprops.platform.runtime_loop import RuntimeLoop, Target
+from nflprops.platform.runtime_loop import OUTCOME_INGEST_HOLD_FILE, RuntimeLoop, Target
 from nflprops.platform.stats_backfill import fetch_season_outcomes
 
 REPO = Path(__file__).resolve().parents[2]
@@ -200,6 +200,35 @@ def test_outcome_ingest_failure_is_logged_and_retried_never_fatal(tmp_path: Path
     assert len(_calls(calls)) == 1
     loop._ingest_outcomes(far, NOW + timedelta(minutes=15))
     assert len(_calls(calls)) == 2  # retried after the short retry delay
+
+
+def test_hold_file_pauses_outcome_ingest_until_released(tmp_path: Path) -> None:
+    argv, calls = _recorder(tmp_path)
+    loop = _runtime(tmp_path, argv, outcome_ingest_interval_seconds=3 * 3600.0)
+    far = Target(2026, 5, NOW + timedelta(days=3), "warehouse")
+    hold = loop.layout.state / OUTCOME_INGEST_HOLD_FILE
+    hold.parent.mkdir(parents=True, exist_ok=True)
+    hold.touch()
+    loop._ingest_outcomes(far, NOW)
+    loop._ingest_outcomes(far, NOW + timedelta(days=1))
+    assert _calls(calls) == []
+    assert loop._last["outcome_ingest"]["held"] is True
+    hold.unlink()
+    loop._ingest_outcomes(far, NOW + timedelta(days=1, minutes=1))
+    assert len(_calls(calls)) == 1
+
+
+def test_ops_hold_release_and_report_are_validated() -> None:
+    ops = (REPO / "deploy/wizard/ops.sh").read_text()
+    assert 'touch "$ROOT/state/outcome_ingest.hold"' in ops
+    assert 'rm -f "$ROOT/state/outcome_ingest.hold"' in ops
+    assert f"state/{OUTCOME_INGEST_HOLD_FILE}" in ops
+    wf = (REPO / ".github/workflows/checkpoint-execute.yml").read_text()
+    assert "verify_only requires an explicit run_id" in wf
+    for step in ("Build the immutable result bundle", "Upload + atomic publish",
+                 "Keep the result bundle"):
+        block = wf[wf.index(step):wf.index(step) + 200]
+        assert "inputs.verify_only != true" in block, step
 
 
 def test_production_runtime_enables_outcome_ingest() -> None:
