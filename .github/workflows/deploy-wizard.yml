@@ -15,7 +15,7 @@ name: Deploy WizardOfOdds (foundation)
 #   1. upload the release archive to releases/<release-id>.tar.gz
 #   2. prepare_release.sh -- entirely BEFORE activation: extract into the
 #      immutable releases/<release-id>/, build ITS OWN .venv
-#      (`.[orchestration,runtime]`), and run the pre-activation checks from
+#      (`.[runtime]`: core only, no science stack), and run the pre-activation checks from
 #      that venv. Any failure deletes the partial release; `current` is
 #      never touched.
 #   3. activate_release.sh -- atomically switch `current`, restart

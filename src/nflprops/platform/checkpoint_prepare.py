@@ -184,12 +184,30 @@ def pending_requests(warehouse: Warehouse) -> pl.DataFrame:
     return requests.filter(pl.col("state") == STATE_PENDING_REMOTE_EXECUTION)
 
 
+#: Request states whose snapshot may still be EXECUTED and so must not be
+#: pruned. Terminal states (NOT_EXECUTABLE, COMPLETED, ...) never execute
+#: again; their audit trail is the immutable request bundle
+#: (`publications/checkpoint_requests/<run_id>/`: identity, full PIT data
+#: manifest + its SHA-256, snapshot id + manifest SHA) plus the request row,
+#: so their full-copy snapshot falls back to ordinary bounded retention.
+SNAPSHOT_PROTECTING_STATES = (STATE_PREPARING, STATE_PENDING_REMOTE_EXECUTION)
+
+
 def protected_snapshot_ids(warehouse: Warehouse) -> frozenset[str]:
-    """Snapshots a PENDING (or retained NOT_EXECUTABLE) request references
-    -- never pruned."""
+    """Snapshots an executable (PREPARING / PENDING_REMOTE_EXECUTION)
+    request references -- never pruned."""
     requests = _read_requests(warehouse).filter(
-        pl.col("state").is_in([STATE_PENDING_REMOTE_EXECUTION, STATE_NOT_EXECUTABLE])
+        pl.col("state").is_in(list(SNAPSHOT_PROTECTING_STATES))
     )
+    return frozenset(v for v in requests["snapshot_id"].drop_nulls().to_list() if v)
+
+
+def request_snapshot_ids_at(warehouse_root: Path) -> frozenset[str]:
+    """Every snapshot id ANY checkpoint request references, whatever its
+    state. Read-only; never creates the warehouse directory."""
+    if not warehouse_root.is_dir():
+        return frozenset()
+    requests = _read_requests(Warehouse(warehouse_root))
     return frozenset(v for v in requests["snapshot_id"].drop_nulls().to_list() if v)
 
 

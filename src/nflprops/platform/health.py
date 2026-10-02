@@ -268,10 +268,18 @@ def latest_snapshot_check(snapshot_root: Any) -> HealthCheck:
     return _check
 
 
-def disk_free_check(path: Any, *, minimum_free_gb: float = 1.0) -> HealthCheck:
+def disk_free_check(path: Any, *, minimum_free_gb: float | None = None) -> HealthCheck:
     """Never creates `path` as a side effect -- measures free space on
     `path` if it already exists, else its nearest EXISTING ancestor
-    (same volume in practice for any path under the state root)."""
+    (same volume in practice for any path under the state root).
+
+    Reports the storage-guard level (OK / WARNING < 8 GiB / CRITICAL < 5 GiB
+    / FAIL_CLOSED < 3 GiB). Unhealthy only below `minimum_free_gb`
+    (default: the FAIL_CLOSED threshold, where the runtime stops creating
+    snapshots and preparing checkpoints)."""
+    from nflprops.platform.storage_guard import FAIL_CLOSED_FREE_GIB, disk_level
+
+    floor = FAIL_CLOSED_FREE_GIB if minimum_free_gb is None else minimum_free_gb
 
     def _check() -> tuple[bool, str | None]:
         import shutil as _shutil
@@ -279,8 +287,8 @@ def disk_free_check(path: Any, *, minimum_free_gb: float = 1.0) -> HealthCheck:
         target = _nearest_existing_ancestor(path)
         usage = _shutil.disk_usage(target)
         free_gb = usage.free / (1024**3)
-        healthy = free_gb >= minimum_free_gb
-        return healthy, f"{free_gb:.2f} GiB free at {target}"
+        healthy = free_gb >= floor
+        return healthy, f"{free_gb:.2f} GiB free at {target} level={disk_level(free_gb)}"
 
     return _check
 
@@ -403,7 +411,18 @@ def _tree_bytes(root: Any) -> int:
     base = Path(root)
     if not base.exists():
         return 0
-    return sum(p.stat().st_size for p in base.rglob("*") if p.is_file())
+    # Physical bytes: a hard-linked file (deduplicated snapshots) counts once.
+    seen: set[tuple[int, int]] = set()
+    total = 0
+    for p in base.rglob("*"):
+        if not p.is_file():
+            continue
+        st = p.stat()
+        if (st.st_dev, st.st_ino) in seen:
+            continue
+        seen.add((st.st_dev, st.st_ino))
+        total += st.st_size
+    return total
 
 
 def storage_growth_check(
@@ -412,9 +431,10 @@ def storage_growth_check(
     snapshot_root: Any,
     publications_root: Any,
     retention_limit: int,
-    minimum_free_gb: float = 2.0,
+    minimum_free_gb: float = 3.0,
     raw_root: Any | None = None,
     protected_snapshot_ids: frozenset[str] = frozenset(),
+    request_snapshot_ids: frozenset[str] = frozenset(),
 ) -> HealthCheck:
     """Live DuckDB/Parquet warehouse size, snapshot count/size, publication
     size, and MEASURED growth between the oldest and newest retained
@@ -437,8 +457,15 @@ def storage_growth_check(
         if query_cache.exists():
             live_bytes += query_cache.stat().st_size
         snapshots = list_snapshots(Path(snapshot_root))
-        snapshot_bytes = sum(info.total_bytes for info in snapshots)
+        snapshot_bytes = _tree_bytes(Path(snapshot_root))  # physical, links once
         retained = [s for s in snapshots if s.snapshot_id not in protected_snapshot_ids]
+        # A snapshot released by a TERMINAL request (no longer protected) is
+        # ordinary retention's to prune on the runtime's next housekeeping
+        # pass; it is reported, not counted as a retention failure. Only
+        # periodic snapshots (never referenced by any request) beyond
+        # retention prove that pruning is not working.
+        released = [s for s in retained if s.snapshot_id in request_snapshot_ids]
+        periodic = [s for s in retained if s.snapshot_id not in request_snapshot_ids]
         raw_bytes = _tree_bytes(raw_root) if raw_root is not None else 0
         publication_bytes = _tree_bytes(publications_root)
         free_gb = _shutil.disk_usage(_nearest_existing_ancestor(warehouse)).free / (1024**3)
@@ -454,15 +481,16 @@ def storage_growth_check(
                 growth = f"{per_day / (1024**2):.2f}MiB/day over {elapsed_days:.1f}d"
 
         problems: list[str] = []
-        if len(retained) > retention_limit:
-            problems.append(f"{len(retained)} snapshots exceed retention {retention_limit}")
+        if len(periodic) > retention_limit:
+            problems.append(f"{len(periodic)} snapshots exceed retention {retention_limit}")
         if free_gb < minimum_free_gb:
             problems.append(f"free {free_gb:.2f} GiB below {minimum_free_gb:.2f} GiB")
         mib = 1024**2
         detail = (
             f"live_warehouse={live_bytes / mib:.1f}MiB raw_payloads={raw_bytes / mib:.1f}MiB "
-            f"snapshots={len(retained)}/{retention_limit} "
+            f"snapshots={len(periodic)}/{retention_limit} "
             f"(+{len(snapshots) - len(retained)} pending-protected, "
+            f"+{len(released)} released-awaiting-prune, "
             f"{snapshot_bytes / mib:.1f}MiB) "
             f"publications={publication_bytes / mib:.1f}MiB free={free_gb:.2f}GiB "
             f"snapshot_growth={growth}"

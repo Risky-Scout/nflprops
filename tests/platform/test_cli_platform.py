@@ -79,9 +79,11 @@ def _storage_growth(output: str) -> dict[str, object]:
 def test_platform_health_storage_growth_honors_the_pruning_protected_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Regression (live 2026-09-30): health counted snapshots referenced by
-    retained NOT_EXECUTABLE requests against retention although pruning
-    protects them, so a correctly pruned runtime failed the deploy gate."""
+    """Regression (live 2026-09-30): health counted request-referenced
+    snapshots against retention, so a correctly pruned runtime failed the
+    deploy gate. PENDING snapshots are protected; snapshots released by
+    terminal (NOT_EXECUTABLE) requests await the next prune and are reported,
+    never counted as a retention failure (bounded storage)."""
     from nflprops.platform.checkpoint_prepare import (
         REMOTE_REQUESTS_TABLE,
         STATE_NOT_EXECUTABLE,
@@ -123,7 +125,9 @@ def test_platform_health_storage_growth_honors_the_pruning_protected_set(
     assert "storage_growth" not in DEPLOY_GATE_NONCRITICAL
     check = _storage_growth(runner.invoke(app, ["platform", "health"]).output)
     assert check["healthy"] is True, check
-    assert "snapshots=7/7 (+3 pending-protected" in str(check["detail"])
+    assert "snapshots=7/7 (+1 pending-protected, +2 released-awaiting-prune" in str(
+        check["detail"]
+    )
 
     # A genuinely excessive UNPROTECTED snapshot still fails.
     snapshot(11)

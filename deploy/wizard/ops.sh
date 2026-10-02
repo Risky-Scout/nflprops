@@ -15,6 +15,10 @@
 #                          claim + PREPARE one MANUAL checkpoint (no science)
 #   verify-snapshot SNAPSHOT_ID
 #                          READ-ONLY: re-verify one immutable snapshot
+#   inventory              READ-ONLY: disk/inode usage + per-path physical
+#                          inventory of RUNTIME_ROOT only (canonical files,
+#                          releases, snapshots + their protection, raw
+#                          payload growth, logs/backups, temp/orphan files)
 #   restart                sudo -n systemctl restart nflprops-runtime.service,
 #                          then GATE on 2 consecutive healthy probes
 #
@@ -127,6 +131,226 @@ op_restart() {
   die "$UNIT did not become healthy after restart"
 }
 
+# ---------------------------------------------------------------- inventory
+# READ-ONLY. Every command below only stats/lists/reads files under $ROOT
+# (plus `df` of /). Nothing is created, moved, or deleted.
+
+# "<bytes> <mtime> <path>" for one path (dir sizes are du apparent bytes).
+inv_entry() {
+  local p="$1" bytes mtime
+  bytes="$(du -sb "$p" 2>/dev/null | cut -f1)"
+  mtime="$(stat -c '%y' "$p" 2>/dev/null | cut -d. -f1)"
+  printf '%14s  %s  %s\n' "${bytes:-?}" "${mtime:-?}" "$p"
+}
+
+# bytes, file count, oldest, newest of every regular file under $1.
+inv_files_summary() {
+  find "$1" -type f -printf '%T@ %s %TY-%Tm-%TdT%TH:%TM\n' 2>/dev/null | sort -n | awk '
+    NR == 1 { oldest = $3 }
+    { bytes += $2; n += 1; newest = $3 }
+    END { printf "bytes=%d files=%d oldest=%s newest=%s\n", bytes, n, (n ? oldest : "-"), (n ? newest : "-") }'
+}
+
+op_inventory() {
+  local d child
+  section "filesystem"
+  show df -h /
+  show df -i /
+  show df -B1 /
+
+  section "top-level sizes (bytes, du apparent)"
+  for d in "$ROOT" "$ROOT/state" "$ROOT/state/raw" "$ROOT/state/canonical" \
+           "$ROOT/snapshots" "$ROOT/releases" "$ROOT/backups" "$ROOT/logs" \
+           "$ROOT/publications" "$ROOT/locks"; do
+    if [ -e "$d" ]; then
+      printf '%14s  %s\n' "$(du -sb "$d" | cut -f1)" "$d"
+      printf '%14s  %s (disk usage)\n' "$(du -sB1 "$d" | cut -f1)" "$d"
+    else
+      echo "absent: $d"
+    fi
+  done
+
+  section "immediate children (bytes  mtime  path)"
+  for d in "$ROOT" "$ROOT/state" "$ROOT/state/raw" "$ROOT/state/canonical" \
+           "$ROOT/snapshots" "$ROOT/releases" "$ROOT/backups" "$ROOT/logs" \
+           "$ROOT/publications" "$ROOT/locks"; do
+    [ -d "$d" ] || continue
+    echo "--- $d"
+    find "$d" -mindepth 1 -maxdepth 1 -print0 2>/dev/null | sort -z \
+      | while IFS= read -r -d '' child; do inv_entry "$child"; done
+  done
+
+  section "canonical physical files (per table / *.parts dir)"
+  find "$ROOT/state/canonical" -mindepth 1 -maxdepth 1 -print0 2>/dev/null | sort -z \
+    | while IFS= read -r -d '' child; do
+        if [ -d "$child" ]; then
+          printf '%s  DIR  %s\n' "$child" "$(inv_files_summary "$child")"
+        else
+          printf '%s  FILE bytes=%s mtime=%s\n' "$child" \
+            "$(stat -c '%s' "$child")" "$(stat -c '%y' "$child" | cut -d. -f1)"
+        fi
+      done
+
+  section "temp / staging / orphan candidates under RUNTIME_ROOT (release venvs excluded)"
+  find "$ROOT" -path "$ROOT/releases/*/.venv" -prune -o \( \
+      -name '*.tmp' -o -name '*.parquet.tmp' -o -name '*.json.tmp' -o -name '*.partial' \
+      -o -name '*.pending' -o -name '*.replaced' -o -name '_incoming' -o -name '_pending' \
+      -o -name '.*.tmp-*' -o -name '*canary*' -o -name '*.tar.gz' \) -print0 2>/dev/null \
+    | sort -z | while IFS= read -r -d '' child; do inv_entry "$child"; done
+  echo "(end of candidates)"
+  for d in "$ROOT/publications/_incoming" "$ROOT/snapshots/_pending"; do
+    if [ -d "$d" ]; then echo "--- $d"; find "$d" -mindepth 1 -maxdepth 1 -print0 \
+      | sort -z | while IFS= read -r -d '' child; do inv_entry "$child"; done; fi
+  done
+
+  section "releases"
+  local current_target
+  current_target=""
+  if [ -L "$ROOT/current" ]; then current_target="$(readlink -f "$ROOT/current")"; fi
+  echo "current -> ${current_target:-<none>}"
+  for d in "$ROOT"/releases/*; do
+    [ -e "$d" ] || continue
+    local is_current=NO prepared=NO sha="-" rollback=NO
+    [ "$(readlink -f "$d")" = "$current_target" ] && is_current=YES
+    [ -f "$d/.prepared" ] && prepared=YES
+    [ -f "$d/RELEASE_SHA" ] && sha="$(cat "$d/RELEASE_SHA")"
+    # activate_release.sh keeps exactly the active release and the one it
+    # replaced; that one is the rollback target iff it is health-verifiable.
+    if [ "$is_current" = NO ] && [ -d "$d" ] && [ "$prepared" = YES ] && [ "$sha" != "-" ]; then
+      rollback=YES
+    fi
+    printf 'release=%s bytes=%s mtime=%s current=%s rollback_target=%s prepared=%s release_sha=%s\n' \
+      "$(basename "$d")" "$(du -sb "$d" | cut -f1)" "$(stat -c '%y' "$d" | cut -d. -f1)" \
+      "$is_current" "$rollback" "$prepared" "$sha"
+  done
+
+  section "raw payloads by provider/endpoint"
+  find "$ROOT/state/raw" -mindepth 2 -maxdepth 2 -type d -print0 2>/dev/null | sort -z \
+    | while IFS= read -r -d '' child; do
+        printf '%s  %s\n' "${child#"$ROOT"/state/raw/}" "$(inv_files_summary "$child")"
+      done
+  section "raw payloads by day written (UTC mtime)"
+  find "$ROOT/state/raw" -type f -printf '%TY-%Tm-%Td %s\n' 2>/dev/null \
+    | awk '{ b[$1] += $2; n[$1] += 1 } END { for (d in b) printf "%s bytes=%d files=%d\n", d, b[d], n[d] }' \
+    | sort
+  section "raw payload growth windows"
+  for minutes in 360 1440 4320; do
+    printf 'last_%sm  ' "$minutes"
+    find "$ROOT/state/raw" -type f -mmin "-$minutes" -printf '%s\n' 2>/dev/null \
+      | awk '{ b += $1; n += 1 } END { printf "bytes=%d files=%d\n", b, n }'
+  done
+  printf 'raw_total  %s\n' "$(inv_files_summary "$ROOT/state/raw")"
+  section "canonical growth windows (files modified within window; bytes = current size)"
+  for minutes in 1440 4320; do
+    printf 'last_%sm  ' "$minutes"
+    find "$ROOT/state/canonical" -type f -mmin "-$minutes" -printf '%s\n' 2>/dev/null \
+      | awk '{ b += $1; n += 1 } END { printf "bytes=%d files=%d\n", b, n }'
+  done
+
+  section "logs (every file)"
+  [ -d "$ROOT/logs" ] && find "$ROOT/logs" -type f -printf '%14s  %TY-%Tm-%TdT%TH:%TM  %p\n' | sort -k2
+  section "backups (every file)"
+  if [ -d "$ROOT/backups" ]; then
+    find "$ROOT/backups" -type f -printf '%14s  %TY-%Tm-%TdT%TH:%TM  %p\n' | sort -k2
+  else
+    echo "absent: $ROOT/backups"
+  fi
+  section "publications (every file)"
+  [ -d "$ROOT/publications" ] && find "$ROOT/publications" -type f -printf '%14s  %TY-%Tm-%TdT%TH:%TM  %p\n' | sort -k2
+
+  section "snapshots: retention + request protection; superseded compaction parts"
+  runtime_python - "$ROOT" <<'PY' || echo "[snapshot/parts analysis failed]"
+import json, re, sys
+from pathlib import Path
+
+from nflprops.data.warehouse import read_table
+from nflprops.platform.runtime_layout import snapshot_retention
+from nflprops.platform.warehouse_snapshot import list_snapshots
+
+root = Path(sys.argv[1])
+canonical = root / "state" / "canonical"
+snap_root = root / "snapshots"
+
+SEEN = set()  # (dev, inode): hard-linked snapshot files count once overall
+
+
+def tree_bytes(path):
+    return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+
+
+def physical_bytes(path):
+    total = 0
+    for p in path.rglob("*"):
+        if p.is_file():
+            st = p.stat()
+            if (st.st_dev, st.st_ino) not in SEEN:
+                SEEN.add((st.st_dev, st.st_ino))
+                total += st.st_size
+    return total
+
+requests = read_table(canonical, "remote_checkpoint_requests")
+try:  # the deployed release's own protection rule
+    from nflprops.platform.checkpoint_prepare import SNAPSHOT_PROTECTING_STATES as protecting_states
+except ImportError:  # releases before bounded storage
+    protecting_states = ("PENDING_REMOTE_EXECUTION", "NOT_EXECUTABLE")
+print(f"protecting_states={list(protecting_states)}")
+by_snapshot = {}
+if requests.height:
+    for row in requests.iter_rows(named=True):
+        if row["snapshot_id"]:
+            by_snapshot.setdefault(row["snapshot_id"], []).append(row["state"])
+protected = {sid for sid, states in by_snapshot.items() if any(s in protecting_states for s in states)}
+
+keep = snapshot_retention()
+snapshots = list_snapshots(snap_root)
+unprotected = [s.snapshot_id for s in snapshots if s.snapshot_id not in protected]
+kept_by_policy = set(unprotected[-keep:])
+listed = {s.snapshot_id for s in snapshots}
+totals = {"all": 0, "physical": 0, "not_executable_only": 0, "beyond_policy_unprotected": 0}
+print(f"retention_keep={keep}")
+for s in snapshots:
+    size = tree_bytes(snap_root / s.snapshot_id)
+    unique = physical_bytes(snap_root / s.snapshot_id)
+    totals["physical"] += unique
+    states = sorted(by_snapshot.get(s.snapshot_id, []))
+    prot = s.snapshot_id in protected
+    ne_only = prot and all(st in ("NOT_EXECUTABLE", "COMPLETED") for st in states) and "NOT_EXECUTABLE" in states
+    totals["all"] += size
+    if ne_only:
+        totals["not_executable_only"] += size
+    if not prot and s.snapshot_id not in kept_by_policy:
+        totals["beyond_policy_unprotected"] += size
+    print(json.dumps({
+        "snapshot_id": s.snapshot_id, "bytes": size, "new_physical_bytes": unique,
+        "created_at": str(s.created_at),
+        "retained_by_policy": s.snapshot_id in kept_by_policy, "protected_by_request": prot,
+        "request_states": states, "protected_only_by_not_executable": ne_only,
+    }, sort_keys=True))
+for entry in sorted(snap_root.iterdir()) if snap_root.exists() else []:
+    if entry.name not in listed:
+        print(json.dumps({"unlisted_snapshot_entry": str(entry), "bytes": tree_bytes(entry) if entry.is_dir() else entry.stat().st_size}))
+print("snapshot_totals " + json.dumps(totals, sort_keys=True))
+
+part_re = re.compile(r"^part-(\d{9})-(\d{9})\.parquet$")
+orphan_total = 0
+for parts_dir in sorted(canonical.glob("*.parts")):
+    parts = []
+    for p in parts_dir.iterdir():
+        m = part_re.match(p.name)
+        if m and p.is_file():
+            parts.append((int(m.group(1)), int(m.group(2)), p))
+    for start, end, p in parts:
+        if any((s, e) != (start, end) and s <= start and end <= e for s, e, _ in parts):
+            size = p.stat().st_size
+            orphan_total += size
+            print(f"superseded_part bytes={size} path={p}")
+    others = [p for p in parts_dir.iterdir() if not part_re.match(p.name)]
+    for p in others:
+        print(f"non_part_file_in_parts_dir bytes={p.stat().st_size if p.is_file() else -1} path={p}")
+print(f"superseded_parts_total_bytes={orphan_total}")
+PY
+}
+
 main() {
   [ "$#" -ge 2 ] || die "usage: OPERATION RUNTIME_ROOT [ARGS...]"
   local op="$1"
@@ -154,6 +378,7 @@ main() {
       runtime_python -m nflprops.platform.wizard_runtime snapshot verify "$1" || die "snapshot verify failed"
       ;;
     restart) op_restart ;;
+    inventory) op_inventory ;;
     *) die "unknown operation $op" ;;
   esac
 }
