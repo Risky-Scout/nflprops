@@ -376,6 +376,7 @@ def _build_loop(
     from nflprops.platform.checkpoint_worker import DEFAULT_WORKER_TIMEOUT_SECONDS
     from nflprops.platform.runtime_layout import current_migration_head
     from nflprops.platform.runtime_loop import (
+        DEFAULT_OUTCOME_INGEST_INTERVAL_SECONDS,
         DEFAULT_SNAPSHOT_INTERVAL_SECONDS,
         DEFAULT_TICK_SECONDS,
         RuntimeLoop,
@@ -412,6 +413,11 @@ def _build_loop(
             )
         ),
         raw_retention_days=retention_days,
+        outcome_ingest_interval_seconds=float(
+            os.environ.get(
+                "NFLPROPS_OUTCOME_INGEST_INTERVAL_SECONDS", DEFAULT_OUTCOME_INGEST_INTERVAL_SECONDS
+            )
+        ),
     )
 
 
@@ -570,6 +576,78 @@ def checkpoint_pending() -> None:
     typer.echo(json.dumps(rows, indent=2, sort_keys=True, default=str))
 
 
+@checkpoint_app.command("executable")
+def checkpoint_executable() -> None:
+    """Read-only, for the GitHub executor (checkpoint-execute.yml): the
+    PENDING_REMOTE_EXECUTION requests that still pass the fail-closed
+    execution gate, oldest cutoff first, each with the identity GitHub
+    must verify and -- if a result bundle for it is already published
+    (an earlier executor died before ingest) -- that bundle's manifest
+    SHA-256, so the executor resumes ingest instead of re-executing."""
+    import json
+
+    from nflprops.platform.immutable_bundle import read_manifest
+    from nflprops.platform.result_ingest import result_bundle_id
+
+    layout = _layout()
+    if not layout.warehouse_root.is_dir():
+        typer.echo("[]")
+        return
+    from nflprops.data.warehouse import Warehouse
+    from nflprops.platform.checkpoint_prepare import executable_requests
+
+    rows = []
+    frame = executable_requests(Warehouse(layout.warehouse_root))
+    for row in frame.sort("scheduled_as_of").iter_rows(named=True):
+        published = layout.publications / result_bundle_id(row["run_id"])
+        published_sha = None
+        if published.is_dir():
+            try:
+                published_sha = read_manifest(published).manifest_sha256
+            except BundleError:
+                published_sha = None  # not a valid bundle: never resumed from
+        rows.append({
+            field: row[field]
+            for field in (
+                "run_id", "checkpoint_name", "game_id", "season", "week",
+                "scheduled_as_of", "kickoff_at", "request_bundle_sha256",
+                "snapshot_id", "snapshot_manifest_sha256", "data_manifest_sha256",
+            )
+        } | {"published_result_manifest_sha256": published_sha})
+    typer.echo(json.dumps(rows, indent=2, sort_keys=True, default=str))
+
+
+@checkpoint_app.command("refuse")
+def checkpoint_refuse(
+    run_id: str = typer.Option(..., help="The pending request's run_id (64 hex)."),
+    workflow_run: str = typer.Option(..., help="URL of the GitHub run that refused it."),
+) -> None:
+    """WIZARD SIDE: record that the GitHub executor's verification refused
+    one pending request (-> NOT_EXECUTABLE, run FAILED). Only narrows
+    publication; idempotent; never touches a completed request."""
+    import re
+
+    from nflprops.data.warehouse import Warehouse
+    from nflprops.platform.result_ingest import ResultIngestError, refuse_request
+
+    if not re.fullmatch(r"[0-9a-f]{64}", run_id):
+        raise typer.BadParameter("run_id must be 64 hex")
+    if not re.fullmatch(r"https://github\.com/[\w.-]+/[\w.-]+/actions/runs/\d+", workflow_run):
+        raise typer.BadParameter("workflow_run must be a GitHub Actions run URL")
+    layout = _layout()
+    try:
+        status = refuse_request(
+            Warehouse(layout.warehouse_root),
+            run_id,
+            detail=f"GitHub executor verification refused the request: {workflow_run}",
+            lock_path=layout.writer_lock,
+        )
+    except (ResultIngestError, WriterLockError) as exc:
+        typer.echo(f"FAILED: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(f"{status}: {run_id}")
+
+
 # ------------------------------------------------------------ BLOCK 4
 
 
@@ -577,6 +655,9 @@ def checkpoint_pending() -> None:
 def ingest_stats(
     seasons: str = typer.Option(..., help="Comma-separated seasons, e.g. 2024,2025,2026."),
     weeks: str = typer.Option("", help="Optional comma-separated weeks, e.g. 1,2,3,4."),
+    recent_days: int = typer.Option(
+        0, help="Only final games played in the last N days (recurring runtime ingest); 0 = all."
+    ),
 ) -> None:
     """Append completed-game outcome history (`player_game_stats`,
     `team_game_stats`) for final games only as immutable versions: a
@@ -585,20 +666,22 @@ def ingest_stats(
     `games` or any other table."""
     import json
     from dataclasses import asdict
-    from datetime import UTC, datetime
+    from datetime import UTC, datetime, timedelta
 
     from nflprops.data.outcome_versions import OutcomeVersionError
     from nflprops.platform.stats_backfill import backfill_outcome_history
 
     layout, _cfg, warehouse, provider, _release_sha = _runtime_components()
+    now = datetime.now(UTC)
     try:
         summaries = backfill_outcome_history(
             provider,
             warehouse,
             seasons=[int(part) for part in seasons.split(",") if part.strip()],
             lock_path=layout.writer_lock,
-            now=datetime.now(UTC),
+            now=now,
             weeks=[int(part) for part in weeks.split(",") if part.strip()] or None,
+            since=now - timedelta(days=recent_days) if recent_days > 0 else None,
         )
     except (WriterLockError, OutcomeVersionError) as exc:
         typer.echo(f"FAILED: {exc}", err=True)
@@ -623,7 +706,9 @@ def execute_checkpoint_cmd(
     """GITHUB SIDE ONLY: verify one prepared checkpoint against its
     snapshot, run the certified 20,000-draw checkpoint flow on a scratch
     restore, gate calibration, decide PUBLIC_READY, and write the result
-    files. Refuses to run on the Wizard host (NFLPROPS_RUNTIME_ROOT set)."""
+    files. Refuses to run on the Wizard host (NFLPROPS_RUNTIME_ROOT set).
+    Exit 3 = verification deterministically refused the request; exit 1 =
+    any other (possibly transient) failure."""
     import json
     import os
 
@@ -647,13 +732,20 @@ def execute_checkpoint_cmd(
         info = restore_snapshot(Path(snapshot_root), request["snapshot_id"], scratch)
         warehouse = Warehouse(scratch, Path(work_dir) / "scratch.duckdb")
         cfg = load()
-        run = verify_request_against_snapshot(
-            request,
-            warehouse,
-            cfg,
-            snapshot_id=info.snapshot_id,
-            snapshot_manifest_sha256=info.manifest_sha256,
-        )
+        try:
+            run = verify_request_against_snapshot(
+                request,
+                warehouse,
+                cfg,
+                snapshot_id=info.snapshot_id,
+                snapshot_manifest_sha256=info.manifest_sha256,
+            )
+        except RemoteExecutionError as exc:
+            # Deterministic: this request can never execute as claimed.
+            # Exit 3 lets the workflow record it NOT_EXECUTABLE on Wizard
+            # (never retried, never blocks the queue).
+            typer.echo(f"REFUSED: {exc}", err=True)
+            raise typer.Exit(3) from exc
         executed = execute_checkpoint(
             request,
             run,

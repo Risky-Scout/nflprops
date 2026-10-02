@@ -13,6 +13,11 @@ name: Wizard Runtime Ops
 #                                       (never science, never publication)
 #   restart                             scoped restart of nflprops-runtime
 #                                       only, gated on health
+#   checkpoint-select                   read-only executable-request list
+#   result-ingest                       BLOCK 4: install ONE published GitHub
+#                                       result bundle (idempotent)
+#   ingest-stats                        BLOCK 4: append final-game outcome
+#                                       versions (genuine receipt time)
 #
 # Never touches any other service, nginx, DNS, or any path outside
 # /home/wizard-deploy/nflprops.
@@ -32,6 +37,9 @@ on:
           - verify-snapshot
           - restart
           - inventory
+          - checkpoint-select
+          - result-ingest
+          - ingest-stats
       game_id:
         description: "manual-checkpoint: canonical game id (UUID)"
         required: false
@@ -50,6 +58,18 @@ on:
         type: string
       snapshot_id:
         description: "verify-snapshot: snapshot id"
+        required: false
+        type: string
+      bundle_id:
+        description: "result-ingest: checkpoint-result-<run_id>"
+        required: false
+        type: string
+      manifest_sha256:
+        description: "result-ingest: the result bundle manifest SHA-256 the executor reported"
+        required: false
+        type: string
+      weeks:
+        description: "ingest-stats: optional comma-separated weeks, e.g. 1,2,3,4 (season is required)"
         required: false
         type: string
 
@@ -77,6 +97,9 @@ jobs:
           SEASON: ${{ inputs.season }}
           WEEK: ${{ inputs.week }}
           SNAPSHOT_ID: ${{ inputs.snapshot_id }}
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+          MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+          WEEKS: ${{ inputs.weeks }}
         run: |
           if [ "${{ github.ref }}" != "refs/heads/main" ]; then
             echo "::error::Wizard ops may only run from main (got ${{ github.ref }})"; exit 1
@@ -90,6 +113,14 @@ jobs:
               ;;
             verify-snapshot)
               [[ "$SNAPSHOT_ID" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$ ]] || { echo "::error::snapshot_id format"; exit 1; }
+              ;;
+            result-ingest)
+              [[ "$BUNDLE_ID" =~ ^checkpoint-result-[0-9a-f]{64}$ ]] || { echo "::error::bundle_id must be checkpoint-result-<run_id>"; exit 1; }
+              [[ "$MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::manifest_sha256 must be 64 hex"; exit 1; }
+              ;;
+            ingest-stats)
+              [[ "$SEASON" =~ ^20[0-9]{2}$ ]] || { echo "::error::season must be a year"; exit 1; }
+              [[ -z "$WEEKS" || "$WEEKS" =~ ^[0-9]{1,2}(,[0-9]{1,2})*$ ]] || { echo "::error::weeks must be like 1,2,3,4"; exit 1; }
               ;;
           esac
 
@@ -115,12 +146,17 @@ jobs:
           SEASON: ${{ inputs.season }}
           WEEK: ${{ inputs.week }}
           SNAPSHOT_ID: ${{ inputs.snapshot_id }}
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+          MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+          WEEKS: ${{ inputs.weeks }}
         run: |
           REMOTE="${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}"
           ARGS=()
           case "$OPERATION" in
             manual-checkpoint) ARGS=("$GAME_ID" "$AS_OF" "$SEASON" "$WEEK") ;;
             verify-snapshot) ARGS=("$SNAPSHOT_ID") ;;
+            result-ingest) ARGS=("$BUNDLE_ID" "$MANIFEST_SHA256") ;;
+            ingest-stats) ARGS=("$SEASON"); [ -n "$WEEKS" ] && ARGS+=("$WEEKS") ;;
           esac
           # shellcheck disable=SC2086
           ssh $SSH_OPTS "$REMOTE" bash -s -- "$OPERATION" "$RUNTIME_ROOT" "${ARGS[@]}" \

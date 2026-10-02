@@ -21,10 +21,23 @@
 #                          payload growth, logs/backups, temp/orphan files)
 #   restart                sudo -n systemctl restart nflprops-runtime.service,
 #                          then GATE on 2 consecutive healthy probes
+#   checkpoint-select      READ-ONLY (BLOCK 4): JSON list of executable
+#                          PENDING_REMOTE_EXECUTION requests (+ any already
+#                          published result bundle SHA) for checkpoint-execute.yml
+#   result-ingest BUNDLE_ID MANIFEST_SHA256
+#                          BLOCK 4: validate + install ONE published GitHub
+#                          result bundle (runtime owner, writer lock; idempotent)
+#   checkpoint-refuse RUN_ID WORKFLOW_RUN_URL
+#                          BLOCK 4: the executor's verification refused this
+#                          request -> NOT_EXECUTABLE (fail closed; idempotent)
+#   ingest-stats SEASON [WEEKS]
+#                          BLOCK 4: append final-game outcome versions
+#                          (genuine receipt time; never fabricated PIT)
 #
 # Runs as wizard-deploy. Touches no other service, nginx, or any path
 # outside RUNTIME_ROOT; the only privileged action is the scoped restart.
 # Never runs training, replay, simulation, or calibration.
+# (result-ingest only appends GitHub-produced rows; it computes no science.)
 
 set -uo pipefail
 
@@ -379,6 +392,37 @@ main() {
       ;;
     restart) op_restart ;;
     inventory) op_inventory ;;
+    checkpoint-select)
+      runtime_python -m nflprops.platform.wizard_runtime checkpoint executable \
+        || die "checkpoint select failed"
+      ;;
+    result-ingest)
+      [ "$#" -eq 2 ] || die "result-ingest needs BUNDLE_ID MANIFEST_SHA256"
+      [[ "$1" =~ ^checkpoint-result-[0-9a-f]{64}$ ]] || die "bundle_id format"
+      [[ "$2" =~ ^[0-9a-f]{64}$ ]] || die "manifest sha256 format"
+      [ -d "$ROOT/publications/$1" ] || die "no published bundle $1"
+      runtime_python -m nflprops.platform.wizard_runtime result-ingest \
+        --bundle-id "$1" --expected-manifest-sha256 "$2" || die "result ingest failed"
+      ;;
+    checkpoint-refuse)
+      [ "$#" -eq 2 ] || die "checkpoint-refuse needs RUN_ID WORKFLOW_RUN_URL"
+      [[ "$1" =~ ^[0-9a-f]{64}$ ]] || die "run_id format"
+      [[ "$2" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+$ ]] || die "workflow run url format"
+      runtime_python -m nflprops.platform.wizard_runtime checkpoint refuse \
+        --run-id "$1" --workflow-run "$2" || die "checkpoint refuse failed"
+      ;;
+    ingest-stats)
+      [ "$#" -ge 1 ] && [ "$#" -le 2 ] || die "ingest-stats needs SEASON [WEEKS]"
+      [[ "$1" =~ ^20[0-9]{2}$ ]] || die "season format"
+      if [ "$#" -eq 2 ]; then
+        [[ "$2" =~ ^[0-9]{1,2}(,[0-9]{1,2})*$ ]] || die "weeks format"
+        runtime_python -m nflprops.platform.wizard_runtime ingest-stats \
+          --seasons "$1" --weeks "$2" || die "ingest-stats failed"
+      else
+        runtime_python -m nflprops.platform.wizard_runtime ingest-stats \
+          --seasons "$1" || die "ingest-stats failed"
+      fi
+      ;;
     *) die "unknown operation $op" ;;
   esac
 }

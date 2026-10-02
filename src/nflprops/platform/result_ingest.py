@@ -25,7 +25,9 @@ resumed by re-running the same ingest): artifact rows (natural keys,
 `remote_checkpoint_results` row carrying the PUBLIC_READY decision.
 
 Re-ingesting an already-installed bundle is a no-op; a DIFFERENT bundle
-for an already-completed run is refused.
+for an already-completed run is refused. A crash at any point before the
+final results row is resumed by re-running the same ingest, including
+after the request was already marked COMPLETED.
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ from nflprops.orchestration.run_store import (
     update_run_status,
 )
 from nflprops.platform.checkpoint_prepare import (
+    STATE_NOT_EXECUTABLE,
     STATE_PENDING_REMOTE_EXECUTION,
     _read_requests,
     _upsert_request,
@@ -66,6 +69,12 @@ from nflprops.platform.writer_lock import WriterLock
 
 RESULTS_TABLE = "remote_checkpoint_results"
 STATE_COMPLETED = "COMPLETED"
+
+#: The GitHub executor's verification deterministically refused the
+#: request (identity/config/manifest drift, a RESEARCH_ONLY snapshot, a
+#: failed execution gate): it can never execute, so it must not block the
+#: queue. Recorded exactly like the runtime's own execution gate.
+FAILURE_REMOTE_EXECUTION_REFUSED = "REMOTE_EXECUTION_REFUSED"
 
 _TS = pl.Datetime(time_unit="us", time_zone="UTC")
 _RESULTS_SCHEMA: dict[str, Any] = {
@@ -161,7 +170,10 @@ def _check_live_request(
     if requests.height != 1:
         raise ResultIngestError(f"no live checkpoint request for run {result['run_id']}")
     request = requests.row(0, named=True)
-    if request["state"] != STATE_PENDING_REMOTE_EXECUTION:
+    # COMPLETED is written only by this ingest, immediately before the
+    # `remote_checkpoint_results` row; reaching here (no results row yet)
+    # in that state means a crash between the two writes -> resume.
+    if request["state"] not in (STATE_PENDING_REMOTE_EXECUTION, STATE_COMPLETED):
         raise ResultIngestError(f"live request is {request['state']}, not PENDING_REMOTE_EXECUTION")
     for field in ("snapshot_id", "snapshot_manifest_sha256", "data_manifest_sha256",
                   "request_bundle_sha256"):
@@ -272,3 +284,39 @@ def _summary(result: dict[str, Any], bundle_id: str, manifest_sha: str) -> dict[
         "decision_reasons": result["decision_reasons"],
         "row_counts": result["row_counts"],
     }
+
+
+def refuse_request(
+    warehouse: Warehouse,
+    run_id: str,
+    *,
+    detail: str,
+    lock_path: Path,
+    lock_timeout_seconds: float = 60.0,
+) -> str:
+    """Record that the GitHub executor's verification refused `run_id`:
+    request PENDING_REMOTE_EXECUTION -> NOT_EXECUTABLE, run SCHEDULED ->
+    FAILED (REMOTE_EXECUTION_REFUSED) -- the same transitions the
+    runtime's execution gate makes. Only ever narrows publication (fail
+    closed). Idempotent; a completed request is never touched."""
+    with WriterLock(lock_path, timeout_seconds=lock_timeout_seconds):
+        requests = _read_requests(warehouse).filter(pl.col("run_id") == run_id)
+        if requests.height != 1:
+            raise ResultIngestError(f"no live checkpoint request for run {run_id}")
+        request = requests.row(0, named=True)
+        if request["state"] == STATE_NOT_EXECUTABLE:
+            return "ALREADY_NOT_EXECUTABLE"
+        if request["state"] != STATE_PENDING_REMOTE_EXECUTION:
+            raise ResultIngestError(f"live request is {request['state']}; refusing to change it")
+        backend = as_run_store_backend(warehouse)
+        run = get_run(backend, run_id)
+        if run is not None and run.status is PredictionRunStatus.SCHEDULED:
+            update_run_status(
+                backend,
+                run_id,
+                status=PredictionRunStatus.FAILED,
+                failure_code=FAILURE_REMOTE_EXECUTION_REFUSED,
+                failure_detail=detail,
+            )
+        _upsert_request(warehouse, {**request, "state": STATE_NOT_EXECUTABLE})
+    return "NOT_EXECUTABLE"

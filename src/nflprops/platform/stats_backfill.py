@@ -82,12 +82,18 @@ def fetch_season_outcomes(
     season: int,
     now: datetime,
     weeks: Sequence[int] | None = None,
+    since: datetime | None = None,
     include_postseason: bool = True,
 ) -> tuple[pl.DataFrame, pl.DataFrame, SeasonBackfill]:
     """Read one season's completed-game outcomes from the provider (no
     writes). Returns (player_game_stats, team_game_stats, summary); each
     frame carries `outcome_source_status`, the provider game status the
-    row was selected under."""
+    row was selected under.
+
+    `weeks` / `since` (game date >= since) restrict the final games; when
+    either is given and the provider exposes `provider_game_id`, stats are
+    fetched for exactly those games (small, bounded calls for the live
+    runtime's recurring ingest) instead of the whole season."""
     season_types = [2, 3] if include_postseason else [2]
     games = records_to_frame(provider.games(seasons=[season], season_types=season_types))
     final_games = pl.DataFrame(schema={"canonical_game_id": pl.Utf8, "outcome_source_status": pl.Utf8})
@@ -95,16 +101,30 @@ def fetch_season_outcomes(
         selected = games.filter(_is_final(pl.col("status")))
         if weeks is not None:
             selected = selected.filter(pl.col("week").is_in(list(weeks)))
+        if since is not None:
+            selected = selected.filter(pl.col("date") >= since)
         final_games = selected.select(
             pl.col("canonical_game_id").cast(pl.Utf8),
             pl.col("status").cast(pl.Utf8).alias("outcome_source_status"),
         ).unique(subset=["canonical_game_id"], keep="first", maintain_order=True)
 
+    game_ids: list[str] | None = None
+    if (weeks is not None or since is not None) and "provider_game_id" in games.columns:
+        game_ids = (
+            games.filter(pl.col("canonical_game_id").cast(pl.Utf8).is_in(
+                final_games["canonical_game_id"].implode()
+            ))["provider_game_id"].drop_nulls().cast(pl.Utf8).unique().sort().to_list()
+        )
     ps_records: list[Any] = []
     ts_records: list[Any] = []
-    for season_type in season_types:
-        ps_records.extend(provider.player_game_stats(seasons=[season], season_type=season_type))
-        ts_records.extend(provider.team_game_stats(seasons=[season], season_type=season_type))
+    if game_ids != []:  # no selected final game -> nothing to fetch
+        for season_type in season_types:
+            ps_records.extend(provider.player_game_stats(
+                seasons=[season], game_ids=game_ids, season_type=season_type
+            ))
+            ts_records.extend(provider.team_game_stats(
+                seasons=[season], game_ids=game_ids, season_type=season_type
+            ))
 
     def _prepare(records: list[Any], table: str) -> tuple[pl.DataFrame, int]:
         frame = records_to_frame(records)
@@ -158,6 +178,7 @@ def backfill_outcome_history(
     lock_path: Path,
     now: datetime,
     weeks: Sequence[int] | None = None,
+    since: datetime | None = None,
     lock_timeout_seconds: float = 60.0,
     include_postseason: bool = True,
 ) -> list[BackfillResult]:
@@ -166,7 +187,7 @@ def backfill_outcome_history(
     fail-closed refusal aborts before anything is written."""
     fetched = [
         fetch_season_outcomes(
-            provider, season=season, now=now, weeks=weeks,
+            provider, season=season, now=now, weeks=weeks, since=since,
             include_postseason=include_postseason,
         )
         for season in sorted(set(seasons))

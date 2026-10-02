@@ -45,10 +45,12 @@ from nflprops.platform.remote_checkpoint import (
 )
 from nflprops.platform.remote_training import PRODUCTION_N_DRAWS
 from nflprops.platform.result_ingest import (
+    FAILURE_REMOTE_EXECUTION_REFUSED,
     RESULTS_TABLE,
     STATE_COMPLETED,
     ResultIngestError,
     ingest_result_bundle,
+    refuse_request,
     result_bundle_id,
 )
 from nflprops.platform.runtime_layout import resolve_runtime_layout
@@ -193,10 +195,146 @@ def test_full_roundtrip_installs_result_and_fails_public_ready_closed(
         )
 
 
+@pytest.mark.parametrize("crash_at", ["request_transition", "results_row"])
+def test_ingest_resumes_after_a_crash_and_refuses_a_different_bundle(
+    wizard: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, crash_at: str
+) -> None:
+    """A crash at any step under the lock is resumed by re-running the SAME
+    ingest -- including the window after the request is marked COMPLETED
+    but before the results row exists -- with no duplicated rows; a
+    different bundle for the completed run is then refused."""
+    run_id = wizard["prepared"].run_id
+    live = wizard["warehouse"]
+    lock = wizard["layout"].writer_lock
+    executed = _github_execute(wizard, tmp_path)
+    final, manifest_sha = _publish(wizard, executed["out"], run_id)
+
+    class _SimulatedCrashError(RuntimeError):
+        pass
+
+    real_upsert = result_ingest._upsert_request
+    real_append = live.append
+    if crash_at == "request_transition":
+        def _crash_upsert(*_a: object, **_k: object) -> None:
+            raise _SimulatedCrashError
+        monkeypatch.setattr(result_ingest, "_upsert_request", _crash_upsert)
+    else:
+        def _crash_results(table: str, *a: object, **k: object) -> object:
+            if table == RESULTS_TABLE:
+                raise _SimulatedCrashError
+            return real_append(table, *a, **k)
+        monkeypatch.setattr(live, "append", _crash_results)
+
+    with pytest.raises(_SimulatedCrashError):
+        ingest_result_bundle(live, final, expected_manifest_sha256=manifest_sha,
+                             lock_path=lock, now=datetime.now(UTC))
+    request = live.read(REMOTE_REQUESTS_TABLE).filter(pl.col("run_id") == run_id)
+    expected_state = "PENDING_REMOTE_EXECUTION" if crash_at == "request_transition" else STATE_COMPLETED
+    assert request["state"].to_list() == [expected_state]
+    assert not live.exists(RESULTS_TABLE)
+    # Restore only this test's crash injection (the fixture's patches stay).
+    monkeypatch.setattr(result_ingest, "_upsert_request", real_upsert)
+    monkeypatch.setattr(live, "append", real_append)
+
+    resumed = ingest_result_bundle(live, final, expected_manifest_sha256=manifest_sha,
+                                   lock_path=lock, now=datetime.now(UTC))
+    assert resumed["status"] == "INGESTED"
+    assert get_run(live, run_id).status.value == executed["result"]["run"]["status"]
+    request = live.read(REMOTE_REQUESTS_TABLE).filter(pl.col("run_id") == run_id)
+    assert request["state"].to_list() == [STATE_COMPLETED]
+    assert live.read(RESULTS_TABLE).height == 1
+    for table, count in executed["result"]["row_counts"].items():
+        if count:
+            assert live.read(table).filter(pl.col("run_id") == run_id).height == count, table
+
+    # A second, different execution of the same request: refused.
+    other = _github_execute(wizard, tmp_path / "second")
+    bundle_id = result_bundle_id(run_id)
+    staging = stage_bundle_dir(tmp_path / "elsewhere" / bundle_id, bundle_id=bundle_id)
+    shutil.copytree(other["out"], staging, dirs_exist_ok=True)
+    manifest = build_manifest(
+        bundle_id=bundle_id, source_identity={"science_sha": "c" * 40},
+        schema_version="nflprops.platform.wizard_runtime.result_bundle/v1", root_dir=staging,
+    )
+    write_manifest(manifest, staging)
+    assert manifest.manifest_sha256 != manifest_sha
+    with pytest.raises(ResultIngestError, match="already has installed result"):
+        ingest_result_bundle(live, staging, expected_manifest_sha256=manifest.manifest_sha256,
+                             lock_path=lock, now=datetime.now(UTC))
+    assert live.read(RESULTS_TABLE)["bundle_manifest_sha256"].to_list() == [manifest_sha]
+
+
 def test_executor_refuses_config_drift(wizard: dict, tmp_path: Path) -> None:
     drifted = load(cli_overrides={"run.log_level": "DEBUG"})
     with pytest.raises(RemoteExecutionError, match="config SHA"):
         _github_execute(wizard, tmp_path, config=drifted)
+
+
+def test_execute_cli_exits_3_on_a_deterministic_verification_refusal(
+    wizard: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """checkpoint-execute.yml records exit 3 as NOT_EXECUTABLE (never
+    retried); every other failure stays retryable."""
+    from typer.testing import CliRunner
+
+    import nflprops.config as config_module
+    from nflprops.platform.wizard_runtime import app
+
+    drifted = load(cli_overrides={"run.log_level": "DEBUG"})
+    monkeypatch.setattr(config_module, "load", lambda *a, **k: drifted)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    monkeypatch.delenv("NFLPROPS_RUNTIME_ROOT", raising=False)
+    prepared = wizard["prepared"]
+    (tmp_path / "work").mkdir()
+    (tmp_path / "out").mkdir()
+    result = CliRunner().invoke(app, [
+        "execute-checkpoint",
+        "--request-dir", str(prepared.request_bundle_dir),
+        "--expected-request-sha256", prepared.request_bundle_sha256,
+        "--snapshot-root", str(wizard["layout"].snapshots),
+        "--work-dir", str(tmp_path / "work"),
+        "--out-dir", str(tmp_path / "out"),
+        "--science-sha", "b" * 40,
+        "--workflow-run", "test",
+    ])
+    assert result.exit_code == 3, result.output
+    assert not (tmp_path / "out" / "result.json").exists()
+
+
+def test_refusal_marks_not_executable_idempotently_and_never_touches_completed(
+    wizard: dict, tmp_path: Path
+) -> None:
+    run_id = wizard["prepared"].run_id
+    live = wizard["warehouse"]
+    lock = wizard["layout"].writer_lock
+    assert refuse_request(live, run_id, detail="github run x", lock_path=lock) == "NOT_EXECUTABLE"
+    request = live.read(REMOTE_REQUESTS_TABLE).filter(pl.col("run_id") == run_id)
+    assert request["state"].to_list() == ["NOT_EXECUTABLE"]
+    run = get_run(live, run_id)
+    assert run.status.value == "FAILED"
+    assert run.failure_code == FAILURE_REMOTE_EXECUTION_REFUSED
+    assert refuse_request(live, run_id, detail="again", lock_path=lock) == "ALREADY_NOT_EXECUTABLE"
+    # A refused request can never be completed by a late result bundle
+    # (the snapshot predates the refusal, so the GitHub side still verifies;
+    # the Wizard ingest is what refuses).
+    executed = _github_execute(wizard, tmp_path)
+    final, sha = _publish(wizard, executed["out"], run_id)
+    with pytest.raises(ResultIngestError, match="NOT_EXECUTABLE"):
+        ingest_result_bundle(live, final, expected_manifest_sha256=sha,
+                             lock_path=lock, now=datetime.now(UTC))
+
+
+def test_refusal_never_touches_a_completed_request(wizard: dict, tmp_path: Path) -> None:
+    run_id = wizard["prepared"].run_id
+    live = wizard["warehouse"]
+    lock = wizard["layout"].writer_lock
+    executed = _github_execute(wizard, tmp_path)
+    final, sha = _publish(wizard, executed["out"], run_id)
+    ingest_result_bundle(live, final, expected_manifest_sha256=sha, lock_path=lock,
+                         now=datetime.now(UTC))
+    with pytest.raises(ResultIngestError, match="COMPLETED"):
+        refuse_request(live, run_id, detail="late", lock_path=lock)
+    assert get_run(live, run_id).status.value == executed["result"]["run"]["status"]
 
 
 def test_executor_refuses_non_production_draw_count(
