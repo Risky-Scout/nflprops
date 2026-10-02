@@ -445,9 +445,9 @@ class _StatsProvider:
     """Records carry the provider boundary's genuine receipt time, exactly
     like `BDLProvider` (`MappingContext.effective_available_at`)."""
 
-    def __init__(self, now: datetime) -> None:
+    def __init__(self, now: datetime, received_at: datetime | None = None) -> None:
         self.now = now
-        self.received_at = now - timedelta(minutes=1)
+        self.received_at = received_at if received_at is not None else now - timedelta(minutes=1)
 
     def games(self, seasons=None, season_types=None, **_kw):
         base = {"season": 2026, "season_type": 2, "week": 1, "postseason": False,
@@ -508,3 +508,36 @@ def test_stats_backfill_is_final_only_genuine_receipt_time_and_versioned(
     # Identical provider content: no new version, stored rows untouched.
     assert (again[0].player.new_keys, again[0].player.corrections) == (0, 0)
     assert warehouse.read("player_game_stats").equals(before)
+
+
+def test_stats_backfill_accepts_receipts_stamped_during_the_fetch(tmp_path: Path) -> None:
+    """Production regression: `ingest-stats` takes `now` BEFORE fetching and
+    the real provider stamps each record's receipt time DURING the fetch,
+    so genuine rows carry available_at > now. They must be stored with that
+    exact receipt time; only a row stamped after the fetch completed is
+    held back."""
+    now = datetime.now(UTC)
+    received_at = now + timedelta(microseconds=1)  # slightly after now, before fetch completion
+    provider = _StatsProvider(now, received_at=received_at)
+    warehouse = Warehouse(tmp_path / "canonical")
+    results = backfill_outcome_history(
+        provider, warehouse, seasons=[2026], lock_path=tmp_path / "writer.lock", now=now
+    )
+    assert results[0].season.held_back_rows == 0
+    assert (results[0].season.player_rows, results[0].season.team_rows) == (2, 2)
+    for table in ("player_game_stats", "team_game_stats"):
+        stored = warehouse.read(table)
+        # The evidence timestamp is the genuine receipt, never the cutoff.
+        assert stored["available_at"].to_list() == [received_at] * 2
+        assert stored["available_at_is_estimated"].to_list() == [False, False]
+
+    # A receipt genuinely after the fetch completed is still held back.
+    future = _StatsProvider(now, received_at=datetime.now(UTC) + timedelta(hours=1))
+    other = Warehouse(tmp_path / "other")
+    held = backfill_outcome_history(
+        future, other, seasons=[2026], lock_path=tmp_path / "writer.lock", now=now
+    )
+    assert held[0].season.held_back_rows == 4  # 2 player + 2 team final-game rows
+    assert (held[0].season.player_rows, held[0].season.team_rows) == (0, 0)
+    assert held[0].player.stored_versions == 0
+    assert held[0].team.stored_versions == 0

@@ -39,7 +39,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -133,6 +133,12 @@ def fetch_season_outcomes(
             ts_records.extend(provider.team_game_stats(
                 seasons=[season], game_ids=game_ids, season_type=season_type
             ))
+    # The provider stamps each record's genuine receipt time DURING the
+    # fetch above, i.e. after a `now` taken before it. The hold-back cutoff
+    # is therefore when the fetch completed (never earlier than `now`); only
+    # a record stamped after that is genuinely from the future. This moves
+    # the validation cutoff only -- `available_at` itself is never touched.
+    received_by = max(now, datetime.now(UTC))
 
     def _prepare(records: list[Any], table: str) -> tuple[pl.DataFrame, int]:
         frame = records_to_frame(records)
@@ -151,8 +157,8 @@ def fetch_season_outcomes(
         frame = frame.with_columns(pl.col("canonical_game_id").cast(pl.Utf8)).join(
             final_games, on="canonical_game_id", how="inner"
         )
-        future = frame.filter(pl.col("available_at") > now)
-        return frame.filter(pl.col("available_at") <= now), future.height
+        future = frame.filter(pl.col("available_at") > received_by)
+        return frame.filter(pl.col("available_at") <= received_by), future.height
 
     ps, ps_held = _prepare(ps_records, "player_game_stats")
     ts, ts_held = _prepare(ts_records, "team_game_stats")
