@@ -158,6 +158,9 @@ def _week(root: Path) -> tuple[dict, FakeProvider, datetime]:
 
 
 def _loop(env: dict, provider: FakeProvider, clock: object, **kwargs: object) -> RuntimeLoop:
+    # The startup grace (no pass in the first 300 s after loop start) has
+    # its own tests in test_checkpoint_pacing_and_heartbeat.py.
+    kwargs.setdefault("checkpoint_startup_grace_seconds", 0.0)
     return RuntimeLoop(layout=env["layout"], warehouse=env["warehouse"], config=env["config"],
                        provider=provider, migration_head=HEAD, release_sha="a" * 40,
                        clock=clock, season=SEASON, lock_timeout_seconds=5.0,  # type: ignore[arg-type]
@@ -269,11 +272,13 @@ def test_eleven_simultaneous_checkpoints_one_bounded_unit_per_pass(tmp_path: Pat
 
 def test_runtime_ticks_drain_the_queue_monotonically(tmp_path: Path) -> None:
     env, provider, now = _week(tmp_path / "rt")
-    loop = _loop(env, provider, Clock(now), checkpoint_worker=False)
+    clock = Clock(now)
+    loop = _loop(env, provider, clock, checkpoint_worker=False)
     for done in range(1, N_GAMES + 1):
         loop.tick()
         assert _states(env).count(STATE_PENDING_REMOTE_EXECUTION) == done
         assert loop._last["checkpoint_preparation"]["prepared"] == 1
+        clock.advance(timedelta(seconds=loop.checkpoint_cooldown_seconds))  # paced
     loop.tick()
     assert _runs(env).height == N_GAMES  # nothing re-claimed
 
@@ -476,9 +481,11 @@ def test_committed_checkpoints_survive_a_later_timeout_and_a_parent_restart(
     assert _requests(env).sort("request_id").equals(committed)  # nothing reset
 
     # ... and the parent restarts: a NEW RuntimeLoop (fresh in-memory state)
-    restarted = _loop(env, provider, Clock(now), checkpoint_worker=False)
+    restart_clock = Clock(now)
+    restarted = _loop(env, provider, restart_clock, checkpoint_worker=False)
     for _ in range(N_GAMES):
         restarted.tick()
+        restart_clock.advance(timedelta(seconds=restarted.checkpoint_cooldown_seconds))
 
     runs = _runs(env)
     assert runs.height == N_GAMES and runs["run_id"].n_unique() == N_GAMES

@@ -844,8 +844,6 @@ def platform_health(
         request_snapshot_ids_at,
     )
 
-    protected = protected_snapshot_ids_at(layout.warehouse_root)
-
     running_sha = _running_release_sha()
     checks["runtime_version"] = runtime_version_check(running_sha)
     if expect_version:
@@ -871,8 +869,10 @@ def platform_health(
         publications_root=layout.publications,
         retention_limit=retention,
         raw_root=layout.raw_root,
-        protected_snapshot_ids=protected,
-        request_snapshot_ids=request_snapshot_ids_at(layout.warehouse_root),
+        # Resolved inside the check, after it lists the snapshots (see
+        # storage_growth_check): a snapshot it sees is never unprotected.
+        protected_snapshot_ids=lambda: protected_snapshot_ids_at(layout.warehouse_root),
+        request_snapshot_ids=lambda: request_snapshot_ids_at(layout.warehouse_root),
     )
     checks["memory_pressure"] = memory_pressure_check()
     checks["migration_storage_version"] = migration_storage_version_check()
