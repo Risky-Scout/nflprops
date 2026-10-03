@@ -266,10 +266,10 @@ def test_runtime_records_the_timeout_backs_off_then_recovers(tmp_path: Path) -> 
     target = loop.resolver.resolve(env["warehouse"], now)  # type: ignore[union-attr]
     assert target is not None
 
-    with pytest.raises(CheckpointWorkerTimeoutError):
-        loop._prepare_checkpoints(target, now)
+    loop._prepare_checkpoints(target, now)  # a timeout never fails the tick
     audit = loop._last["checkpoint_preparation"]
     assert audit["status"] == "TIMEOUT" and "exceeded 3s" in audit["error"]
+    assert audit["timeouts_total"] == 1 and audit["consecutive_failures"] == 1
     assert _lock_is_free(env)
 
     # inside the backoff: no worker is started at all (collection unaffected)
@@ -284,6 +284,9 @@ def test_runtime_records_the_timeout_backs_off_then_recovers(tmp_path: Path) -> 
     requests = env["warehouse"].read(REMOTE_REQUESTS_TABLE)
     assert requests["state"].to_list() == [STATE_PENDING_REMOTE_EXECUTION]
     assert loop._checkpoint_retry_at is None
+    audit = loop._last["checkpoint_preparation"]
+    assert audit["status"] == "OK" and audit["consecutive_failures"] == 0
+    assert audit["timeouts_total"] == 1  # history is kept, never reset
 
 
 def test_runtime_starts_no_worker_when_no_pass_has_work(tmp_path: Path) -> None:

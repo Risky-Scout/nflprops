@@ -25,7 +25,11 @@ the canonical live warehouse on the Wizard host. Each tick it:
    (`checkpoint_prepare.preparation_work_pending`), and then in a
    short-lived child process with a hard wall-clock bound
    (`platform.checkpoint_worker`): its memory is returned to the OS when it
-   exits, and a stuck pass is killed, fails closed and is retried later;
+   exits, and a stuck pass is killed, fails closed and is retried later.
+   Each pass is BOUNDED (`checkpoint_batch_limit`, earliest due first) and
+   a failed/timed-out pass never fails the tick: it is recorded, counted
+   (DEGRADED when it keeps failing) and retried after a backoff measured
+   from the failure;
 6. takes a periodic immutable snapshot (deduplicated; bounded retention
    that never prunes a snapshot a pending checkpoint request references);
 7. (BLOCK 4) every few hours, appends completed-game outcome versions for
@@ -121,6 +125,16 @@ DEFAULT_DISCOVERY_REFRESH_SECONDS = 6 * 3600
 DEFAULT_DISCOVERY_RETRY_SECONDS = 300
 DEFAULT_MAX_CONSECUTIVE_FAILURES = 10
 DEFAULT_CHECKPOINT_RETRY_SECONDS = 60.0
+#: Checkpoints claimed/prepared per preparation pass (one worker). One
+#: bounded unit per pass: 11 Week-4 T48H slots due at the same instant
+#: made an unbounded pass exceed the 180 s worker bound every time, so it
+#: was killed with nothing kept (2026-10-02 restart loop). Override with
+#: NFLPROPS_CHECKPOINT_PREPARE_BATCH_LIMIT.
+DEFAULT_CHECKPOINT_BATCH_LIMIT = 1
+#: Consecutive failed/timed-out preparation passes after which the runtime
+#: reports checkpoint preparation DEGRADED (status file + health). The
+#: runtime itself keeps running: a preparation failure never fails a tick.
+DEFAULT_CHECKPOINT_DEGRADED_AFTER = 3
 DEFAULT_HOUSEKEEPING_INTERVAL_SECONDS = 600.0
 #: Legacy raw payloads converted per housekeeping pass (bounded lock hold;
 #: ~5k legacy files clear in about ten passes).
@@ -365,6 +379,10 @@ class RuntimeLoop:
     checkpoint_timeout_seconds: float = DEFAULT_WORKER_TIMEOUT_SECONDS
     checkpoint_retry_seconds: float = DEFAULT_CHECKPOINT_RETRY_SECONDS
     checkpoint_worker_argv: tuple[str, ...] = WORKER_ARGV
+    #: Checkpoints per preparation pass (None = unbounded, the pre-fix
+    #: behavior; the production runtime always bounds it).
+    checkpoint_batch_limit: int | None = DEFAULT_CHECKPOINT_BATCH_LIMIT
+    checkpoint_degraded_after: int = DEFAULT_CHECKPOINT_DEGRADED_AFTER
     housekeeping_interval_seconds: float = DEFAULT_HOUSEKEEPING_INTERVAL_SECONDS
     raw_compress_batch: int = DEFAULT_RAW_COMPRESS_BATCH
     #: Finite raw retention, always on: <= 30 days (an override may only
@@ -382,6 +400,9 @@ class RuntimeLoop:
     _outcome_ingest_due_at: datetime | None = None
     _raw_retention_at: datetime | None = None
     _checkpoint_retry_at: datetime | None = None
+    _checkpoint_consecutive_failures: int = 0
+    _checkpoint_timeouts_total: int = 0
+    _checkpoint_failures_total: int = 0
     _housekeeping_at: datetime | None = None
     _disk_level: str = LEVEL_OK
     _started_at: datetime | None = None
@@ -446,7 +467,28 @@ class RuntimeLoop:
         )
         return result
 
+    def _checkpoint_counters(self) -> dict[str, Any]:
+        return {
+            "consecutive_failures": self._checkpoint_consecutive_failures,
+            "timeouts_total": self._checkpoint_timeouts_total,
+            "failures_total": self._checkpoint_failures_total,
+            "degraded": self._checkpoint_consecutive_failures >= self.checkpoint_degraded_after,
+            "degraded_after": self.checkpoint_degraded_after,
+            "batch_limit": self.checkpoint_batch_limit,
+        }
+
     def _prepare_checkpoints(self, target: Target, now: datetime) -> None:
+        """One BOUNDED preparation pass (`checkpoint_batch_limit`
+        checkpoints, earliest first); later ticks continue the queue.
+
+        A worker failure or timeout is a checkpoint-subsystem failure, never
+        a failed tick: the child's process group is already killed and
+        reaped, its writer lock died with it and its staging is removed
+        (`prepare_due_checkpoints_in_worker`), so the failure is recorded,
+        counted (DEGRADED after `checkpoint_degraded_after` in a row), and
+        the pass is retried `checkpoint_retry_seconds` after the failure
+        was OBSERVED -- while collection, status, snapshots and housekeeping
+        carry on."""
         if self._checkpoint_retry_at is not None and now < self._checkpoint_retry_at:
             return
         if not preparation_work_pending(
@@ -468,9 +510,13 @@ class RuntimeLoop:
             "hostname": self.hostname,
             "release_sha": self.release_sha,
             "lock_timeout_seconds": self.lock_timeout_seconds,
+            "max_checkpoints": self.checkpoint_batch_limit,
         }
         try:
             if self.checkpoint_worker:
+                # Fresh heartbeat before a pass that may block this thread
+                # for up to `checkpoint_timeout_seconds`.
+                self._write_status(now, target, state="running")
                 result = prepare_due_checkpoints_in_worker(
                     **inputs,
                     timeout_seconds=self.checkpoint_timeout_seconds,
@@ -481,17 +527,29 @@ class RuntimeLoop:
                 result = prepare_due_checkpoints(**inputs)
         except CheckpointWorkerError as exc:
             # Fail closed and auditable: nothing unpublished was kept, the
-            # writer lock died with the worker, and the (idempotent) pass is
-            # retried after a bounded backoff so collection keeps running.
+            # writer lock died with the worker. The backoff is measured from
+            # when the failure was observed -- a pass killed at its 180 s
+            # bound must not be retried on the very next tick.
+            observed = self.clock()
             timed_out = isinstance(exc, CheckpointWorkerTimeoutError)
-            self._checkpoint_retry_at = now + timedelta(seconds=self.checkpoint_retry_seconds)
+            self._checkpoint_consecutive_failures += 1
+            if timed_out:
+                self._checkpoint_timeouts_total += 1
+            else:
+                self._checkpoint_failures_total += 1
+            self._checkpoint_retry_at = observed + timedelta(
+                seconds=self.checkpoint_retry_seconds
+            )
+            counters = self._checkpoint_counters()
             self._last["checkpoint_preparation"] = {
                 "status": "TIMEOUT" if timed_out else "FAILED",
-                "at": now.isoformat(),
+                "at": observed.isoformat(),
+                "pass_started_at": now.isoformat(),
                 "season": target.season,
                 "week": target.week,
                 "error": str(exc)[:500],
                 "retry_not_before": self._checkpoint_retry_at.isoformat(),
+                **counters,
             }
             _log(
                 "checkpoint_preparation_timeout" if timed_out else "checkpoint_preparation_failed",
@@ -500,9 +558,25 @@ class RuntimeLoop:
                 week=target.week,
                 error=str(exc)[:500],
                 retry_not_before=self._checkpoint_retry_at,
+                **counters,
             )
-            raise
+            if counters["degraded"]:
+                _log("checkpoint_preparation_degraded", logging.CRITICAL, **counters)
+            return
         self._checkpoint_retry_at = None
+        self._checkpoint_consecutive_failures = 0
+        self._last["checkpoint_preparation"] = {
+            "status": "OK",
+            "at": self.clock().isoformat(),
+            "pass_started_at": now.isoformat(),
+            "season": target.season,
+            "week": target.week,
+            "claimed": len(result.claimed),
+            "missed": len(result.missed),
+            "prepared": len(result.prepared),
+            "blocked": len(result.blocked),
+            **self._checkpoint_counters(),
+        }
         if result.claimed or result.missed or result.prepared or result.blocked:
             _log(
                 "checkpoints_prepared",
@@ -511,6 +585,7 @@ class RuntimeLoop:
                 prepared=[p.run_id for p in result.prepared],
                 blocked_insufficient_pre_cutoff_pit=list(result.blocked),
                 snapshot_id=result.snapshot.snapshot_id if result.snapshot else None,
+                batch_limit=self.checkpoint_batch_limit,
             )
             self._prune()
 

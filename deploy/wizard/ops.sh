@@ -19,6 +19,11 @@
 #                          inventory of RUNTIME_ROOT only (canonical files,
 #                          releases, snapshots + their protection, raw
 #                          payload growth, logs/backups, temp/orphan files)
+#   runtime-diagnostics    READ-ONLY: nflprops-runtime.service ONLY -- journal
+#                          tail, cgroup memory.events, MemoryCurrent/Peak,
+#                          TasksCurrent/Max, NRestarts, checkpoint-preparation
+#                          timeout counters (UNKNOWN when not readable; never
+#                          widens permissions)
 #   restart                sudo -n systemctl restart nflprops-runtime.service,
 #                          then GATE on 2 consecutive healthy probes
 #   checkpoint-select      READ-ONLY (BLOCK 4): JSON list of executable
@@ -122,6 +127,72 @@ op_status() {
     journalctl -u "$UNIT" -n 40 --no-pager
   else
     echo "journal not readable by $(whoami) -- see $ROOT/logs/runtime-status.json above"
+  fi
+}
+
+# ------------------------------------------------------ runtime-diagnostics
+# READ-ONLY and scoped to $UNIT and $ROOT: never another unit's journal,
+# cgroup or process. Anything the deploy user cannot read is printed as
+# UNKNOWN (with the reason) -- this op never asks for more privilege.
+
+diag_field() {
+  local name="$1" value
+  value="$(systemctl show "$UNIT" -p "$name" --value 2>/dev/null)"
+  case "$value" in
+    ""|"[not set]") echo "$name=UNKNOWN" ;;
+    *) echo "$name=$value" ;;
+  esac
+}
+
+op_runtime_diagnostics() {
+  local f cgroup cgdir
+  section "unit properties ($UNIT)"
+  for f in ActiveState SubState MainPID NRestarts ActiveEnterTimestamp ExecMainStatus Result \
+           MemoryCurrent MemoryPeak MemoryHigh MemoryMax TasksCurrent TasksMax; do
+    diag_field "$f"
+  done
+  section "cgroup ($UNIT only)"
+  cgroup="$(systemctl show "$UNIT" -p ControlGroup --value 2>/dev/null)"
+  case "$cgroup" in
+    /system.slice/nflprops-runtime.service) cgdir="/sys/fs/cgroup$cgroup" ;;
+    *) cgdir="" ;;
+  esac
+  if [ -z "$cgdir" ]; then
+    echo "ControlGroup=UNKNOWN (got '${cgroup:-}'; only $UNIT's own cgroup is ever read)"
+  else
+    echo "ControlGroup=$cgroup"
+    for f in memory.events memory.current memory.peak pids.current pids.max; do
+      if [ -r "$cgdir/$f" ]; then
+        echo "--- $f"
+        cat "$cgdir/$f"
+      else
+        echo "$f=UNKNOWN (not readable by $(whoami))"
+      fi
+    done
+  fi
+  section "checkpoint preparation (runtime status file)"
+  runtime_python - "$ROOT/logs/runtime-status.json" <<'PY' || echo "checkpoint_preparation=UNKNOWN"
+import json, sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.is_file():
+    print(f"checkpoint_preparation=UNKNOWN (no {path})")
+    raise SystemExit(0)
+status = json.loads(path.read_text())
+print(f"state={status.get('state')} heartbeat_at={status.get('heartbeat_at')} "
+      f"release_sha={status.get('release_sha')}")
+prep = (status.get("last") or {}).get("checkpoint_preparation")
+if prep is None:
+    print("checkpoint_preparation=NONE_RECORDED (no pass since this runtime started)")
+else:
+    print("checkpoint_preparation=" + json.dumps(prep, sort_keys=True))
+PY
+  section "journal tail ($UNIT only)"
+  if journalctl -u "$UNIT" -n 120 --no-pager >/dev/null 2>&1; then
+    journalctl -u "$UNIT" -n 120 --no-pager
+  else
+    echo "journal=UNKNOWN (not readable by $(whoami))"
   fi
 }
 
@@ -396,6 +467,7 @@ main() {
       runtime_python -m nflprops.platform.wizard_runtime snapshot verify "$1" || die "snapshot verify failed"
       ;;
     restart) op_restart ;;
+    runtime-diagnostics) op_runtime_diagnostics ;;
     inventory) op_inventory ;;
     checkpoint-select)
       runtime_python -m nflprops.platform.wizard_runtime checkpoint executable \

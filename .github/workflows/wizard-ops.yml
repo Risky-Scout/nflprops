@@ -21,6 +21,9 @@ name: Wizard Runtime Ops
 #   outcome-ingest-hold / -release      BLOCK 4: pause / resume the runtime's
 #                                       recurring outcome ingest (hold file)
 #   outcome-report                      BLOCK 4: read-only outcome-table check
+#   runtime-diagnostics                 read-only nflprops-runtime journal tail,
+#                                       cgroup memory/tasks, NRestarts,
+#                                       checkpoint-preparation counters
 #
 # Never touches any other service, nginx, DNS, or any path outside
 # /home/wizard-deploy/nflprops.
@@ -46,6 +49,7 @@ on:
           - outcome-ingest-hold
           - outcome-ingest-release
           - outcome-report
+          - runtime-diagnostics
       game_id:
         description: "manual-checkpoint: canonical game id (UUID)"
         required: false
