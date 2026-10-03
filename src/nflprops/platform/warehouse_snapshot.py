@@ -39,6 +39,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -205,6 +206,7 @@ def create_snapshot(
     migration_head: str,
     hostname: str,
     created_at: datetime | None = None,
+    before_publish: Callable[[str, str], None] | None = None,
 ) -> SnapshotInfo:
     """Produce one immutable snapshot of `warehouse_root` under
     `snapshot_root`, coordinated by the writer lock. Idempotent: if the
@@ -216,6 +218,13 @@ def create_snapshot(
     warehouse's files and migration head are unchanged since the latest
     snapshot, no new snapshot is written and the latest one is returned --
     see `prune_snapshots` for the matching bounded-retention half.
+
+    `before_publish(snapshot_id, manifest_sha256)`, if given, runs under
+    the writer lock after the staged copy is verified and BEFORE the
+    snapshot becomes visible (also for a deduplicated, already-published
+    one), so a caller can durably protect the snapshot first: it is never
+    observable unprotected. It must not take the writer lock itself (it is
+    already held). If it raises, nothing is published.
     """
     resolved_created_at = created_at or datetime.now(UTC)
     resolved_lock_path = lock_path or default_lock_path(snapshot_root.parent)
@@ -266,9 +275,13 @@ def create_snapshot(
                 # Bounded disk (BLOCK 2B probe: ~11 GB free on the Wizard
                 # host): an unchanged warehouse never produces a second,
                 # byte-identical copy -- the existing snapshot is returned.
+                if before_publish is not None:
+                    before_publish(duplicate.snapshot_id, duplicate.manifest_sha256)
                 return duplicate
             write_manifest(manifest, staging)
             verify_directory_against_manifest(staging, manifest)
+            if before_publish is not None:
+                before_publish(manifest.bundle_id, manifest.manifest_sha256)
 
             final_dir = snapshot_root / snapshot_id
             publish_atomically(staging, final_dir)
@@ -316,7 +329,7 @@ def prune_snapshots(
     snapshot_root: Path,
     *,
     keep: int,
-    protected: frozenset[str] = frozenset(),
+    protected: frozenset[str] | Callable[[], frozenset[str]] = frozenset(),
     lock_path: Path | None = None,
     lock_timeout_seconds: float = DEFAULT_SNAPSHOT_LOCK_TIMEOUT_SECONDS,
 ) -> list[str]:
@@ -326,13 +339,16 @@ def prune_snapshots(
 
     `protected` snapshot_ids (those a checkpoint request still pending
     GitHub execution references -- `nflprops.platform.checkpoint_prepare`)
-    are never pruned and do not count against `keep`."""
+    are never pruned and do not count against `keep`. A callable is
+    evaluated under the writer lock, so a protection committed by a writer
+    that held the lock first is always seen."""
     if keep < 1:
         raise WarehouseSnapshotError("prune_snapshots requires keep >= 1")
     resolved_lock_path = lock_path or default_lock_path(snapshot_root.parent)
     with WriterLock(resolved_lock_path, timeout_seconds=lock_timeout_seconds):
+        keep_ids = protected() if callable(protected) else protected
         snapshots = [
-            s for s in list_snapshots(snapshot_root) if s.snapshot_id not in protected
+            s for s in list_snapshots(snapshot_root) if s.snapshot_id not in keep_ids
         ]
         doomed = snapshots[:-keep] if len(snapshots) > keep else []
         for info in doomed:

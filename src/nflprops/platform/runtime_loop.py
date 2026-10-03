@@ -29,7 +29,11 @@ the canonical live warehouse on the Wizard host. Each tick it:
    Each pass is BOUNDED (`checkpoint_batch_limit`, earliest due first) and
    a failed/timed-out pass never fails the tick: it is recorded, counted
    (DEGRADED when it keeps failing) and retried after a backoff measured
-   from the failure;
+   from the failure. Passes are PACED: after a pass completes, the next
+   one starts no sooner than `checkpoint_cooldown_seconds` later (measured
+   from completion), so expensive preparation never runs back-to-back.
+   While the worker runs, this process keeps refreshing its heartbeat
+   (status file only; it never touches the warehouse meanwhile);
 6. takes a periodic immutable snapshot (deduplicated; bounded retention
    that never prunes a snapshot a pending checkpoint request references);
 7. (BLOCK 4) every few hours, appends completed-game outcome versions for
@@ -135,6 +139,15 @@ DEFAULT_CHECKPOINT_BATCH_LIMIT = 1
 #: reports checkpoint preparation DEGRADED (status file + health). The
 #: runtime itself keeps running: a preparation failure never fails a tick.
 DEFAULT_CHECKPOINT_DEGRADED_AFTER = 3
+#: Minimum pause between preparation workers, measured from the moment the
+#: previous worker COMPLETED: one pass per minute at most, so a long queue
+#: (11 simultaneous slots) never keeps the 1-vCPU / MemoryHigh-bound host
+#: busy with back-to-back preparation. Override with
+#: NFLPROPS_CHECKPOINT_PREPARE_COOLDOWN_SECONDS.
+DEFAULT_CHECKPOINT_COOLDOWN_SECONDS = 60.0
+#: While a preparation worker runs, the heartbeat is refreshed this often
+#: (well inside the 180 s runtime_loop freshness bound).
+DEFAULT_CHECKPOINT_HEARTBEAT_SECONDS = 15.0
 DEFAULT_HOUSEKEEPING_INTERVAL_SECONDS = 600.0
 #: Legacy raw payloads converted per housekeeping pass (bounded lock hold;
 #: ~5k legacy files clear in about ten passes).
@@ -383,6 +396,8 @@ class RuntimeLoop:
     #: behavior; the production runtime always bounds it).
     checkpoint_batch_limit: int | None = DEFAULT_CHECKPOINT_BATCH_LIMIT
     checkpoint_degraded_after: int = DEFAULT_CHECKPOINT_DEGRADED_AFTER
+    checkpoint_cooldown_seconds: float = DEFAULT_CHECKPOINT_COOLDOWN_SECONDS
+    checkpoint_heartbeat_seconds: float = DEFAULT_CHECKPOINT_HEARTBEAT_SECONDS
     housekeeping_interval_seconds: float = DEFAULT_HOUSEKEEPING_INTERVAL_SECONDS
     raw_compress_batch: int = DEFAULT_RAW_COMPRESS_BATCH
     #: Finite raw retention, always on: <= 30 days (an override may only
@@ -400,6 +415,7 @@ class RuntimeLoop:
     _outcome_ingest_due_at: datetime | None = None
     _raw_retention_at: datetime | None = None
     _checkpoint_retry_at: datetime | None = None
+    _checkpoint_cooldown_until: datetime | None = None
     _checkpoint_consecutive_failures: int = 0
     _checkpoint_timeouts_total: int = 0
     _checkpoint_failures_total: int = 0
@@ -407,6 +423,7 @@ class RuntimeLoop:
     _disk_level: str = LEVEL_OK
     _started_at: datetime | None = None
     _last: dict[str, Any] = field(default_factory=dict)
+    _status_payload: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.resolver is None:
@@ -475,6 +492,7 @@ class RuntimeLoop:
             "degraded": self._checkpoint_consecutive_failures >= self.checkpoint_degraded_after,
             "degraded_after": self.checkpoint_degraded_after,
             "batch_limit": self.checkpoint_batch_limit,
+            "cooldown_seconds": self.checkpoint_cooldown_seconds,
         }
 
     def _prepare_checkpoints(self, target: Target, now: datetime) -> None:
@@ -488,8 +506,14 @@ class RuntimeLoop:
         counted (DEGRADED after `checkpoint_degraded_after` in a row), and
         the pass is retried `checkpoint_retry_seconds` after the failure
         was OBSERVED -- while collection, status, snapshots and housekeeping
-        carry on."""
+        carry on.
+
+        A completed pass starts a cooldown (`checkpoint_cooldown_seconds`,
+        from completion) before the next worker may start; the queue order
+        (unfinished PREPARING first, then earliest cutoff) is unchanged."""
         if self._checkpoint_retry_at is not None and now < self._checkpoint_retry_at:
+            return
+        if self._checkpoint_cooldown_until is not None and now < self._checkpoint_cooldown_until:
             return
         if not preparation_work_pending(
             warehouse=self.warehouse,
@@ -522,6 +546,8 @@ class RuntimeLoop:
                     timeout_seconds=self.checkpoint_timeout_seconds,
                     stop_event=self.stop_event,
                     worker_argv=self.checkpoint_worker_argv,
+                    on_wait=lambda: self._refresh_heartbeat(worker_started_at=now),
+                    on_wait_interval_seconds=self.checkpoint_heartbeat_seconds,
                 )
             else:
                 result = prepare_due_checkpoints(**inputs)
@@ -563,11 +589,16 @@ class RuntimeLoop:
             if counters["degraded"]:
                 _log("checkpoint_preparation_degraded", logging.CRITICAL, **counters)
             return
+        completed = self.clock()
         self._checkpoint_retry_at = None
         self._checkpoint_consecutive_failures = 0
+        self._checkpoint_cooldown_until = completed + timedelta(
+            seconds=self.checkpoint_cooldown_seconds
+        )
         self._last["checkpoint_preparation"] = {
             "status": "OK",
-            "at": self.clock().isoformat(),
+            "at": completed.isoformat(),
+            "next_pass_not_before": self._checkpoint_cooldown_until.isoformat(),
             "pass_started_at": now.isoformat(),
             "season": target.season,
             "week": target.week,
@@ -645,7 +676,8 @@ class RuntimeLoop:
         pruned = prune_snapshots(
             self.layout.snapshots,
             keep=self.snapshot_retention,
-            protected=protected_snapshot_ids(self.warehouse),
+            # evaluated under the writer lock (see prune_snapshots)
+            protected=lambda: protected_snapshot_ids(self.warehouse),
             lock_path=self.layout.writer_lock,
             lock_timeout_seconds=self.lock_timeout_seconds,
         )
@@ -793,6 +825,28 @@ class RuntimeLoop:
             "writes_heavy_science": False,
         }
         _write_json_atomically(self.layout.runtime_status, payload)
+        self._status_payload = payload
+
+    def _refresh_heartbeat(self, *, worker_started_at: datetime) -> None:
+        """Called while a checkpoint-preparation worker runs: rewrite the
+        last full status with a fresh heartbeat. Reads nothing from the
+        warehouse (the worker may be writing it) -- only this process's
+        own status file is written, from this same thread."""
+        if self._status_payload is None:
+            return
+        now = self.clock()
+        _write_json_atomically(
+            self.layout.runtime_status,
+            {
+                **self._status_payload,
+                "heartbeat_at": now,
+                "checkpoint_worker": {
+                    "running": True,
+                    "started_at": worker_started_at,
+                    "elapsed_seconds": round((now - worker_started_at).total_seconds(), 1),
+                },
+            },
+        )
 
     # -- loop ----------------------------------------------------------
 
