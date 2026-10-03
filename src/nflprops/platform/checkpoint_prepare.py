@@ -19,7 +19,9 @@ due checkpoint it only:
    SCHEDULED run that lacks one;
 3. creates ONE immutable warehouse snapshot covering them
    (`warehouse_snapshot.create_snapshot`: writer lock -> DuckDB
-   CHECKPOINT -> temp copy -> verify -> atomic rename);
+   CHECKPOINT -> temp copy -> verify -> record the snapshot id on the
+   PREPARING rows (protection) -> atomic rename), so the snapshot is
+   protected from the instant it is visible;
 4. publishes one immutable request bundle per checkpoint under
    `<runtime_root>/publications/checkpoint_requests/<run_id>/`
    (identity + the full PIT data manifest + the snapshot reference,
@@ -80,7 +82,11 @@ from nflprops.platform.immutable_bundle import (
     write_manifest,
 )
 from nflprops.platform.runtime_layout import RuntimeLayout
-from nflprops.platform.warehouse_snapshot import SnapshotInfo, create_snapshot
+from nflprops.platform.warehouse_snapshot import (
+    SnapshotInfo,
+    create_snapshot,
+    list_snapshots,
+)
 from nflprops.platform.writer_lock import WriterLock
 
 REMOTE_REQUESTS_TABLE = "remote_checkpoint_requests"
@@ -465,6 +471,29 @@ def _publish_request_bundle(
     return bundle.manifest_sha256, final_dir
 
 
+def _published_claim_snapshot(
+    layout: RuntimeLayout, preparing: pl.DataFrame
+) -> SnapshotInfo | None:
+    """Crash recovery: the snapshot a previous, interrupted pass already
+    protected (recorded on the PREPARING rows before publication) and
+    published -- reused instead of creating another, so the protected
+    snapshot is converted to PENDING rather than orphaned. Taken after the
+    claim, it holds all of the claim's PIT data (the bundle step re-checks
+    the manifest hash). None if the rows disagree, carry no snapshot, or
+    the snapshot was never published (crash between protect and publish)."""
+    ids = set(preparing["snapshot_id"].to_list())
+    shas = set(preparing["snapshot_manifest_sha256"].to_list())
+    if len(ids) != 1 or len(shas) != 1:
+        return None
+    (snapshot_id,), (manifest_sha,) = ids, shas
+    if not snapshot_id or not manifest_sha:
+        return None
+    for info in list_snapshots(layout.snapshots):
+        if info.snapshot_id == snapshot_id and info.manifest_sha256 == manifest_sha:
+            return info
+    return None
+
+
 def _finish_preparing(
     layout: RuntimeLayout,
     warehouse: Warehouse,
@@ -488,14 +517,34 @@ def _finish_preparing(
     if preparing.is_empty():
         return None, []
 
-    snapshot = create_snapshot(
-        warehouse_root=warehouse.root,
-        snapshot_root=layout.snapshots,
-        lock_path=layout.writer_lock,
-        lock_timeout_seconds=lock_timeout_seconds,
-        migration_head=migration_head,
-        hostname=hostname,
-    )
+    snapshot = _published_claim_snapshot(layout, preparing)
+    if snapshot is None:
+
+        def _protect(snapshot_id: str, manifest_sha256: str) -> None:
+            # Under create_snapshot's writer lock, BEFORE the snapshot is
+            # published: the PREPARING rows (a SNAPSHOT_PROTECTING_STATE)
+            # reference it first, so it is never observable as an ordinary,
+            # unprotected periodic snapshot -- not by pruning, not by the
+            # storage_growth health check.
+            for request in preparing.iter_rows(named=True):
+                _upsert_request(
+                    warehouse,
+                    {
+                        **request,
+                        "snapshot_id": snapshot_id,
+                        "snapshot_manifest_sha256": manifest_sha256,
+                    },
+                )
+
+        snapshot = create_snapshot(
+            warehouse_root=warehouse.root,
+            snapshot_root=layout.snapshots,
+            lock_path=layout.writer_lock,
+            lock_timeout_seconds=lock_timeout_seconds,
+            migration_head=migration_head,
+            hostname=hostname,
+            before_publish=_protect,
+        )
     prepared: list[PreparedCheckpoint] = []
     with WriterLock(layout.writer_lock, timeout_seconds=lock_timeout_seconds):
         for request in preparing.iter_rows(named=True):

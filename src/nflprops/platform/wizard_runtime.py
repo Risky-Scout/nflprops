@@ -377,6 +377,7 @@ def _build_loop(
     from nflprops.platform.runtime_layout import current_migration_head
     from nflprops.platform.runtime_loop import (
         DEFAULT_CHECKPOINT_BATCH_LIMIT,
+        DEFAULT_CHECKPOINT_COOLDOWN_SECONDS,
         DEFAULT_OUTCOME_INGEST_INTERVAL_SECONDS,
         DEFAULT_SNAPSHOT_INTERVAL_SECONDS,
         DEFAULT_TICK_SECONDS,
@@ -418,6 +419,15 @@ def _build_loop(
             int(
                 os.environ.get(
                     "NFLPROPS_CHECKPOINT_PREPARE_BATCH_LIMIT", DEFAULT_CHECKPOINT_BATCH_LIMIT
+                )
+            ),
+        ),
+        checkpoint_cooldown_seconds=max(
+            0.0,
+            float(
+                os.environ.get(
+                    "NFLPROPS_CHECKPOINT_PREPARE_COOLDOWN_SECONDS",
+                    DEFAULT_CHECKPOINT_COOLDOWN_SECONDS,
                 )
             ),
         ),

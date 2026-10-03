@@ -436,8 +436,8 @@ def storage_growth_check(
     retention_limit: int,
     minimum_free_gb: float = 3.0,
     raw_root: Any | None = None,
-    protected_snapshot_ids: frozenset[str] = frozenset(),
-    request_snapshot_ids: frozenset[str] = frozenset(),
+    protected_snapshot_ids: frozenset[str] | Callable[[], frozenset[str]] = frozenset(),
+    request_snapshot_ids: frozenset[str] | Callable[[], frozenset[str]] = frozenset(),
 ) -> HealthCheck:
     """Live DuckDB/Parquet warehouse size, snapshot count/size, publication
     size, and MEASURED growth between the oldest and newest retained
@@ -445,7 +445,12 @@ def storage_growth_check(
     extrapolates a season-long capacity claim -- it reports only what has
     actually been measured. Unhealthy if retention is exceeded or free
     space falls below `minimum_free_gb`. Read-only; never creates a
-    directory. Snapshot sizes come from their manifests (no disk walk)."""
+    directory. Snapshot sizes come from their manifests (no disk walk).
+
+    Callable id sets are resolved AFTER the snapshots are listed: a
+    checkpoint snapshot is protected (its request row written) before it is
+    published, so every snapshot the listing saw already has its protection
+    visible to the later read -- never a transient retention failure."""
 
     def _check() -> tuple[bool, str | None]:
         import shutil as _shutil
@@ -460,15 +465,21 @@ def storage_growth_check(
         if query_cache.exists():
             live_bytes += query_cache.stat().st_size
         snapshots = list_snapshots(Path(snapshot_root))
+        protected_ids = (
+            protected_snapshot_ids() if callable(protected_snapshot_ids) else protected_snapshot_ids
+        )
+        request_ids = (
+            request_snapshot_ids() if callable(request_snapshot_ids) else request_snapshot_ids
+        )
         snapshot_bytes = _tree_bytes(Path(snapshot_root))  # physical, links once
-        retained = [s for s in snapshots if s.snapshot_id not in protected_snapshot_ids]
+        retained = [s for s in snapshots if s.snapshot_id not in protected_ids]
         # A snapshot released by a TERMINAL request (no longer protected) is
         # ordinary retention's to prune on the runtime's next housekeeping
         # pass; it is reported, not counted as a retention failure. Only
         # periodic snapshots (never referenced by any request) beyond
         # retention prove that pruning is not working.
-        released = [s for s in retained if s.snapshot_id in request_snapshot_ids]
-        periodic = [s for s in retained if s.snapshot_id not in request_snapshot_ids]
+        released = [s for s in retained if s.snapshot_id in request_ids]
+        periodic = [s for s in retained if s.snapshot_id not in request_ids]
         raw_bytes = _tree_bytes(raw_root) if raw_root is not None else 0
         publication_bytes = _tree_bytes(publications_root)
         free_gb = _shutil.disk_usage(_nearest_existing_ancestor(warehouse)).free / (1024**3)

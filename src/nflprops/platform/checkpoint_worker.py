@@ -20,7 +20,10 @@ The boundary here is deliberately small:
   `prepare_due_checkpoints`, writes its result atomically, and exits -- so
   every byte it allocated goes back to the OS;
 * the parent waits at most `timeout_seconds` (and never past a stop
-  request). On timeout/stop it SIGKILLs the child's whole process group.
+  request), calling `on_wait` every `on_wait_interval_seconds` meanwhile
+  (the runtime refreshes its heartbeat there -- it never touches the
+  warehouse, so the child stays the only writer). On timeout/stop it
+  SIGKILLs the child's whole process group.
   The writer lock is an `flock` held only on the child's own descriptor, so
   the kernel releases it with the child; the parent then removes the
   child's unpublished staging directories under that lock and raises
@@ -47,7 +50,7 @@ import tempfile
 import threading
 import time
 import traceback
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -69,14 +72,17 @@ from nflprops.platform.writer_lock import WriterLock
 logger = logging.getLogger("nflprops.runtime")
 
 JOB_SCHEMA_VERSION = "nflprops.platform.checkpoint_worker_job/v1"
-#: The runtime waits for the child synchronously, so a hung pass blocks
-#: collection for at most this long (near T90M/T30M the cadence is 1-2 min).
+#: The runtime waits for the child synchronously (refreshing only its
+#: heartbeat meanwhile), so a hung pass blocks collection for at most this
+#: long (near T90M/T30M the cadence is 1-2 min).
 #: Override with NFLPROPS_CHECKPOINT_PREPARE_TIMEOUT_SECONDS.
 DEFAULT_WORKER_TIMEOUT_SECONDS = 180.0
 #: How often the parent checks the child and its own stop request.
 _POLL_SECONDS = 0.2
 #: SIGKILLed children are reaped within this bound (never an unbounded wait).
 _REAP_SECONDS = 10.0
+#: Default spacing of `on_wait` calls while the child runs.
+DEFAULT_ON_WAIT_INTERVAL_SECONDS = 15.0
 
 WORKER_ARGV: tuple[str, ...] = (sys.executable, "-m", "nflprops.platform.checkpoint_worker")
 #: Environment forced on the CHILD only (never the runtime, never GitHub
@@ -318,13 +324,23 @@ def prepare_due_checkpoints_in_worker(
     timeout_seconds: float = DEFAULT_WORKER_TIMEOUT_SECONDS,
     stop_event: threading.Event | None = None,
     worker_argv: Sequence[str] = WORKER_ARGV,
+    on_wait: Callable[[], None] | None = None,
+    on_wait_interval_seconds: float = DEFAULT_ON_WAIT_INTERVAL_SECONDS,
 ) -> PreparePassResult:
     """`prepare_due_checkpoints`, executed in a short-lived child process
     bounded by `timeout_seconds`. Same inputs, same result; raises
     `CheckpointWorkerTimeoutError` (child killed, staging cleaned, nothing
-    published) or `CheckpointWorkerError` (child failed)."""
+    published) or `CheckpointWorkerError` (child failed).
+
+    `on_wait` is called from this (the waiting) thread every
+    `on_wait_interval_seconds` while the child runs. Its failures are logged
+    and never interrupt the wait, the timeout or the kill."""
     if timeout_seconds <= 0:
         raise ValueError(f"timeout_seconds must be positive, got {timeout_seconds}")
+    if on_wait_interval_seconds <= 0:
+        raise ValueError(
+            f"on_wait_interval_seconds must be positive, got {on_wait_interval_seconds}"
+        )
     # Resolved HERE, exactly as the in-process pass would resolve it, so run
     # identity (model_version / config_sha256 / source_sha256) is the
     # parent's, never re-derived by the child.
@@ -366,6 +382,7 @@ def prepare_due_checkpoints_in_worker(
                 f"could not start the checkpoint preparation worker: {exc}"
             ) from exc
         reason: str | None = None
+        last_on_wait = started
         while proc.poll() is None:
             elapsed = time.monotonic() - started
             if elapsed >= timeout_seconds:
@@ -375,6 +392,15 @@ def prepare_due_checkpoints_in_worker(
             if reason is not None:
                 _kill_group(proc)
                 break
+            if on_wait is not None and time.monotonic() - last_on_wait >= on_wait_interval_seconds:
+                last_on_wait = time.monotonic()
+                try:
+                    on_wait()
+                except Exception as exc:  # a heartbeat never decides the pass
+                    logger.warning(
+                        "checkpoint worker on_wait failed",
+                        extra={"fields": {"error": f"{type(exc).__name__}: {exc}"[:300]}},
+                    )
             time.sleep(_POLL_SECONDS)
         elapsed = time.monotonic() - started
         # The child's stderr (its JSON logs, any traceback or Rust panic
