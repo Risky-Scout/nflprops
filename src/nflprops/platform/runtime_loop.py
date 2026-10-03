@@ -31,7 +31,10 @@ the canonical live warehouse on the Wizard host. Each tick it:
    (DEGRADED when it keeps failing) and retried after a backoff measured
    from the failure. Passes are PACED: after a pass completes, the next
    one starts no sooner than `checkpoint_cooldown_seconds` later (measured
-   from completion), so expensive preparation never runs back-to-back.
+   from completion), so expensive preparation never runs back-to-back,
+   and the first pass waits `checkpoint_startup_grace_seconds` after the
+   loop starts (STARTUP_GRACE: due checkpoints stay queued, nothing else
+   in the tick waits).
    While the worker runs, this process keeps refreshing its heartbeat
    (status file only; it never touches the warehouse meanwhile);
 6. takes a periodic immutable snapshot (deduplicated; bounded retention
@@ -145,6 +148,14 @@ DEFAULT_CHECKPOINT_DEGRADED_AFTER = 3
 #: busy with back-to-back preparation. Override with
 #: NFLPROPS_CHECKPOINT_PREPARE_COOLDOWN_SECONDS.
 DEFAULT_CHECKPOINT_COOLDOWN_SECONDS = 60.0
+#: No preparation worker starts until this long after the loop started:
+#: the first single pass of the failed 9c05160 activation pushed host PSI
+#: over the deploy-gate threshold while the new release was being
+#: health-gated. Collection, status, snapshots and housekeeping run
+#: normally meanwhile; due checkpoints stay queued (nothing is claimed,
+#: missed or discarded by waiting). Override with
+#: NFLPROPS_CHECKPOINT_PREPARE_STARTUP_GRACE_SECONDS.
+DEFAULT_CHECKPOINT_STARTUP_GRACE_SECONDS = 300.0
 #: While a preparation worker runs, the heartbeat is refreshed this often
 #: (well inside the 180 s runtime_loop freshness bound).
 DEFAULT_CHECKPOINT_HEARTBEAT_SECONDS = 15.0
@@ -397,6 +408,7 @@ class RuntimeLoop:
     checkpoint_batch_limit: int | None = DEFAULT_CHECKPOINT_BATCH_LIMIT
     checkpoint_degraded_after: int = DEFAULT_CHECKPOINT_DEGRADED_AFTER
     checkpoint_cooldown_seconds: float = DEFAULT_CHECKPOINT_COOLDOWN_SECONDS
+    checkpoint_startup_grace_seconds: float = DEFAULT_CHECKPOINT_STARTUP_GRACE_SECONDS
     checkpoint_heartbeat_seconds: float = DEFAULT_CHECKPOINT_HEARTBEAT_SECONDS
     housekeeping_interval_seconds: float = DEFAULT_HOUSEKEEPING_INTERVAL_SECONDS
     raw_compress_batch: int = DEFAULT_RAW_COMPRESS_BATCH
@@ -493,6 +505,7 @@ class RuntimeLoop:
             "degraded_after": self.checkpoint_degraded_after,
             "batch_limit": self.checkpoint_batch_limit,
             "cooldown_seconds": self.checkpoint_cooldown_seconds,
+            "startup_grace_seconds": self.checkpoint_startup_grace_seconds,
         }
 
     def _prepare_checkpoints(self, target: Target, now: datetime) -> None:
@@ -510,7 +523,23 @@ class RuntimeLoop:
 
         A completed pass starts a cooldown (`checkpoint_cooldown_seconds`,
         from completion) before the next worker may start; the queue order
-        (unfinished PREPARING first, then earliest cutoff) is unchanged."""
+        (unfinished PREPARING first, then earliest cutoff) is unchanged.
+        No worker starts during the startup grace after the loop started
+        (recorded as STARTUP_GRACE -- never FAILED/DEGRADED)."""
+        if self._started_at is not None:
+            grace_until = self._started_at + timedelta(
+                seconds=self.checkpoint_startup_grace_seconds
+            )
+            if now < grace_until:
+                self._last["checkpoint_preparation"] = {
+                    "status": "STARTUP_GRACE",
+                    "state": "STARTUP_GRACE",
+                    "at": now.isoformat(),
+                    "grace_until": grace_until.isoformat(),
+                    "remaining_seconds": round((grace_until - now).total_seconds(), 1),
+                    **self._checkpoint_counters(),
+                }
+                return
         if self._checkpoint_retry_at is not None and now < self._checkpoint_retry_at:
             return
         if self._checkpoint_cooldown_until is not None and now < self._checkpoint_cooldown_until:
@@ -852,6 +881,8 @@ class RuntimeLoop:
 
     def tick(self) -> Target | None:
         now = self.clock()
+        if self._started_at is None:  # embedded use without run(): loop start
+            self._started_at = now
         self._ensure_reference_data()
         assert self.resolver is not None
         target = self.resolver.resolve(self.warehouse, now)

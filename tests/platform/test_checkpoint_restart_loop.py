@@ -158,6 +158,9 @@ def _week(root: Path) -> tuple[dict, FakeProvider, datetime]:
 
 
 def _loop(env: dict, provider: FakeProvider, clock: object, **kwargs: object) -> RuntimeLoop:
+    # The startup grace (no pass in the first 300 s after loop start) has
+    # its own tests in test_checkpoint_pacing_and_heartbeat.py.
+    kwargs.setdefault("checkpoint_startup_grace_seconds", 0.0)
     return RuntimeLoop(layout=env["layout"], warehouse=env["warehouse"], config=env["config"],
                        provider=provider, migration_head=HEAD, release_sha="a" * 40,
                        clock=clock, season=SEASON, lock_timeout_seconds=5.0,  # type: ignore[arg-type]

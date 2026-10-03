@@ -629,6 +629,11 @@ def checkpoint_preparation_check(status_path: Any) -> HealthCheck:
             f"failures_total={prep.get('failures_total')} "
             f"batch_limit={prep.get('batch_limit')}"
         )
+        if prep.get("status") == "STARTUP_GRACE":
+            detail += (
+                f" remaining_seconds={prep.get('remaining_seconds')} "
+                f"grace_until={prep.get('grace_until')}"
+            )
         if prep.get("degraded"):
             return False, (
                 f"DEGRADED: {detail} retry_not_before={prep.get('retry_not_before')} "

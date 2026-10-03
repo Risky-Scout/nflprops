@@ -132,6 +132,7 @@ def _loop(env: dict, provider: FakeProvider, clock: Clock, **kwargs: object) -> 
     # pacing (the cooldown between workers) is covered in
     # test_checkpoint_pacing_and_heartbeat.py.
     kwargs.setdefault("checkpoint_cooldown_seconds", 0.0)
+    kwargs.setdefault("checkpoint_startup_grace_seconds", 0.0)
     return RuntimeLoop(
         layout=env["layout"],
         warehouse=env["warehouse"],

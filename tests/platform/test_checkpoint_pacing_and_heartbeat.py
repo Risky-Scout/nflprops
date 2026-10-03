@@ -40,12 +40,14 @@ import pytest
 from test_checkpoint_restart_loop import (
     PLANNING_HANG_WORKER,
     Clock,
+    _expected_due_order,
     _inputs,
     _lock_is_free,
     _loop,
     _no_partial_artifacts,
     _process_group_gone,
     _requests,
+    _runs,
     _script,
     _states,
     _week,
@@ -61,6 +63,7 @@ from nflprops.platform.checkpoint_prepare import (
     STATE_PREPARING,
     PreparePassResult,
     _upsert_request,
+    preparation_work_pending,
     prepare_due_checkpoints,
     protected_snapshot_ids_at,
     request_snapshot_ids_at,
@@ -574,3 +577,142 @@ def test_heartbeat_refresh_never_reads_the_warehouse(
     }
     previous = json.loads(full)
     assert status["next_official_checkpoint"] == previous["next_official_checkpoint"]
+
+
+# ====================================================== F. startup grace
+
+
+def test_startup_grace_default_and_env_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from test_checkpoint_restart_loop import _env
+
+    from nflprops.platform.runtime_loop import DEFAULT_CHECKPOINT_STARTUP_GRACE_SECONDS
+    from nflprops.platform.wizard_runtime import _build_loop
+
+    assert DEFAULT_CHECKPOINT_STARTUP_GRACE_SECONDS == 300.0
+    assert RuntimeLoop.__dataclass_fields__["checkpoint_startup_grace_seconds"].default == 300.0
+    env = _env(tmp_path)
+    for value, expected in ((None, 300.0), ("120", 120.0), ("0", 0.0)):
+        if value is None:
+            monkeypatch.delenv("NFLPROPS_CHECKPOINT_PREPARE_STARTUP_GRACE_SECONDS", raising=False)
+        else:
+            monkeypatch.setenv("NFLPROPS_CHECKPOINT_PREPARE_STARTUP_GRACE_SECONDS", value)
+        loop = _build_loop(env["layout"], env["config"], env["warehouse"], object(), None)
+        assert loop.checkpoint_startup_grace_seconds == expected
+        assert loop.checkpoint_batch_limit == 1 and loop.checkpoint_cooldown_seconds == 60.0
+
+
+def _grace_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, worker_seconds: float = 30.0
+) -> tuple[dict, RuntimeLoop, Clock, list[datetime], datetime]:
+    """Production pacing (grace 300 s, batch 1, cooldown 60 s); the worker
+    runs the real pass in-process and takes `worker_seconds`."""
+    env, provider, now = _week(tmp_path / "rt")
+    start = now + timedelta(minutes=15)  # a collection is due again at start
+    clock = Clock(start)
+    loop = _loop(env, provider, clock, checkpoint_startup_grace_seconds=300.0)
+    assert (loop.checkpoint_batch_limit, loop.checkpoint_cooldown_seconds) == (1, 60.0)
+    calls: list[datetime] = []
+
+    def _worker(**kwargs: Any) -> PreparePassResult:
+        calls.append(clock.now)
+        for key in ("timeout_seconds", "stop_event", "worker_argv", "on_wait",
+                    "on_wait_interval_seconds"):
+            kwargs.pop(key)
+        result = prepare_due_checkpoints(**kwargs)
+        clock.advance(timedelta(seconds=worker_seconds))
+        return result
+
+    monkeypatch.setattr(runtime_loop_module, "prepare_due_checkpoints_in_worker", _worker)
+    return env, loop, clock, calls, start
+
+
+def _prep_status(env: dict) -> dict:
+    import json
+
+    return json.loads(env["layout"].runtime_status.read_text())["last"]["checkpoint_preparation"]
+
+
+def test_no_worker_during_startup_grace_while_the_runtime_carries_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    from nflprops.platform.health import checkpoint_preparation_check
+
+    env, loop, clock, calls, start = _grace_loop(tmp_path, monkeypatch)
+    collections = env["warehouse"].read("collector_runs").height
+    due = len(_expected_due_order(env))
+
+    loop.tick()  # loop start
+
+    assert loop._started_at == start
+    assert calls == []  # no checkpoint worker
+    assert env["warehouse"].read("collector_runs").height == collections + 1  # collected
+    assert list_snapshots(env["layout"].snapshots)  # periodic snapshot still taken
+    prep = _prep_status(env)
+    assert prep["status"] == prep["state"] == "STARTUP_GRACE"
+    assert prep["remaining_seconds"] == 300.0
+    assert prep["degraded"] is False and prep["consecutive_failures"] == 0
+    healthy, detail = checkpoint_preparation_check(env["layout"].runtime_status)()
+    assert healthy is True and "status=STARTUP_GRACE" in (detail or "")
+    assert "remaining_seconds=300.0" in (detail or "")
+
+    heartbeats = []
+    for _ in range(19):  # up to start + 285 s
+        clock.advance(timedelta(seconds=15))
+        loop.tick()
+        status = json.loads(env["layout"].runtime_status.read_text())
+        heartbeats.append(datetime.fromisoformat(status["heartbeat_at"]))
+        assert status["state"] == "running"
+    assert heartbeats == sorted(heartbeats) and heartbeats[-1] == clock.now  # advances
+    clock.advance(timedelta(seconds=14))  # start + 299 s
+    loop.tick()
+    assert calls == []
+    assert _prep_status(env)["remaining_seconds"] == 1.0
+    # queue untouched: nothing claimed, missed or discarded; all still due
+    assert _runs(env).height == 0 and _states(env) == []
+    assert preparation_work_pending(warehouse=env["warehouse"], config=env["config"],
+                                    season=2026, week=4, now=clock.now)
+    assert len(_expected_due_order(env)) == due == 11
+
+
+def test_first_worker_after_grace_then_batch_one_and_cooldown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env, loop, clock, calls, start = _grace_loop(tmp_path, monkeypatch)
+    expected = _expected_due_order(env)
+    loop.tick()
+    clock.advance(timedelta(seconds=300))  # grace expires exactly now
+    loop.tick()
+    assert calls == [start + timedelta(seconds=300)]
+    first = _requests(env).row(0, named=True)
+    assert _states(env) == [STATE_PENDING_REMOTE_EXECUTION]  # batch limit 1
+    assert first["game_id"] == expected[0]  # earliest cutoff first
+    completed = clock.now
+    prep = _prep_status(env)
+    assert prep["status"] == "OK" and prep["prepared"] == 1
+    assert loop._checkpoint_cooldown_until == completed + timedelta(seconds=60)
+
+    clock.advance(timedelta(seconds=45))
+    loop.tick()  # inside the completion cooldown
+    assert len(calls) == 1
+    clock.advance(timedelta(seconds=15))  # completed + 60 s
+    loop.tick()
+    assert len(calls) == 2 and len(_states(env)) == 2
+    order = _requests(env).sort("prepared_at", maintain_order=True)["game_id"].to_list()
+    assert order == expected[:2]
+
+
+def test_grace_is_measured_from_loop_start_in_run(tmp_path: Path) -> None:
+    env, provider, now = _week(tmp_path / "rt")
+    clock = Clock(now)
+    loop = _loop(env, provider, clock, checkpoint_startup_grace_seconds=300.0,
+                 checkpoint_worker_argv=("/nonexistent/never-started",))
+    assert loop.run(install_signal_handlers=False, max_ticks=1) == 0
+    assert loop._started_at == now
+    prep = loop._last["checkpoint_preparation"]
+    assert prep["status"] == "STARTUP_GRACE" and prep["remaining_seconds"] == 300.0
+    assert _runs(env).height == 0  # would have FAILED if a worker had been spawned
+    assert loop._checkpoint_failures_total == 0
