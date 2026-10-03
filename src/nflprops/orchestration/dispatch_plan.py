@@ -193,14 +193,31 @@ def plan_due_checkpoints(
     week: int,
     now: datetime,
     settings: DispatchSettings,
+    limit: int | None = None,
 ) -> list[PlannedCheckpoint]:
     """Every due (RUN) or missed (MISSED), unclaimed official checkpoint
     for (season, week) as of `now`, in game order then T48H..T30M order.
-    Returns [] when `[checkpoints].enabled` is false."""
-    planned: list[PlannedCheckpoint] = []
-    for slot in due_checkpoint_slots(
+    Returns [] when `[checkpoints].enabled` is false.
+
+    With `limit`, only the `limit` EARLIEST slots are planned -- ordered by
+    (scheduled_as_of, kickoff_at, game_id, T48H..T30M) -- and the PIT data
+    manifest (the expensive part) is computed for those alone. Slot
+    enumeration reads only `games`/`prediction_runs`, so a bounded caller
+    makes monotonic, deterministic progress through any number of
+    simultaneously due checkpoints."""
+    if limit is not None and limit < 0:
+        raise ValueError(f"limit must be >= 0, got {limit}")
+    slots: list[DueCheckpointSlot] | Iterator[DueCheckpointSlot] = due_checkpoint_slots(
         warehouse=warehouse, config=config, season=season, week=week, now=now
-    ):
+    )
+    if limit is not None:
+        order = {name: index for index, name in enumerate(OFFICIAL_CHECKPOINTS)}
+        slots = sorted(
+            slots,
+            key=lambda s: (s.scheduled_as_of, s.kickoff_at, s.game_id, order[s.checkpoint]),
+        )[:limit]
+    planned: list[PlannedCheckpoint] = []
+    for slot in slots:
         game_id = slot.game_id
         kickoff_at = slot.kickoff_at
         checkpoint = slot.checkpoint

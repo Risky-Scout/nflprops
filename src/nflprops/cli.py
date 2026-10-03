@@ -777,6 +777,7 @@ def platform_health(
         DEPLOY_GATE_NONCRITICAL,
         PRE_ACTIVATION_NONCRITICAL,
         HealthCheck,
+        checkpoint_preparation_check,
         clock_sync_check,
         collect_platform_health,
         collection_freshness_check,
@@ -860,6 +861,7 @@ def platform_health(
     checks["runtime_loop"] = runtime_loop_check(
         layout.runtime_status, expected_release_sha=expect_version or None
     )
+    checks["checkpoint_preparation"] = checkpoint_preparation_check(layout.runtime_status)
     checks["collection_freshness"] = collection_freshness_check(layout.warehouse_root, config=cfg)
     checks["latest_snapshot"] = latest_snapshot_check(layout.snapshots)
     checks["disk_free"] = disk_free_check(layout.root)
