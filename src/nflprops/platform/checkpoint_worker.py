@@ -119,6 +119,7 @@ def _job_payload(
     release_sha: str | None,
     lock_timeout_seconds: float,
     market_mode: str,
+    max_checkpoints: int | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": JOB_SCHEMA_VERSION,
@@ -137,6 +138,7 @@ def _job_payload(
         "release_sha": release_sha,
         "lock_timeout_seconds": lock_timeout_seconds,
         "market_mode": market_mode,
+        "max_checkpoints": max_checkpoints,
     }
 
 
@@ -212,6 +214,7 @@ def run_job(job_path: Path) -> PreparePassResult:
         lock_timeout_seconds=float(job["lock_timeout_seconds"]),
         market_mode=job["market_mode"],
         settings=DispatchSettings(**job["settings"]),
+        max_checkpoints=job.get("max_checkpoints"),
     )
 
 
@@ -311,6 +314,7 @@ def prepare_due_checkpoints_in_worker(
     release_sha: str | None,
     lock_timeout_seconds: float = 60.0,
     market_mode: str = "live",
+    max_checkpoints: int | None = None,
     timeout_seconds: float = DEFAULT_WORKER_TIMEOUT_SECONDS,
     stop_event: threading.Event | None = None,
     worker_argv: Sequence[str] = WORKER_ARGV,
@@ -342,6 +346,7 @@ def prepare_due_checkpoints_in_worker(
                 release_sha=release_sha,
                 lock_timeout_seconds=lock_timeout_seconds,
                 market_mode=market_mode,
+                max_checkpoints=max_checkpoints,
             ),
         )
         stderr_path = Path(tmp) / "worker.stderr"

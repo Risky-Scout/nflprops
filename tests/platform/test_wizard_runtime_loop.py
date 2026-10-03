@@ -47,6 +47,7 @@ from nflprops.platform.checkpoint_prepare import (
     STATE_PENDING_REMOTE_EXECUTION,
     CheckpointPrepareError,
     executable_requests,
+    preparation_work_pending,
     prepare_due_checkpoints,
     prepare_manual_checkpoint,
     protected_snapshot_ids,
@@ -363,6 +364,21 @@ def _checkpoint_env(
     return loop, clock
 
 
+def _drain(loop: RuntimeLoop, *, max_ticks: int = 10) -> int:
+    """Tick (clock frozen) until no preparation work is pending: each pass
+    prepares at most `checkpoint_batch_limit` checkpoints, so N catch-ups
+    due at once take N ticks. Returns the ticks used."""
+    for used in range(max_ticks):
+        target = loop.resolver.resolve(loop.warehouse, loop.clock())  # type: ignore[union-attr]
+        assert target is not None
+        if not preparation_work_pending(warehouse=loop.warehouse, config=loop.config,
+                                        season=target.season, week=target.week,
+                                        now=loop.clock()):
+            return used
+        loop.tick()
+    raise AssertionError(f"preparation still pending after {max_ticks} ticks")
+
+
 def test_due_official_checkpoint_is_prepared_never_executed(
     env: dict, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -424,6 +440,7 @@ def test_catch_up_keeps_the_original_scheduled_as_of(env: dict) -> None:
     loop, clock = _checkpoint_env(env, kickoff)
     clock.advance(minutes=50)  # the runtime was down ~48 min past T6H
     loop.tick()
+    _drain(loop)  # T48H, T24H, T6H: one bounded pass each
     run = env["warehouse"].read(PREDICTION_RUNS_TABLE).filter(pl.col("checkpoint_name") == "T6H")
     assert run["scheduled_as_of"][0] == kickoff - 6 * H
 
@@ -637,6 +654,7 @@ def test_first_start_catch_ups_are_retained_but_never_executable(env: dict) -> N
     stays executable; a MANUAL checkpoint is unchanged."""
     kickoff = BASE + 6 * H + 2 * M
     loop, clock = _checkpoint_env(env, kickoff)  # first tick: collect + catch-up
+    _drain(loop)
 
     runs = _runs_by_name(env)
     requests = _requests_by_name(env)
@@ -700,10 +718,12 @@ def test_already_pending_catch_ups_are_blocked_on_the_next_pass(
         # the previous release, simulated in-process (the patch cannot
         # reach a worker process)
         loop, clock = _checkpoint_env(env, kickoff, checkpoint_worker=False)
+        _drain(loop)
     loop.checkpoint_worker = True  # the gated release: the real worker
     requests = _requests_by_name(env)
     assert {requests[n]["state"] for n in ("T48H", "T24H")} == {STATE_PENDING_REMOTE_EXECUTION}
-    snapshot_id = requests["T48H"]["snapshot_id"]
+    # one bounded pass per catch-up: each has its own snapshot
+    snapshot_ids = {n: requests[n]["snapshot_id"] for n in ("T48H", "T24H")}
     bundle_dir = env["layout"].checkpoint_requests / requests["T48H"]["run_id"]
     assert bundle_dir.is_dir()
 
@@ -714,10 +734,10 @@ def test_already_pending_catch_ups_are_blocked_on_the_next_pass(
     runs = _runs_by_name(env)
     for name in ("T48H", "T24H"):
         assert requests[name]["state"] == STATE_NOT_EXECUTABLE
-        assert requests[name]["snapshot_id"] == snapshot_id
+        assert requests[name]["snapshot_id"] == snapshot_ids[name]
         assert runs[name]["failure_code"] == FAILURE_INSUFFICIENT_PRE_CUTOFF_PIT_DATA
     assert bundle_dir.is_dir()  # never deleted
-    assert snapshot_id not in protected_snapshot_ids(env["warehouse"])
+    assert not set(snapshot_ids.values()) & protected_snapshot_ids(env["warehouse"])
     assert executable_requests(env["warehouse"]).is_empty()
 
 

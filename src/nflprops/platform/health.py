@@ -141,6 +141,9 @@ DEPLOY_GATE_NONCRITICAL: frozenset[str] = frozenset(
         # the critical `runtime_loop` check instead. Freshness stays
         # critical for ordinary (non-gate) health.
         "collection_freshness",
+        # Reported, never deploy-gating: a release that FIXES a degraded
+        # checkpoint-preparation subsystem must be deployable.
+        "checkpoint_preparation",
     }
 )
 
@@ -586,6 +589,40 @@ def runtime_loop_check(
         )
         if problems:
             return False, f"{'; '.join(problems)} -- {detail}"
+        return True, detail
+
+    return _check
+
+
+def checkpoint_preparation_check(status_path: Any) -> HealthCheck:
+    """The runtime's checkpoint-preparation subsystem, from its status file
+    (`last.checkpoint_preparation`, written by `RuntimeLoop`). A failed or
+    timed-out pass never stops the runtime, so a subsystem that keeps
+    failing is surfaced HERE as DEGRADED (unhealthy) instead of as a
+    restart loop. Read-only; healthy when no pass has run yet."""
+
+    def _check() -> tuple[bool, str | None]:
+        import json
+        from pathlib import Path
+
+        path = Path(status_path)
+        if not path.is_file():
+            return True, "no runtime status yet"
+        prep = (json.loads(path.read_text()).get("last") or {}).get("checkpoint_preparation")
+        if not prep:
+            return True, "no preparation pass recorded since the runtime started"
+        detail = (
+            f"status={prep.get('status')} at={prep.get('at')} "
+            f"consecutive_failures={prep.get('consecutive_failures')} "
+            f"timeouts_total={prep.get('timeouts_total')} "
+            f"failures_total={prep.get('failures_total')} "
+            f"batch_limit={prep.get('batch_limit')}"
+        )
+        if prep.get("degraded"):
+            return False, (
+                f"DEGRADED: {detail} retry_not_before={prep.get('retry_not_before')} "
+                f"error={str(prep.get('error'))[:200]}"
+            )
         return True, detail
 
     return _check

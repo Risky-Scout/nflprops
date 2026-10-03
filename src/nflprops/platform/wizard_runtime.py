@@ -376,6 +376,7 @@ def _build_loop(
     from nflprops.platform.checkpoint_worker import DEFAULT_WORKER_TIMEOUT_SECONDS
     from nflprops.platform.runtime_layout import current_migration_head
     from nflprops.platform.runtime_loop import (
+        DEFAULT_CHECKPOINT_BATCH_LIMIT,
         DEFAULT_OUTCOME_INGEST_INTERVAL_SECONDS,
         DEFAULT_SNAPSHOT_INTERVAL_SECONDS,
         DEFAULT_TICK_SECONDS,
@@ -411,6 +412,14 @@ def _build_loop(
             os.environ.get(
                 "NFLPROPS_CHECKPOINT_PREPARE_TIMEOUT_SECONDS", DEFAULT_WORKER_TIMEOUT_SECONDS
             )
+        ),
+        checkpoint_batch_limit=max(
+            1,
+            int(
+                os.environ.get(
+                    "NFLPROPS_CHECKPOINT_PREPARE_BATCH_LIMIT", DEFAULT_CHECKPOINT_BATCH_LIMIT
+                )
+            ),
         ),
         raw_retention_days=retention_days,
         outcome_ingest_interval_seconds=float(

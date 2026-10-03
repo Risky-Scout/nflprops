@@ -382,6 +382,21 @@ def _record_missing_requests(
     return added
 
 
+def _unprepared_claims(warehouse: Warehouse) -> int:
+    """Claimed checkpoints not yet prepared: PREPARING requests plus
+    SCHEDULED runs without a request row (a claim whose pass was killed
+    before step 2). A bounded pass finishes these before claiming more."""
+    requests = _read_requests(warehouse)
+    count = requests.filter(pl.col("state") == STATE_PREPARING).height
+    if warehouse.exists(PREDICTION_RUNS_TABLE):
+        known = set(requests["request_id"].to_list())
+        scheduled = warehouse.read(PREDICTION_RUNS_TABLE).filter(
+            pl.col("status") == PredictionRunStatus.SCHEDULED.value
+        )
+        count += sum(run_id not in known for run_id in scheduled["run_id"].to_list())
+    return count
+
+
 def _publish_request_bundle(
     layout: RuntimeLayout,
     warehouse: Warehouse,
@@ -458,11 +473,18 @@ def _finish_preparing(
     hostname: str,
     lock_timeout_seconds: float,
     market_mode: str,
+    limit: int | None = None,
 ) -> tuple[SnapshotInfo | None, list[PreparedCheckpoint]]:
-    """Steps 3-4 for every PREPARING request (outside the writer lock --
-    `create_snapshot` acquires it itself; the lock is re-taken for the
+    """Steps 3-4 for every PREPARING request -- or, with `limit`, for the
+    `limit` earliest (scheduled_as_of, kickoff_at, game_id, run_id) of them;
+    the rest stay PREPARING for a later pass. Runs outside the writer lock
+    (`create_snapshot` acquires it itself; the lock is re-taken for the
     request-row updates)."""
     preparing = _read_requests(warehouse).filter(pl.col("state") == STATE_PREPARING)
+    if limit is not None:
+        preparing = preparing.sort(["scheduled_as_of", "kickoff_at", "game_id", "run_id"]).head(
+            limit
+        )
     if preparing.is_empty():
         return None, []
 
@@ -558,20 +580,42 @@ def prepare_due_checkpoints(
     lock_timeout_seconds: float = 60.0,
     market_mode: str = "live",
     settings: DispatchSettings | None = None,
+    max_checkpoints: int | None = None,
 ) -> PreparePassResult:
     """One scheduling/preparation pass for the official checkpoints of
-    (season, week) as of `now`. Never executes science."""
+    (season, week) as of `now`. Never executes science.
+
+    `max_checkpoints` bounds the pass (None = everything due, the original
+    behavior). A bounded pass first finishes already-claimed, unprepared
+    checkpoints (PREPARING, or SCHEDULED without a request row), earliest
+    first, and claims new slots -- earliest `scheduled_as_of` first -- only
+    with the budget left over. Each claim is committed before the snapshot
+    step, so the work of one pass is never lost to a later kill, and N
+    simultaneously due checkpoints complete in ceil(N / max_checkpoints)
+    passes instead of one all-or-nothing pass."""
+    if max_checkpoints is not None and max_checkpoints < 1:
+        raise ValueError(f"max_checkpoints must be >= 1, got {max_checkpoints}")
     resolved = settings or DispatchSettings.resolve(config, market_mode=market_mode)
     claimed: list[str] = []
     missed: list[str] = []
     with WriterLock(layout.writer_lock, timeout_seconds=lock_timeout_seconds):
-        planned: list[PlannedCheckpoint] = plan_due_checkpoints(
-            warehouse=warehouse,
-            config=config,
-            season=season,
-            week=week,
-            now=now,
-            settings=resolved,
+        claim_limit = (
+            None
+            if max_checkpoints is None
+            else max(0, max_checkpoints - _unprepared_claims(warehouse))
+        )
+        planned: list[PlannedCheckpoint] = (
+            []
+            if claim_limit == 0
+            else plan_due_checkpoints(
+                warehouse=warehouse,
+                config=config,
+                season=season,
+                week=week,
+                now=now,
+                settings=resolved,
+                limit=claim_limit,
+            )
         )
         for item in planned:
             if not claim_checkpoint(as_run_store_backend(warehouse), item.record):
@@ -590,6 +634,7 @@ def prepare_due_checkpoints(
         hostname=hostname,
         lock_timeout_seconds=lock_timeout_seconds,
         market_mode=market_mode,
+        limit=max_checkpoints,
     )
     return PreparePassResult(
         claimed=tuple(claimed),
