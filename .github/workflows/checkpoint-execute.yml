@@ -268,7 +268,7 @@ jobs:
           SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
           REMOTE: ${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}
           RUN_ID: ${{ steps.select.outputs.run_id }}
-          CANCELLED: ${{ cancelled() }}
+          JOB_STATUS: ${{ job.status }}
           EXIT_CODE: ${{ steps.execute.outputs.exit_code }}
           REFUSAL_CODE: ${{ steps.execute.outputs.refusal_code }}
           DOWNLOAD: ${{ steps.download.outcome }}
@@ -276,7 +276,7 @@ jobs:
           PUBLISH: ${{ steps.publish.outcome }}
           INGEST: ${{ steps.ingest.outcome }}
         run: |
-          if [ "$CANCELLED" = "true" ]; then code=TIMEOUT_OR_CANCELLED
+          if [ "$JOB_STATUS" = "cancelled" ]; then code=TIMEOUT_OR_CANCELLED
           elif [ "$EXIT_CODE" = "4" ]; then code="$REFUSAL_CODE"
           elif [ "$DOWNLOAD" = "failure" ]; then code=DOWNLOAD_OR_BUNDLE_VERIFY_FAILED
           elif [ "$EXECUTE" = "failure" ]; then code=EXECUTOR_FAILED
