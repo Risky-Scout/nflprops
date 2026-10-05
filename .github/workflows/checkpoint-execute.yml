@@ -19,9 +19,20 @@ name: Checkpoint Execute (BLOCK 4)
 # GitHub never opens the live Wizard warehouse/DuckDB: every Wizard-side
 # write is a fixed `deploy/wizard/ops.sh` operation executed by the runtime
 # owner. If a result bundle for the request is already published (an
-# earlier run died before ingest), this run only resumes the ingest. A
-# request the verification deterministically refuses is recorded
-# NOT_EXECUTABLE (fail closed) so it never blocks the queue.
+# earlier run died before ingest), this run only resumes the ingest.
+#
+# Refusal classes (nflprops.platform.remote_checkpoint):
+#   exit 3  SCIENTIFIC verification refusal (pre-cutoff evidence gate,
+#           RESEARCH_ONLY evidence, corrupt immutable request/snapshot
+#           identity, non-production draws) -> recorded NOT_EXECUTABLE with
+#           its refusal code, so it never blocks the queue;
+#   exit 4  OPERATIONAL verification refusal (executor/environment or
+#           config-runtime mismatch, unsupported schema/hash version, PIT
+#           manifest not reproduced, wrong snapshot restored) and every other
+#           failure (download, executor crash, timeout/cancel, publish,
+#           ingest) -> recorded as an operational failure ONLY; the request
+#           stays PENDING_REMOTE_EXECUTION and the job fails visibly.
+# NOT_EXECUTABLE is never a generic failure state.
 #
 # Triggers: workflow_dispatch (optionally an explicit run_id), and a
 # schedule that is OFF until the repository variable
@@ -35,7 +46,7 @@ on:
         required: false
         type: string
       verify_only:
-        description: "Verify the request against its immutable snapshot, then stop (no simulation). A deterministic refusal is still recorded NOT_EXECUTABLE. Requires run_id."
+        description: "Verify the request against its immutable snapshot, then stop (no simulation). A SCIENTIFIC refusal is still recorded NOT_EXECUTABLE; an operational one leaves the request pending. Requires run_id."
         required: false
         type: boolean
         default: false
@@ -109,6 +120,7 @@ jobs:
             --github-output "$GITHUB_OUTPUT"
 
       - name: Download + verify the immutable request bundle and snapshot
+        id: download
         if: steps.select.outputs.found == 'true' && steps.select.outputs.published_sha256 == ''
         env:
           SCP_OPTS: -i ~/.ssh/wizard_deploy_key -P ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
@@ -142,6 +154,7 @@ jobs:
           [ "$VERIFY_ONLY" = "true" ] && extra=(--verify-only)
           set +e
           python -m nflprops.platform.wizard_runtime execute-checkpoint "${extra[@]}" \
+            --refusal-file "$RUNNER_TEMP/refusal.json" \
             --request-dir "$RUNNER_TEMP/request" \
             --expected-request-sha256 "$REQUEST_SHA" \
             --snapshot-root "$RUNNER_TEMP/snapshots" \
@@ -152,23 +165,36 @@ jobs:
           code=$?
           set -e
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" -eq 3 ] || [ "$code" -eq 4 ]; then
+            refusal_class="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["refusal_class"])' "$RUNNER_TEMP/refusal.json")"
+            refusal_code="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["refusal_code"])' "$RUNNER_TEMP/refusal.json")"
+            [[ "$refusal_code" =~ ^[A-Z][A-Z_]{2,63}$ ]] || { echo "::error::bad refusal code"; exit 1; }
+            echo "refusal_class=$refusal_class" >> "$GITHUB_OUTPUT"
+            echo "refusal_code=$refusal_code" >> "$GITHUB_OUTPUT"
+          fi
           if [ "$code" -eq 3 ]; then
-            echo "::warning::verification refused this request; recording it NOT_EXECUTABLE"
+            echo "::warning::SCIENTIFIC verification refusal ($refusal_code); recording it NOT_EXECUTABLE"
             exit 0
+          fi
+          if [ "$code" -eq 4 ]; then
+            echo "::error::OPERATIONAL verification refusal ($refusal_code); the request stays pending"
           fi
           exit "$code"
 
-      - name: Record a deterministic verification refusal (NOT_EXECUTABLE)
-        if: steps.execute.outputs.exit_code == '3'
+      - name: Record a SCIENTIFIC verification refusal (NOT_EXECUTABLE)
+        if: steps.execute.outputs.exit_code == '3' && steps.execute.outputs.refusal_class == 'SCIENTIFIC'
         env:
           SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
           REMOTE: ${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}
           RUN_ID: ${{ steps.select.outputs.run_id }}
+          REFUSAL_CODE: ${{ steps.execute.outputs.refusal_code }}
         run: |
+          # The Wizard side re-checks REFUSAL_CODE is scientific and
+          # refuses anything else.
           # shellcheck disable=SC2086
           ssh $SSH_OPTS "$REMOTE" bash -s -- checkpoint-refuse "$RUNTIME_ROOT" \
             "$RUN_ID" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            < deploy/wizard/ops.sh
+            "$REFUSAL_CODE" < deploy/wizard/ops.sh
 
       - name: Build the immutable result bundle (deterministic manifest)
         id: bundle
@@ -199,6 +225,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload + atomic publish by the Wizard runtime owner
+        id: publish
         if: steps.execute.outputs.exit_code == '0' && inputs.verify_only != true
         env:
           SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
@@ -235,6 +262,35 @@ jobs:
           ssh $SSH_OPTS "$REMOTE" bash -s -- result-ingest "$RUNTIME_ROOT" "$BUNDLE_ID" "$MANIFEST_SHA" \
             < deploy/wizard/ops.sh | tee "$RUNNER_TEMP/ingest.json"
 
+      - name: Record an OPERATIONAL failure (the request stays pending)
+        if: always() && steps.select.outputs.found == 'true' && (failure() || cancelled())
+        env:
+          SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+          REMOTE: ${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}
+          RUN_ID: ${{ steps.select.outputs.run_id }}
+          CANCELLED: ${{ cancelled() }}
+          EXIT_CODE: ${{ steps.execute.outputs.exit_code }}
+          REFUSAL_CODE: ${{ steps.execute.outputs.refusal_code }}
+          DOWNLOAD: ${{ steps.download.outcome }}
+          EXECUTE: ${{ steps.execute.outcome }}
+          PUBLISH: ${{ steps.publish.outcome }}
+          INGEST: ${{ steps.ingest.outcome }}
+        run: |
+          if [ "$CANCELLED" = "true" ]; then code=TIMEOUT_OR_CANCELLED
+          elif [ "$EXIT_CODE" = "4" ]; then code="$REFUSAL_CODE"
+          elif [ "$DOWNLOAD" = "failure" ]; then code=DOWNLOAD_OR_BUNDLE_VERIFY_FAILED
+          elif [ "$EXECUTE" = "failure" ]; then code=EXECUTOR_FAILED
+          elif [ "$PUBLISH" = "failure" ]; then code=PUBLISH_FAILED
+          elif [ "$INGEST" = "failure" ]; then code=INGEST_FAILED
+          else code=EXECUTOR_FAILED
+          fi
+          [[ "$code" =~ ^[A-Z][A-Z_]{2,63}$ ]] || code=EXECUTOR_FAILED
+          echo "::error::operational failure $code recorded; request $RUN_ID stays PENDING_REMOTE_EXECUTION"
+          # shellcheck disable=SC2086
+          ssh $SSH_OPTS "$REMOTE" bash -s -- checkpoint-operational-failure "$RUNTIME_ROOT" \
+            "$RUN_ID" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            "$code" < deploy/wizard/ops.sh
+
       - name: Report
         if: always()
         env:
@@ -243,6 +299,8 @@ jobs:
           CHECKPOINT: ${{ steps.select.outputs.checkpoint_name }}
           BUNDLE_ID: ${{ steps.select.outputs.bundle_id }}
           EXIT_CODE: ${{ steps.execute.outputs.exit_code }}
+          REFUSAL_CLASS: ${{ steps.execute.outputs.refusal_class }}
+          REFUSAL_CODE: ${{ steps.execute.outputs.refusal_code }}
           MANIFEST_SHA: ${{ steps.bundle.outputs.manifest_sha256 || steps.select.outputs.published_sha256 }}
           INGEST: ${{ steps.ingest.outcome }}
         run: |
@@ -251,6 +309,7 @@ jobs:
             if [ "$FOUND" != "true" ]; then echo "No executable pending request."; exit 0; fi
             echo "- run_id: \`$RUN_ID\` ($CHECKPOINT)"
             echo "- execute exit code: \`${EXIT_CODE:-resume-only}\`"
+            echo "- refusal: \`${REFUSAL_CLASS:-none}/${REFUSAL_CODE:-none}\`"
             echo "- result bundle: \`$BUNDLE_ID\`"
             echo "- result manifest sha256: \`${MANIFEST_SHA:-none}\`"
             echo "- Wizard ingest: \`${INGEST:-skipped}\`"

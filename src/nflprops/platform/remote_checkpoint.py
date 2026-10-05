@@ -17,13 +17,20 @@ Fail-closed sequence:
    `PRODUCTION_N_DRAWS` (20,000 -- never reduced);
 4. the PIT data manifest recomputed from the restored snapshot at
    `scheduled_as_of` equals the claimed `data_manifest_sha256`, and the
-   local resolved config hashes to the claimed `config_sha256`;
+   executor's configuration matches the claim (`verify_config_identity`:
+   the versioned, host-independent `scientific_config_sha256` for v2
+   requests; for legacy v1 requests the claimed full-config SHA reproduced
+   exactly via a pinned claimant operational profile);
 5. official checkpoints re-pass the pre-cutoff evidence gate;
 6. the certified `game_checkpoint_flow` runs once (one coherent 20k
    simulation -> projections -> threshold probabilities -> exact PMFs ->
    push-aware prices/EV), writing only to the scratch warehouse;
 7. the calibration gate and the PUBLIC_READY decision are evaluated;
 8. every canonical row the run produced is exported with `result.json`.
+
+Every refusal is classified SCIENTIFIC (deterministic: may be recorded
+NOT_EXECUTABLE) or OPERATIONAL (the request stays pending) -- see
+`RemoteExecutionError`.
 
 Nothing here promotes a calibrator, relaxes a gate, or writes to Wizard;
 installing the bundle is `nflprops.platform.result_ingest` on the Wizard
@@ -41,7 +48,13 @@ from typing import Any
 
 import polars as pl
 
-from nflprops.config import Config, config_sha256
+from nflprops.config import (
+    SCIENTIFIC_CONFIG_HASH_VERSION,
+    Config,
+    config_sha256,
+    scientific_config_sha256,
+    with_operational_values,
+)
 from nflprops.data.evidence_policy import (
     EvidencePolicyError,
     require_official_warehouse,
@@ -60,6 +73,7 @@ from nflprops.orchestration.run_store import (
 from nflprops.platform.checkpoint_prepare import (
     EXECUTION_TARGET,
     REQUEST_SCHEMA_VERSION,
+    SUPPORTED_REQUEST_SCHEMA_VERSIONS,
     remote_execution_blocker,
 )
 from nflprops.platform.immutable_bundle import (
@@ -114,8 +128,132 @@ _IDENTITY_FIELDS = (
 )
 
 
+#: Refusal classes. Only SCIENTIFIC refusals may ever become NOT_EXECUTABLE
+#: (`checkpoint-execute.yml`: exit 3); an OPERATIONAL refusal (exit 4)
+#: leaves the request scientifically pending and is recorded separately as
+#: an operational failure -- a correctly configured executor may succeed.
+REFUSAL_SCIENTIFIC = "SCIENTIFIC"
+REFUSAL_OPERATIONAL = "OPERATIONAL"
+
+#: Scientific, deterministic refusal codes: a property of the immutable
+#: request bundle + snapshot pair that no executor or retry can change.
+REFUSAL_INSUFFICIENT_PRE_CUTOFF_PIT_DATA = "INSUFFICIENT_PRE_CUTOFF_PIT_DATA"
+REFUSAL_RESEARCH_ONLY_EVIDENCE = "RESEARCH_ONLY_EVIDENCE"
+REFUSAL_SNAPSHOT_IDENTITY_CORRUPT = "SNAPSHOT_IDENTITY_CORRUPT"
+REFUSAL_RUN_IDENTITY_CORRUPT = "RUN_IDENTITY_CORRUPT"
+REFUSAL_NON_PRODUCTION_DRAWS = "NON_PRODUCTION_DRAWS"
+SCIENTIFIC_REFUSAL_CODES: frozenset[str] = frozenset({
+    REFUSAL_INSUFFICIENT_PRE_CUTOFF_PIT_DATA,
+    REFUSAL_RESEARCH_ONLY_EVIDENCE,
+    REFUSAL_SNAPSHOT_IDENTITY_CORRUPT,
+    REFUSAL_RUN_IDENTITY_CORRUPT,
+    REFUSAL_NON_PRODUCTION_DRAWS,
+})
+
+#: Operational refusal codes: executor/environment/runtime incompatibility
+#: or a plumbing fault a retry may clear. Never NOT_EXECUTABLE.
+REFUSAL_CONFIG_IDENTITY_MISMATCH = "CONFIG_IDENTITY_MISMATCH"
+REFUSAL_UNSUPPORTED_CONFIG_HASH_VERSION = "UNSUPPORTED_CONFIG_HASH_VERSION"
+REFUSAL_UNSUPPORTED_REQUEST_SCHEMA = "UNSUPPORTED_REQUEST_SCHEMA"
+REFUSAL_MALFORMED_REQUEST = "MALFORMED_REQUEST"
+REFUSAL_WRONG_SNAPSHOT_RESTORED = "WRONG_SNAPSHOT_RESTORED"
+REFUSAL_PIT_MANIFEST_NOT_REPRODUCED = "PIT_MANIFEST_NOT_REPRODUCED"
+OPERATIONAL_REFUSAL_CODES: frozenset[str] = frozenset({
+    REFUSAL_CONFIG_IDENTITY_MISMATCH,
+    REFUSAL_UNSUPPORTED_CONFIG_HASH_VERSION,
+    REFUSAL_UNSUPPORTED_REQUEST_SCHEMA,
+    REFUSAL_MALFORMED_REQUEST,
+    REFUSAL_WRONG_SNAPSHOT_RESTORED,
+    REFUSAL_PIT_MANIFEST_NOT_REPRODUCED,
+})
+
+
 class RemoteExecutionError(NflpropsError):
-    """The request/snapshot pair is not safe to execute; nothing ran."""
+    """The request/snapshot pair is not safe to execute; nothing ran.
+
+    `refusal_code` / `refusal_class` say whether the refusal is a
+    deterministic scientific property of the immutable inputs (SCIENTIFIC
+    -- may be recorded NOT_EXECUTABLE) or an executor/environment problem
+    (OPERATIONAL -- the request stays pending). The default is OPERATIONAL:
+    nothing becomes NOT_EXECUTABLE unless explicitly classified so."""
+
+    def __init__(self, message: str, *, refusal_code: str = REFUSAL_MALFORMED_REQUEST) -> None:
+        super().__init__(message)
+        if refusal_code in SCIENTIFIC_REFUSAL_CODES:
+            self.refusal_class = REFUSAL_SCIENTIFIC
+        elif refusal_code in OPERATIONAL_REFUSAL_CODES:
+            self.refusal_class = REFUSAL_OPERATIONAL
+        else:
+            raise ValueError(f"unknown refusal code {refusal_code!r}")
+        self.refusal_code = refusal_code
+
+    @property
+    def scientific(self) -> bool:
+        return self.refusal_class == REFUSAL_SCIENTIFIC
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "refusal_class": self.refusal_class,
+            "refusal_code": self.refusal_code,
+            "message": str(self),
+        }
+
+
+# --------------------------------------------- configuration identity check
+
+#: Legacy (`LEGACY_REQUEST_SCHEMA_VERSION`) requests carry only the
+#: claimant's FULL resolved-config SHA (`config.config_sha256`), which
+#: includes host-only settings. The only legacy claimant is the Wizard
+#: runtime; these are the operational values it resolved (its env file sets
+#: NFLPROPS_DATA_ROOT; the log level is the shipped default). Legacy
+#: verification substitutes exactly these OPERATIONAL leaves
+#: (`config.with_operational_values` refuses any other path) and must then
+#: reproduce the claimed hash byte for byte -- every scientific leaf still
+#: comes from the executor's own configuration, so the check is not weakened.
+LEGACY_CLAIMANT_OPERATIONAL_PROFILES: dict[str, dict[str, Any]] = {
+    "wizard-runtime": {
+        "run.data_root": "/home/wizard-deploy/nflprops/state",
+        "run.log_level": "INFO",
+    },
+}
+
+
+def verify_config_identity(request: dict[str, Any], config: Config) -> str:
+    """Check the executor's configuration against the request's claim and
+    return how it matched: "scientific/v1", "legacy:local" or
+    "legacy:<profile>". Every mismatch is OPERATIONAL -- the remedy is an
+    executor running the claimed configuration, never NOT_EXECUTABLE."""
+    if request.get("schema_version") == REQUEST_SCHEMA_VERSION:
+        version = request.get("scientific_config_hash_version")
+        if version != SCIENTIFIC_CONFIG_HASH_VERSION:
+            raise RemoteExecutionError(
+                f"request scientific_config_hash_version {version!r} is not supported by this "
+                f"executor ({SCIENTIFIC_CONFIG_HASH_VERSION!r})",
+                refusal_code=REFUSAL_UNSUPPORTED_CONFIG_HASH_VERSION,
+            )
+        local = scientific_config_sha256(config)
+        if local != request.get("scientific_config_sha256"):
+            raise RemoteExecutionError(
+                f"resolved scientific config SHA {local} != claimed "
+                f"{request.get('scientific_config_sha256')} ({version}); the executor must "
+                "run the scientific configuration the checkpoint was claimed under",
+                refusal_code=REFUSAL_CONFIG_IDENTITY_MISMATCH,
+            )
+        return "scientific/v1"
+
+    # Legacy request: reproduce the claimant's full-config hash exactly.
+    claimed = request["config_sha256"]
+    if config_sha256(config) == claimed:
+        return "legacy:local"
+    for name, profile in sorted(LEGACY_CLAIMANT_OPERATIONAL_PROFILES.items()):
+        if config_sha256(with_operational_values(config, profile)) == claimed:
+            return f"legacy:{name}"
+    raise RemoteExecutionError(
+        f"resolved config SHA {config_sha256(config)} != claimed {claimed}, and no pinned "
+        f"legacy claimant profile {sorted(LEGACY_CLAIMANT_OPERATIONAL_PROFILES)} reproduces "
+        "it; the executor must run the same configuration the checkpoint was claimed under",
+        refusal_code=REFUSAL_CONFIG_IDENTITY_MISMATCH,
+    )
 
 
 def _parse_ts(value: str) -> datetime:
@@ -135,8 +273,11 @@ def load_verified_request(
         request_dir, manifest, expected_manifest_sha256=expected_manifest_sha256
     )
     request = json.loads((request_dir / "request.json").read_text())
-    if request.get("schema_version") != REQUEST_SCHEMA_VERSION:
-        raise RemoteExecutionError(f"unsupported request schema {request.get('schema_version')!r}")
+    if request.get("schema_version") not in SUPPORTED_REQUEST_SCHEMA_VERSIONS:
+        raise RemoteExecutionError(
+            f"unsupported request schema {request.get('schema_version')!r}",
+            refusal_code=REFUSAL_UNSUPPORTED_REQUEST_SCHEMA,
+        )
     if request.get("execution_target") != EXECUTION_TARGET:
         raise RemoteExecutionError(f"request execution_target is {request.get('execution_target')!r}")
     if manifest.bundle_id != request["run_id"]:
@@ -153,32 +294,60 @@ def verify_request_against_snapshot(
     snapshot_manifest_sha256: str,
     market_mode: str = "live",
 ) -> PredictionRunRecord:
-    """Steps 2-5 of the module contract. Returns the SCHEDULED run."""
+    """Steps 2-5 of the module contract. Returns the SCHEDULED run.
+
+    Each refusal is classified (`RemoteExecutionError.refusal_class`):
+
+    * OPERATIONAL -- the wrong snapshot restored (plumbing), a PIT data
+      manifest this executor's code does not reproduce from the
+      SHA-verified snapshot (executor/preparer incompatibility; a pristine
+      re-download or a compatible executor may succeed), any configuration
+      identity mismatch, an unsupported hash version.
+    * SCIENTIFIC -- deterministic properties of the immutable pair: the
+      snapshot the request names is not the one it claims, the run is
+      absent / not SCHEDULED / differs from the request inside that
+      snapshot, a non-production draw count, the pre-cutoff evidence gate,
+      RESEARCH_ONLY evidence."""
     if request["snapshot_id"] != snapshot_id:
         raise RemoteExecutionError(
-            f"request names snapshot {request['snapshot_id']!r}, restored {snapshot_id!r}"
+            f"request names snapshot {request['snapshot_id']!r}, restored {snapshot_id!r}",
+            refusal_code=REFUSAL_WRONG_SNAPSHOT_RESTORED,
         )
     if request["snapshot_manifest_sha256"] != snapshot_manifest_sha256:
-        raise RemoteExecutionError("restored snapshot manifest SHA differs from the request's")
+        raise RemoteExecutionError(
+            "restored snapshot manifest SHA differs from the request's",
+            refusal_code=REFUSAL_SNAPSHOT_IDENTITY_CORRUPT,
+        )
 
     run = get_run(as_run_store_backend(warehouse), request["run_id"])
     if run is None:
-        raise RemoteExecutionError(f"snapshot has no prediction_runs row for {request['run_id']}")
+        raise RemoteExecutionError(
+            f"snapshot has no prediction_runs row for {request['run_id']}",
+            refusal_code=REFUSAL_RUN_IDENTITY_CORRUPT,
+        )
     if run.status is not PredictionRunStatus.SCHEDULED:
-        raise RemoteExecutionError(f"run is {run.status.value}, not SCHEDULED")
+        raise RemoteExecutionError(
+            f"run is {run.status.value}, not SCHEDULED",
+            refusal_code=REFUSAL_RUN_IDENTITY_CORRUPT,
+        )
     for field in _IDENTITY_FIELDS:
         if getattr(run, field) != request[field]:
             raise RemoteExecutionError(
                 f"run identity mismatch on {field}: snapshot={getattr(run, field)!r} "
-                f"request={request[field]!r}"
+                f"request={request[field]!r}",
+                refusal_code=REFUSAL_RUN_IDENTITY_CORRUPT,
             )
     for field in ("scheduled_as_of", "kickoff_at"):
         if getattr(run, field).astimezone(UTC) != _parse_ts(request[field]):
-            raise RemoteExecutionError(f"run identity mismatch on {field}")
+            raise RemoteExecutionError(
+                f"run identity mismatch on {field}",
+                refusal_code=REFUSAL_RUN_IDENTITY_CORRUPT,
+            )
     if run.n_draws != PRODUCTION_N_DRAWS:
         raise RemoteExecutionError(
             f"run n_draws={run.n_draws}; production execution requires exactly "
-            f"{PRODUCTION_N_DRAWS}"
+            f"{PRODUCTION_N_DRAWS}",
+            refusal_code=REFUSAL_NON_PRODUCTION_DRAWS,
         )
 
     manifest = build_checkpoint_manifest(
@@ -190,14 +359,10 @@ def verify_request_against_snapshot(
     if manifest.data_manifest_sha256 != request["data_manifest_sha256"]:
         raise RemoteExecutionError(
             "PIT data manifest recomputed from the snapshot "
-            f"({manifest.data_manifest_sha256}) != claimed ({request['data_manifest_sha256']})"
+            f"({manifest.data_manifest_sha256}) != claimed ({request['data_manifest_sha256']})",
+            refusal_code=REFUSAL_PIT_MANIFEST_NOT_REPRODUCED,
         )
-    local_config_sha = config_sha256(config)
-    if local_config_sha != request["config_sha256"]:
-        raise RemoteExecutionError(
-            f"resolved config SHA {local_config_sha} != claimed {request['config_sha256']}; "
-            "the executor must run the same configuration the checkpoint was claimed under"
-        )
+    verify_config_identity(request, config)
 
     blocker = remote_execution_blocker(
         warehouse,
@@ -205,13 +370,17 @@ def verify_request_against_snapshot(
         market_mode=market_mode,
     )
     if blocker is not None:
-        raise RemoteExecutionError(blocker)
+        raise RemoteExecutionError(
+            blocker, refusal_code=REFUSAL_INSUFFICIENT_PRE_CUTOFF_PIT_DATA
+        )
     # Official checkpoint evidence is strict PIT: a snapshot holding any
     # RESEARCH_ONLY (estimated-availability) row is never executed.
     try:
         require_official_warehouse(warehouse, context=f"checkpoint {run.run_id}")
     except EvidencePolicyError as exc:
-        raise RemoteExecutionError(str(exc)) from exc
+        raise RemoteExecutionError(
+            str(exc), refusal_code=REFUSAL_RESEARCH_ONLY_EVIDENCE
+        ) from exc
     return run
 
 
@@ -375,6 +544,12 @@ def execute_checkpoint(
             "model_version": run.model_version,
             "config_sha256": run.config_sha256,
             "source_sha256": run.source_sha256,
+        },
+        "config_identity": {
+            "scientific_config_sha256": scientific_config_sha256(config),
+            "scientific_config_hash_version": SCIENTIFIC_CONFIG_HASH_VERSION,
+            "claimed_scientific_config_sha256": request.get("scientific_config_sha256"),
+            "request_schema_version": request.get("schema_version"),
         },
         "n_draws": PRODUCTION_N_DRAWS,
         "execution": {

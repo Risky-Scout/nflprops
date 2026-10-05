@@ -672,10 +672,15 @@ def checkpoint_executable() -> None:
 def checkpoint_refuse(
     run_id: str = typer.Option(..., help="The pending request's run_id (64 hex)."),
     workflow_run: str = typer.Option(..., help="URL of the GitHub run that refused it."),
+    refusal_code: str = typer.Option(
+        ..., help="The executor's SCIENTIFIC refusal code (remote_checkpoint)."
+    ),
 ) -> None:
-    """WIZARD SIDE: record that the GitHub executor's verification refused
-    one pending request (-> NOT_EXECUTABLE, run FAILED). Only narrows
-    publication; idempotent; never touches a completed request."""
+    """WIZARD SIDE: record that the GitHub executor's verification
+    SCIENTIFICALLY refused one pending request (-> NOT_EXECUTABLE, run
+    FAILED, failure_detail "<refusal_code>: ..."). An operational refusal
+    code is refused (the request stays pending). Only narrows publication;
+    idempotent; never touches a completed request."""
     import re
 
     from nflprops.data.warehouse import Warehouse
@@ -690,6 +695,7 @@ def checkpoint_refuse(
         status = refuse_request(
             Warehouse(layout.warehouse_root),
             run_id,
+            refusal_code=refusal_code,
             detail=f"GitHub executor verification refused the request: {workflow_run}",
             lock_path=layout.writer_lock,
         )
@@ -697,6 +703,68 @@ def checkpoint_refuse(
         typer.echo(f"FAILED: {exc}", err=True)
         raise typer.Exit(1) from exc
     typer.echo(f"{status}: {run_id}")
+
+
+@checkpoint_app.command("operational-failure")
+def checkpoint_operational_failure(
+    run_id: str = typer.Option(..., help="The request's run_id (64 hex)."),
+    workflow_run: str = typer.Option(..., help="URL of the GitHub run that failed."),
+    failure_code: str = typer.Option(..., help="Operational failure code (checkpoint_failures)."),
+) -> None:
+    """WIZARD SIDE: append one OPERATIONAL execution failure to the
+    operational failure log. Never changes the request or its run: the
+    request stays scientifically pending."""
+    import json
+
+    from nflprops.data.warehouse import Warehouse
+    from nflprops.platform.checkpoint_failures import (
+        OperationalFailureError,
+        record_operational_failure,
+    )
+
+    layout = _layout()
+    try:
+        record = record_operational_failure(
+            layout, Warehouse(layout.warehouse_root),
+            run_id=run_id, workflow_run=workflow_run, failure_code=failure_code,
+        )
+    except OperationalFailureError as exc:
+        typer.echo(f"FAILED: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(record, sort_keys=True))
+
+
+@checkpoint_app.command("repair-false-refusal")
+def checkpoint_repair_false_refusal(
+    run_id: str = typer.Option(..., help="The pinned falsely refused run_id (64 hex)."),
+    incident_id: str = typer.Option(..., help="The pinned incident id (refusal_incidents)."),
+) -> None:
+    """WIZARD SIDE: audited remediation of ONE pinned false NOT_EXECUTABLE
+    refusal (`refusal_repair`): re-proves the incident, appends an
+    immutable remediation record, then restores the request to
+    PENDING_REMOTE_EXECUTION. Refuses any other request."""
+    import json
+    from datetime import UTC, datetime
+
+    from nflprops.config import load
+    from nflprops.data.warehouse import Warehouse
+    from nflprops.platform.refusal_repair import (
+        RefusalRepairError,
+        repair_false_refusal,
+    )
+    from nflprops.platform.runtime_layout import running_release_sha
+
+    layout = _layout()
+    try:
+        record = repair_false_refusal(
+            layout, Warehouse(layout.warehouse_root), load(),
+            run_id=run_id, incident_id=incident_id,
+            repair_release_sha=running_release_sha(), now=datetime.now(UTC),
+        )
+    except (RefusalRepairError, WriterLockError) as exc:
+        typer.echo(f"FAILED: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(record, sort_keys=True, default=str))
 
 
 # ------------------------------------------------------------ BLOCK 4
@@ -778,13 +846,20 @@ def execute_checkpoint_cmd(
     verify_only: bool = typer.Option(
         False, help="Verify the request against its snapshot, then stop (no simulation)."
     ),
+    refusal_file: str = typer.Option(
+        "", help="Where to write the classified verification refusal (JSON), if any."
+    ),
 ) -> None:
     """GITHUB SIDE ONLY: verify one prepared checkpoint against its
     snapshot, run the certified 20,000-draw checkpoint flow on a scratch
     restore, gate calibration, decide PUBLIC_READY, and write the result
     files. Refuses to run on the Wizard host (NFLPROPS_RUNTIME_ROOT set).
-    Exit 3 = verification deterministically refused the request; exit 1 =
-    any other (possibly transient) failure."""
+
+    Exit 3 = a SCIENTIFIC, deterministic verification refusal (the only
+    case the workflow may record NOT_EXECUTABLE); exit 4 = an OPERATIONAL
+    verification refusal (executor/environment/config-runtime mismatch:
+    the request stays pending); exit 1 = any other (possibly transient)
+    failure. Exits 3 and 4 write `--refusal-file` (class, code, message)."""
     import json
     import os
 
@@ -817,11 +892,12 @@ def execute_checkpoint_cmd(
                 snapshot_manifest_sha256=info.manifest_sha256,
             )
         except RemoteExecutionError as exc:
-            # Deterministic: this request can never execute as claimed.
-            # Exit 3 lets the workflow record it NOT_EXECUTABLE on Wizard
-            # (never retried, never blocks the queue).
-            typer.echo(f"REFUSED: {exc}", err=True)
-            raise typer.Exit(3) from exc
+            if refusal_file:
+                Path(refusal_file).write_text(json.dumps(exc.as_dict(), sort_keys=True) + "\n")
+            typer.echo(f"REFUSED [{exc.refusal_class}/{exc.refusal_code}]: {exc}", err=True)
+            # Only a SCIENTIFIC refusal can never execute as claimed; an
+            # OPERATIONAL one must leave the request pending.
+            raise typer.Exit(3 if exc.scientific else 4) from exc
         if verify_only:
             typer.echo(f"VERIFIED: run {run.run_id} is executable against snapshot {info.snapshot_id}")
             return

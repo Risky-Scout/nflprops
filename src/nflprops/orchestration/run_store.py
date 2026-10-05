@@ -14,7 +14,7 @@ legality) is testable without any orchestration runtime.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -393,6 +393,46 @@ def update_run_status(
         created_at=current.created_at,
     )
 
+    _persist_update(backend, updated)
+    return updated
+
+
+def reinstate_falsely_refused_run(
+    backend: StorageBackend,
+    run_id: str,
+    *,
+    expected_failure_code: str,
+    expected_failure_detail: str,
+) -> PredictionRunRecord:
+    """The ONE exception to terminal FAILED: put a run that was refused for
+    a proven OPERATIONAL defect back to SCHEDULED, exactly as it was
+    claimed. Callable only by the audited remediation
+    (`nflprops.platform.refusal_repair`), which records the prior row
+    first. Refuses unless the run is FAILED with exactly the expected
+    failure code and detail; identity fields are never touched."""
+    current = get_run(backend, run_id)
+    if current is None:
+        raise RunStatusTransitionError(f"no prediction_runs row for run_id={run_id!r}")
+    if (
+        current.status is not PredictionRunStatus.FAILED
+        or current.failure_code != expected_failure_code
+        or current.failure_detail != expected_failure_detail
+    ):
+        raise RunStatusTransitionError(
+            f"run {run_id!r} is {current.status.value} ({current.failure_code!r}: "
+            f"{current.failure_detail!r}); it is not the expected false refusal"
+        )
+    updated = replace(
+        current,
+        status=PredictionRunStatus.SCHEDULED,
+        failure_code=None,
+        failure_detail=None,
+    )
+    _persist_update(backend, updated)
+    return updated
+
+
+def _persist_update(backend: StorageBackend, updated: PredictionRunRecord) -> None:
     if _is_postgres(backend):
         _update_postgres(backend, updated)
     else:
@@ -400,7 +440,6 @@ def update_run_status(
         backend.append(
             PREDICTION_RUNS_TABLE, frame, key=["run_id"], sort_by=["scheduled_as_of"]
         )
-    return updated
 
 
 def _update_postgres(backend: StorageBackend, record: PredictionRunRecord) -> None:

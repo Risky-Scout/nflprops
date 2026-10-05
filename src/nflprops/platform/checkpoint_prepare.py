@@ -48,7 +48,12 @@ from nflprops.collection.resource_availability import (
     latest_feed_available_at,
     resource_feed_available_at,
 )
-from nflprops.config import Config
+from nflprops.config import (
+    SCIENTIFIC_CONFIG_HASH_VERSION,
+    Config,
+    config_sha256,
+    scientific_config_sha256,
+)
 from nflprops.data.warehouse import Warehouse
 from nflprops.errors import NflpropsError
 from nflprops.orchestration.checkpoints import (
@@ -85,6 +90,7 @@ from nflprops.platform.immutable_bundle import (
     verify_directory_against_manifest,
     write_manifest,
 )
+from nflprops.platform.refusal_incidents import KNOWN_FALSE_REFUSALS
 from nflprops.platform.runtime_layout import RuntimeLayout
 from nflprops.platform.warehouse_snapshot import (
     SnapshotInfo,
@@ -94,7 +100,18 @@ from nflprops.platform.warehouse_snapshot import (
 from nflprops.platform.writer_lock import WriterLock
 
 REMOTE_REQUESTS_TABLE = "remote_checkpoint_requests"
-REQUEST_SCHEMA_VERSION = "nflprops.platform.checkpoint_request/v1"
+#: Current request bundle schema: v2 adds the host-independent scientific
+#: configuration identity (`scientific_config_sha256` +
+#: `scientific_config_hash_version`, `nflprops.config`) the GitHub executor
+#: verifies; `config_sha256` (full resolved config, host settings included)
+#: is kept as deployment provenance and run identity.
+REQUEST_SCHEMA_VERSION = "nflprops.platform.checkpoint_request/v2"
+#: Requests published before v2 carry only the claimant's full-config SHA.
+#: They are verified by reproducing that hash exactly
+#: (`remote_checkpoint.verify_config_identity`); their bundles are never
+#: rewritten.
+LEGACY_REQUEST_SCHEMA_VERSION = "nflprops.platform.checkpoint_request/v1"
+SUPPORTED_REQUEST_SCHEMA_VERSIONS = (LEGACY_REQUEST_SCHEMA_VERSION, REQUEST_SCHEMA_VERSION)
 EXECUTION_TARGET = "GITHUB_ACTIONS"
 
 STATE_PREPARING = "PREPARING"
@@ -232,9 +249,15 @@ SNAPSHOT_PROTECTING_STATES = (STATE_PREPARING, STATE_PENDING_REMOTE_EXECUTION)
 
 def protected_snapshot_ids(warehouse: Warehouse) -> frozenset[str]:
     """Snapshots an executable (PREPARING / PENDING_REMOTE_EXECUTION)
-    request references -- never pruned."""
+    request references -- never pruned -- plus the snapshot of a pinned,
+    still-unremediated false refusal (`refusal_incidents`), which the
+    audited remediation must be able to re-verify."""
     requests = _read_requests(warehouse).filter(
         pl.col("state").is_in(list(SNAPSHOT_PROTECTING_STATES))
+        | (
+            (pl.col("state") == STATE_NOT_EXECUTABLE)
+            & pl.col("request_id").is_in(list(KNOWN_FALSE_REFUSALS))  # request_id == run_id
+        )
     )
     return frozenset(v for v in requests["snapshot_id"].drop_nulls().to_list() if v)
 
@@ -452,8 +475,21 @@ def _publish_request_bundle(
     *,
     snapshot: SnapshotInfo,
     market_mode: str,
+    config: Config,
 ) -> tuple[str, Path]:
-    """Step 4: the immutable, independently verifiable request bundle."""
+    """Step 4: the immutable, independently verifiable request bundle.
+
+    The scientific configuration identity is taken from `config` only when
+    `config` is provably the configuration the run was claimed under (its
+    full resolved hash equals the claim's `config_sha256`); otherwise the
+    request is not published (operational failure, retried later) rather
+    than pairing a claim with another configuration's identity."""
+    if config_sha256(config) != request["config_sha256"]:
+        raise CheckpointPrepareError(
+            f"run {request['run_id']} was claimed under config {request['config_sha256']} "
+            f"but this preparer resolves {config_sha256(config)}; refusing to publish a "
+            "request bundle with a different configuration identity"
+        )
     scheduled = request["scheduled_as_of"]
     manifest = build_checkpoint_manifest(
         warehouse,
@@ -479,6 +515,8 @@ def _publish_request_bundle(
         "kickoff_at": request["kickoff_at"].astimezone(UTC).isoformat(),
         "model_version": request["model_version"],
         "config_sha256": request["config_sha256"],
+        "scientific_config_sha256": scientific_config_sha256(config),
+        "scientific_config_hash_version": SCIENTIFIC_CONFIG_HASH_VERSION,
         "source_sha256": request["source_sha256"],
         "n_draws": request["n_draws"],
         "data_manifest_sha256": manifest.data_manifest_sha256,
@@ -540,6 +578,7 @@ def _finish_preparing(
     layout: RuntimeLayout,
     warehouse: Warehouse,
     *,
+    config: Config,
     migration_head: str,
     hostname: str,
     lock_timeout_seconds: float,
@@ -593,7 +632,8 @@ def _finish_preparing(
     with WriterLock(layout.writer_lock, timeout_seconds=lock_timeout_seconds):
         for request in preparing.iter_rows(named=True):
             bundle_sha, bundle_dir = _publish_request_bundle(
-                layout, warehouse, request, snapshot=snapshot, market_mode=market_mode
+                layout, warehouse, request, snapshot=snapshot, market_mode=market_mode,
+                config=config,
             )
             _upsert_request(
                 warehouse,
@@ -781,6 +821,7 @@ def prepare_due_checkpoints(
     snapshot, prepared = _finish_preparing(
         layout,
         warehouse,
+        config=config,
         migration_head=migration_head,
         hostname=hostname,
         lock_timeout_seconds=lock_timeout_seconds,
@@ -873,6 +914,7 @@ def prepare_manual_checkpoint(
     _snapshot, prepared = _finish_preparing(
         layout,
         warehouse,
+        config=config,
         migration_head=migration_head,
         hostname=hostname,
         lock_timeout_seconds=lock_timeout_seconds,

@@ -32,9 +32,19 @@
 #   result-ingest BUNDLE_ID MANIFEST_SHA256
 #                          BLOCK 4: validate + install ONE published GitHub
 #                          result bundle (runtime owner, writer lock; idempotent)
-#   checkpoint-refuse RUN_ID WORKFLOW_RUN_URL
-#                          BLOCK 4: the executor's verification refused this
-#                          request -> NOT_EXECUTABLE (fail closed; idempotent)
+#   checkpoint-refuse RUN_ID WORKFLOW_RUN_URL REFUSAL_CODE
+#                          BLOCK 4: the executor's verification SCIENTIFICALLY
+#                          refused this request -> NOT_EXECUTABLE (fail
+#                          closed; idempotent). An operational refusal code
+#                          is rejected: the request stays pending.
+#   checkpoint-operational-failure RUN_ID WORKFLOW_RUN_URL FAILURE_CODE
+#                          BLOCK 4: append one OPERATIONAL execution failure
+#                          to state/checkpoint_execute_operational_failures.jsonl;
+#                          never changes the request (stays pending)
+#   checkpoint-repair-false-refusal RUN_ID INCIDENT_ID
+#                          BLOCK 4: audited remediation of ONE pinned false
+#                          NOT_EXECUTABLE refusal (refusal_repair); refuses
+#                          every request that is not the pinned incident
 #   outcome-ingest-hold    BLOCK 4: create $ROOT/state/outcome_ingest.hold --
 #                          the runtime's recurring outcome ingest never starts
 #   outcome-ingest-release BLOCK 4: remove that hold file
@@ -501,11 +511,27 @@ main() {
       echo "hold_file_present=$([ -e "$ROOT/state/outcome_ingest.hold" ] && echo yes || echo no)"
       ;;
     checkpoint-refuse)
-      [ "$#" -eq 2 ] || die "checkpoint-refuse needs RUN_ID WORKFLOW_RUN_URL"
+      [ "$#" -eq 3 ] || die "checkpoint-refuse needs RUN_ID WORKFLOW_RUN_URL REFUSAL_CODE"
       [[ "$1" =~ ^[0-9a-f]{64}$ ]] || die "run_id format"
       [[ "$2" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+$ ]] || die "workflow run url format"
+      [[ "$3" =~ ^[A-Z][A-Z_]{2,63}$ ]] || die "refusal code format"
       runtime_python -m nflprops.platform.wizard_runtime checkpoint refuse \
-        --run-id "$1" --workflow-run "$2" || die "checkpoint refuse failed"
+        --run-id "$1" --workflow-run "$2" --refusal-code "$3" || die "checkpoint refuse failed"
+      ;;
+    checkpoint-operational-failure)
+      [ "$#" -eq 3 ] || die "checkpoint-operational-failure needs RUN_ID WORKFLOW_RUN_URL FAILURE_CODE"
+      [[ "$1" =~ ^[0-9a-f]{64}$ ]] || die "run_id format"
+      [[ "$2" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+$ ]] || die "workflow run url format"
+      [[ "$3" =~ ^[A-Z][A-Z_]{2,63}$ ]] || die "failure code format"
+      runtime_python -m nflprops.platform.wizard_runtime checkpoint operational-failure \
+        --run-id "$1" --workflow-run "$2" --failure-code "$3" || die "operational failure record failed"
+      ;;
+    checkpoint-repair-false-refusal)
+      [ "$#" -eq 2 ] || die "checkpoint-repair-false-refusal needs RUN_ID INCIDENT_ID"
+      [[ "$1" =~ ^[0-9a-f]{64}$ ]] || die "run_id format"
+      [[ "$2" =~ ^INC-[A-Za-z0-9-]{1,80}$ ]] || die "incident id format"
+      runtime_python -m nflprops.platform.wizard_runtime checkpoint repair-false-refusal \
+        --run-id "$1" --incident-id "$2" || die "false-refusal repair failed"
       ;;
     ingest-stats)
       [ "$#" -ge 1 ] && [ "$#" -le 2 ] || die "ingest-stats needs SEASON [WEEKS]"

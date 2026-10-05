@@ -63,6 +63,7 @@ from nflprops.platform.remote_checkpoint import (
     RESULT_SCHEMA_VERSION,
     RESULT_TABLES,
     RUN_TABLE_FILE,
+    SCIENTIFIC_REFUSAL_CODES,
 )
 from nflprops.platform.remote_training import PRODUCTION_N_DRAWS
 from nflprops.platform.writer_lock import WriterLock
@@ -70,10 +71,13 @@ from nflprops.platform.writer_lock import WriterLock
 RESULTS_TABLE = "remote_checkpoint_results"
 STATE_COMPLETED = "COMPLETED"
 
-#: The GitHub executor's verification deterministically refused the
-#: request (identity/config/manifest drift, a RESEARCH_ONLY snapshot, a
-#: failed execution gate): it can never execute, so it must not block the
-#: queue. Recorded exactly like the runtime's own execution gate.
+#: The GitHub executor's verification refused the request for a SCIENTIFIC,
+#: deterministic reason (`remote_checkpoint.SCIENTIFIC_REFUSAL_CODES`: the
+#: pre-cutoff evidence gate, RESEARCH_ONLY evidence, a corrupt immutable
+#: request/snapshot identity, a non-production draw count): it can never
+#: execute, so it must not block the queue. The refusal code is the first
+#: token of the run's `failure_detail`. Operational/config-runtime refusals
+#: are never recorded this way (`checkpoint_failures`).
 FAILURE_REMOTE_EXECUTION_REFUSED = "REMOTE_EXECUTION_REFUSED"
 
 _TS = pl.Datetime(time_unit="us", time_zone="UTC")
@@ -290,15 +294,24 @@ def refuse_request(
     warehouse: Warehouse,
     run_id: str,
     *,
+    refusal_code: str,
     detail: str,
     lock_path: Path,
     lock_timeout_seconds: float = 60.0,
 ) -> str:
-    """Record that the GitHub executor's verification refused `run_id`:
-    request PENDING_REMOTE_EXECUTION -> NOT_EXECUTABLE, run SCHEDULED ->
-    FAILED (REMOTE_EXECUTION_REFUSED) -- the same transitions the
-    runtime's execution gate makes. Only ever narrows publication (fail
-    closed). Idempotent; a completed request is never touched."""
+    """Record that the GitHub executor's verification SCIENTIFICALLY refused
+    `run_id`: request PENDING_REMOTE_EXECUTION -> NOT_EXECUTABLE, run
+    SCHEDULED -> FAILED (REMOTE_EXECUTION_REFUSED, `failure_detail` =
+    "<refusal_code>: <detail>") -- the same transitions the runtime's
+    execution gate makes. Any `refusal_code` outside
+    `SCIENTIFIC_REFUSAL_CODES` is refused before anything is read or
+    written: NOT_EXECUTABLE is never a generic failure state. Idempotent; a
+    completed request is never touched."""
+    if refusal_code not in SCIENTIFIC_REFUSAL_CODES:
+        raise ResultIngestError(
+            f"refusal code {refusal_code!r} is not a scientific refusal "
+            f"({sorted(SCIENTIFIC_REFUSAL_CODES)}); the request stays pending"
+        )
     with WriterLock(lock_path, timeout_seconds=lock_timeout_seconds):
         requests = _read_requests(warehouse).filter(pl.col("run_id") == run_id)
         if requests.height != 1:
@@ -316,7 +329,7 @@ def refuse_request(
                 run_id,
                 status=PredictionRunStatus.FAILED,
                 failure_code=FAILURE_REMOTE_EXECUTION_REFUSED,
-                failure_detail=detail,
+                failure_detail=f"{refusal_code}: {detail}",
             )
         _upsert_request(warehouse, {**request, "state": STATE_NOT_EXECUTABLE})
     return "NOT_EXECUTABLE"
