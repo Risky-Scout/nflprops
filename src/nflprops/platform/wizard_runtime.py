@@ -373,6 +373,10 @@ def _build_loop(
     import os
 
     from nflprops.pipelines.lean import LeanIngestor
+    from nflprops.platform.checkpoint_retry import (
+        DEFAULT_SLOT_RETRY_BASE_SECONDS,
+        DEFAULT_SLOT_RETRY_MAX_SECONDS,
+    )
     from nflprops.platform.checkpoint_worker import DEFAULT_WORKER_TIMEOUT_SECONDS
     from nflprops.platform.runtime_layout import current_migration_head
     from nflprops.platform.runtime_loop import (
@@ -438,6 +442,24 @@ def _build_loop(
                 os.environ.get(
                     "NFLPROPS_CHECKPOINT_PREPARE_STARTUP_GRACE_SECONDS",
                     DEFAULT_CHECKPOINT_STARTUP_GRACE_SECONDS,
+                )
+            ),
+        ),
+        checkpoint_slot_retry_base_seconds=max(
+            1.0,
+            float(
+                os.environ.get(
+                    "NFLPROPS_CHECKPOINT_SLOT_RETRY_BASE_SECONDS",
+                    DEFAULT_SLOT_RETRY_BASE_SECONDS,
+                )
+            ),
+        ),
+        checkpoint_slot_retry_max_seconds=max(
+            1.0,
+            float(
+                os.environ.get(
+                    "NFLPROPS_CHECKPOINT_SLOT_RETRY_MAX_SECONDS",
+                    DEFAULT_SLOT_RETRY_MAX_SECONDS,
                 )
             ),
         ),

@@ -51,7 +51,11 @@ from nflprops.collection.resource_availability import (
 from nflprops.config import Config
 from nflprops.data.warehouse import Warehouse
 from nflprops.errors import NflpropsError
-from nflprops.orchestration.checkpoints import CheckpointAction, CheckpointName
+from nflprops.orchestration.checkpoints import (
+    OFFICIAL_CHECKPOINTS,
+    CheckpointAction,
+    CheckpointName,
+)
 from nflprops.orchestration.dispatch_plan import (
     DispatchSettings,
     PlannedCheckpoint,
@@ -169,6 +173,33 @@ class PreparePassResult:
     prepared: tuple[PreparedCheckpoint, ...]
     snapshot: SnapshotInfo | None
     blocked: tuple[str, ...] = ()
+
+
+#: One official checkpoint slot: (game_id, checkpoint_name, scheduled_as_of
+#: as a UTC ISO-8601 string). Stable across claim states -- an unclaimed due
+#: slot, its SCHEDULED run and its PREPARING request share it -- so an
+#: operationally failing slot can be deferred without touching its run.
+SlotKey = tuple[str, str, str]
+
+#: Bounded-pass order (unchanged): earliest cutoff first, deterministic ties.
+_PREPARING_ORDER = ["scheduled_as_of", "kickoff_at", "game_id", "run_id"]
+
+
+def slot_key(game_id: str, checkpoint_name: str, scheduled_as_of: datetime) -> SlotKey:
+    return (str(game_id), str(checkpoint_name), scheduled_as_of.astimezone(UTC).isoformat())
+
+
+def _excluding(frame: pl.DataFrame, exclude: frozenset[SlotKey]) -> pl.DataFrame:
+    """`frame` (request/run rows) without the rows of `exclude`d slots."""
+    if not exclude or frame.is_empty():
+        return frame
+    keep = [
+        slot_key(row["game_id"], row["checkpoint_name"], row["scheduled_as_of"]) not in exclude
+        for row in frame.select("game_id", "checkpoint_name", "scheduled_as_of").iter_rows(
+            named=True
+        )
+    ]
+    return frame.filter(pl.Series(keep, dtype=pl.Boolean))
 
 
 def _read_requests(warehouse: Warehouse) -> pl.DataFrame:
@@ -388,19 +419,30 @@ def _record_missing_requests(
     return added
 
 
-def _unprepared_claims(warehouse: Warehouse) -> int:
-    """Claimed checkpoints not yet prepared: PREPARING requests plus
-    SCHEDULED runs without a request row (a claim whose pass was killed
-    before step 2). A bounded pass finishes these before claiming more."""
+def _unprepared(warehouse: Warehouse, exclude: frozenset[SlotKey] = frozenset()) -> pl.DataFrame:
+    """Claimed checkpoints not yet prepared, minus `exclude`d slots:
+    PREPARING requests plus SCHEDULED runs without a request row (a claim
+    whose pass was killed before step 2 -- the same pass records its row
+    PREPARING before finishing it). Columns: run_id, game_id,
+    checkpoint_name, scheduled_as_of, kickoff_at."""
+    columns = ["run_id", "game_id", "checkpoint_name", "scheduled_as_of", "kickoff_at"]
     requests = _read_requests(warehouse)
-    count = requests.filter(pl.col("state") == STATE_PREPARING).height
+    frames = [requests.filter(pl.col("state") == STATE_PREPARING).select(columns)]
     if warehouse.exists(PREDICTION_RUNS_TABLE):
-        known = set(requests["request_id"].to_list())
+        known = requests["request_id"].to_list()
         scheduled = warehouse.read(PREDICTION_RUNS_TABLE).filter(
-            pl.col("status") == PredictionRunStatus.SCHEDULED.value
+            (pl.col("status") == PredictionRunStatus.SCHEDULED.value)
+            & ~pl.col("run_id").is_in(known)
         )
-        count += sum(run_id not in known for run_id in scheduled["run_id"].to_list())
-    return count
+        frames.append(scheduled.select(columns))
+    unprepared = pl.concat(frames, how="vertical_relaxed")
+    return _excluding(unprepared, exclude)
+
+
+def _unprepared_claims(warehouse: Warehouse, exclude: frozenset[SlotKey] = frozenset()) -> int:
+    """How many claimed checkpoints are not yet prepared (`_unprepared`).
+    A bounded pass finishes these before claiming more."""
+    return _unprepared(warehouse, exclude).height
 
 
 def _publish_request_bundle(
@@ -503,17 +545,19 @@ def _finish_preparing(
     lock_timeout_seconds: float,
     market_mode: str,
     limit: int | None = None,
+    exclude: frozenset[SlotKey] = frozenset(),
 ) -> tuple[SnapshotInfo | None, list[PreparedCheckpoint]]:
     """Steps 3-4 for every PREPARING request -- or, with `limit`, for the
     `limit` earliest (scheduled_as_of, kickoff_at, game_id, run_id) of them;
-    the rest stay PREPARING for a later pass. Runs outside the writer lock
-    (`create_snapshot` acquires it itself; the lock is re-taken for the
+    the rest stay PREPARING for a later pass. `exclude`d (operationally
+    deferred) slots are left PREPARING untouched. Runs outside the writer
+    lock (`create_snapshot` acquires it itself; the lock is re-taken for the
     request-row updates)."""
-    preparing = _read_requests(warehouse).filter(pl.col("state") == STATE_PREPARING)
+    preparing = _excluding(
+        _read_requests(warehouse).filter(pl.col("state") == STATE_PREPARING), exclude
+    )
     if limit is not None:
-        preparing = preparing.sort(["scheduled_as_of", "kickoff_at", "game_id", "run_id"]).head(
-            limit
-        )
+        preparing = preparing.sort(_PREPARING_ORDER).head(limit)
     if preparing.is_empty():
         return None, []
 
@@ -584,35 +628,84 @@ def preparation_work_pending(
     week: int,
     now: datetime,
     market_mode: str = "live",
+    exclude: frozenset[SlotKey] = frozenset(),
 ) -> bool:
     """Cheap, read-only: would `prepare_due_checkpoints` claim, record,
     gate or finish anything for (season, week) as of `now`? True when an
     official checkpoint slot is due/missed and unclaimed, a SCHEDULED run
     lacks its request row, a request is still PREPARING, or a PENDING
-    request fails the (unchanged) execution gate. Reads only `games`,
+    request fails the (unchanged) execution gate -- ignoring the slots in
+    `exclude` (operationally deferred). Reads only `games`,
     `prediction_runs`, the request table and `collector_resource_runs` --
     never the PIT data a manifest selects -- so the always-on runtime can
     decide whether to start a preparation worker without touching it."""
-    for _slot in due_checkpoint_slots(
+    for slot in due_checkpoint_slots(
         warehouse=warehouse, config=config, season=season, week=week, now=now
     ):
+        if slot_key(slot.game_id, slot.checkpoint.value, slot.scheduled_as_of) not in exclude:
+            return True
+    if not _unprepared(warehouse, exclude).is_empty():
         return True
     requests = _read_requests(warehouse)
-    if not requests.filter(pl.col("state") == STATE_PREPARING).is_empty():
-        return True
-    if warehouse.exists(PREDICTION_RUNS_TABLE):
-        scheduled = warehouse.read(PREDICTION_RUNS_TABLE).filter(
-            pl.col("status") == PredictionRunStatus.SCHEDULED.value
-        )
-        known = set(requests["request_id"].to_list())
-        if any(run_id not in known for run_id in scheduled["run_id"].to_list()):
-            return True
     return any(
         remote_execution_blocker(warehouse, request, market_mode=market_mode) is not None
         for request in requests.filter(
             pl.col("state") == STATE_PENDING_REMOTE_EXECUTION
         ).iter_rows(named=True)
     )
+
+
+def next_preparation_slot(
+    *,
+    warehouse: Warehouse,
+    config: Config,
+    season: int,
+    week: int,
+    now: datetime,
+    exclude: frozenset[SlotKey] = frozenset(),
+) -> SlotKey | None:
+    """Read-only: the slot a pass bounded to ONE checkpoint
+    (`prepare_due_checkpoints(max_checkpoints=1, exclude_slots=exclude)`)
+    works on -- the earliest unprepared claim, else the earliest due slot,
+    in exactly that pass's order -- or None (nothing but gate work). The
+    runtime records an operational failure of the pass against this slot."""
+    unprepared = _unprepared(warehouse, exclude)
+    if not unprepared.is_empty():
+        row = unprepared.sort(_PREPARING_ORDER).row(0, named=True)
+        return slot_key(row["game_id"], row["checkpoint_name"], row["scheduled_as_of"])
+    order = {name: index for index, name in enumerate(OFFICIAL_CHECKPOINTS)}
+    slots = [
+        slot
+        for slot in due_checkpoint_slots(
+            warehouse=warehouse, config=config, season=season, week=week, now=now
+        )
+        if slot_key(slot.game_id, slot.checkpoint.value, slot.scheduled_as_of) not in exclude
+    ]
+    if not slots:
+        return None
+    first = min(
+        slots, key=lambda s: (s.scheduled_as_of, s.kickoff_at, s.game_id, order[s.checkpoint])
+    )
+    return slot_key(first.game_id, first.checkpoint.value, first.scheduled_as_of)
+
+
+def preparation_slot_keys(
+    *, warehouse: Warehouse, config: Config, season: int, week: int, now: datetime
+) -> frozenset[SlotKey]:
+    """Read-only: every slot a preparation pass could still work on (due
+    and unclaimed, or claimed and unprepared). Anything else is finished
+    -- prepared, NOT_EXECUTABLE, missed -- and never worked on again."""
+    keys = {
+        slot_key(row["game_id"], row["checkpoint_name"], row["scheduled_as_of"])
+        for row in _unprepared(warehouse).iter_rows(named=True)
+    }
+    keys.update(
+        slot_key(slot.game_id, slot.checkpoint.value, slot.scheduled_as_of)
+        for slot in due_checkpoint_slots(
+            warehouse=warehouse, config=config, season=season, week=week, now=now
+        )
+    )
+    return frozenset(keys)
 
 
 def prepare_due_checkpoints(
@@ -630,6 +723,7 @@ def prepare_due_checkpoints(
     market_mode: str = "live",
     settings: DispatchSettings | None = None,
     max_checkpoints: int | None = None,
+    exclude_slots: frozenset[SlotKey] = frozenset(),
 ) -> PreparePassResult:
     """One scheduling/preparation pass for the official checkpoints of
     (season, week) as of `now`. Never executes science.
@@ -641,7 +735,14 @@ def prepare_due_checkpoints(
     with the budget left over. Each claim is committed before the snapshot
     step, so the work of one pass is never lost to a later kill, and N
     simultaneously due checkpoints complete in ceil(N / max_checkpoints)
-    passes instead of one all-or-nothing pass."""
+    passes instead of one all-or-nothing pass.
+
+    `exclude_slots` (the runtime's operationally deferred slots) are
+    neither claimed nor finished by this pass and do not count against its
+    budget; they stay exactly as they are -- scientifically pending, never
+    NOT_EXECUTABLE for that reason -- so later checkpoints can advance.
+    Recording missing request rows and the (scientific) execution gate
+    still cover every request."""
     if max_checkpoints is not None and max_checkpoints < 1:
         raise ValueError(f"max_checkpoints must be >= 1, got {max_checkpoints}")
     resolved = settings or DispatchSettings.resolve(config, market_mode=market_mode)
@@ -651,7 +752,7 @@ def prepare_due_checkpoints(
         claim_limit = (
             None
             if max_checkpoints is None
-            else max(0, max_checkpoints - _unprepared_claims(warehouse))
+            else max(0, max_checkpoints - _unprepared_claims(warehouse, exclude_slots))
         )
         planned: list[PlannedCheckpoint] = (
             []
@@ -664,6 +765,7 @@ def prepare_due_checkpoints(
                 now=now,
                 settings=resolved,
                 limit=claim_limit,
+                exclude=exclude_slots,
             )
         )
         for item in planned:
@@ -684,6 +786,7 @@ def prepare_due_checkpoints(
         lock_timeout_seconds=lock_timeout_seconds,
         market_mode=market_mode,
         limit=max_checkpoints,
+        exclude=exclude_slots,
     )
     return PreparePassResult(
         claimed=tuple(claimed),

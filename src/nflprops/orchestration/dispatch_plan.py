@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
 
 from nflprops.collection.service import source_sha256
@@ -194,6 +194,7 @@ def plan_due_checkpoints(
     now: datetime,
     settings: DispatchSettings,
     limit: int | None = None,
+    exclude: frozenset[tuple[str, str, str]] = frozenset(),
 ) -> list[PlannedCheckpoint]:
     """Every due (RUN) or missed (MISSED), unclaimed official checkpoint
     for (season, week) as of `now`, in game order then T48H..T30M order.
@@ -204,12 +205,23 @@ def plan_due_checkpoints(
     manifest (the expensive part) is computed for those alone. Slot
     enumeration reads only `games`/`prediction_runs`, so a bounded caller
     makes monotonic, deterministic progress through any number of
-    simultaneously due checkpoints."""
+    simultaneously due checkpoints.
+
+    `exclude` holds (game_id, checkpoint_name, scheduled_as_of UTC ISO)
+    slots the caller has operationally deferred: they are not planned (and
+    so not claimed) by this call, and take no budget."""
     if limit is not None and limit < 0:
         raise ValueError(f"limit must be >= 0, got {limit}")
     slots: list[DueCheckpointSlot] | Iterator[DueCheckpointSlot] = due_checkpoint_slots(
         warehouse=warehouse, config=config, season=season, week=week, now=now
     )
+    if exclude:
+        slots = [
+            s
+            for s in slots
+            if (s.game_id, s.checkpoint.value, s.scheduled_as_of.astimezone(UTC).isoformat())
+            not in exclude
+        ]
     if limit is not None:
         order = {name: index for index, name in enumerate(OFFICIAL_CHECKPOINTS)}
         slots = sorted(

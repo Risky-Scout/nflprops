@@ -45,6 +45,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from nflprops.data.page_cache import drop_cached_pages
 from nflprops.errors import NflpropsError
 from nflprops.platform.immutable_bundle import (
     BundleError,
@@ -156,6 +157,18 @@ def _reusable_files(snapshot_root: Path) -> dict[str, tuple[Path, int, str]]:
     return {f.relative_path: (latest / f.relative_path, f.byte_count, f.sha256) for f in manifest.files}
 
 
+def _settle(source: Path, dest: Path) -> None:
+    """After a copy: flush the copy to disk, then evict both files' pages
+    from the page cache. Dirty pages cannot be reclaimed until written back,
+    so an unflushed snapshot copy of the warehouse sits in the runtime's
+    memory budget (and stalls it in writeback under `MemoryHigh`)."""
+    with dest.open("rb") as handle:
+        os.fsync(handle.fileno())
+        drop_cached_pages(handle.fileno())
+    with source.open("rb") as handle:
+        drop_cached_pages(handle.fileno())
+
+
 def _link_or_copy(source: Path, dest: Path, prior: tuple[Path, int, str] | None) -> None:
     """Content-addressed dedup with re-verification.
 
@@ -191,6 +204,7 @@ def _link_or_copy(source: Path, dest: Path, prior: tuple[Path, int, str] | None)
                     source,
                 )
     shutil.copy2(source, dest)
+    _settle(source, dest)
     if _sha256_file(dest) != source_sha:
         raise WarehouseSnapshotError(
             f"snapshot copy of {source} does not match the source hash; refusing"

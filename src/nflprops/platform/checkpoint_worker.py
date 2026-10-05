@@ -63,6 +63,7 @@ from nflprops.platform.checkpoint_prepare import (
     CheckpointPrepareError,
     PreparedCheckpoint,
     PreparePassResult,
+    SlotKey,
     prepare_due_checkpoints,
 )
 from nflprops.platform.runtime_layout import RuntimeLayout
@@ -91,7 +92,15 @@ WORKER_ARGV: tuple[str, ...] = (sys.executable, "-m", "nflprops.platform.checkpo
 #: whole cgroup shares, and on Wizard's 1 vCPU they buy no parallelism.
 #: Thread count changes scheduling only -- every checkpoint-preparation
 #: output is explicitly sorted and hashed, so results are identical.
-WORKER_ENV_OVERRIDES: Mapping[str, str] = {"POLARS_MAX_THREADS": "1"}
+#: `_RJEM_MALLOC_CONF` makes Polars' (prefixed) jemalloc return freed pages
+#: to the OS immediately instead of holding them for reuse: the worker's
+#: decode buffers otherwise stay resident (~80 MiB on the production-shaped
+#: prop history) inside the shared `MemoryHigh` budget. Allocation policy
+#: only -- no result changes.
+WORKER_ENV_OVERRIDES: Mapping[str, str] = {
+    "POLARS_MAX_THREADS": "1",
+    "_RJEM_MALLOC_CONF": "dirty_decay_ms:0,muzzy_decay_ms:0",
+}
 #: How much of the child's stderr / traceback a failure report carries.
 _TAIL_CHARS = 4000
 #: At most this much of one pass's child stderr is passed through to ours.
@@ -126,6 +135,7 @@ def _job_payload(
     lock_timeout_seconds: float,
     market_mode: str,
     max_checkpoints: int | None = None,
+    exclude_slots: frozenset[SlotKey] = frozenset(),
 ) -> dict[str, Any]:
     return {
         "schema_version": JOB_SCHEMA_VERSION,
@@ -145,6 +155,7 @@ def _job_payload(
         "lock_timeout_seconds": lock_timeout_seconds,
         "market_mode": market_mode,
         "max_checkpoints": max_checkpoints,
+        "exclude_slots": sorted(list(key) for key in exclude_slots),
     }
 
 
@@ -221,6 +232,10 @@ def run_job(job_path: Path) -> PreparePassResult:
         market_mode=job["market_mode"],
         settings=DispatchSettings(**job["settings"]),
         max_checkpoints=job.get("max_checkpoints"),
+        exclude_slots=frozenset(
+            (str(game), str(name), str(cutoff))
+            for game, name, cutoff in job.get("exclude_slots", [])
+        ),
     )
 
 
@@ -290,6 +305,47 @@ def _kill_group(proc: subprocess.Popen[bytes]) -> None:
         proc.wait(timeout=_REAP_SECONDS)
 
 
+def supervise_child(
+    proc: subprocess.Popen[bytes],
+    *,
+    started: float,
+    timeout_seconds: float,
+    stop_event: threading.Event | None = None,
+    on_wait: Callable[[], None] | None = None,
+    on_wait_interval_seconds: float = DEFAULT_ON_WAIT_INTERVAL_SECONDS,
+) -> str | None:
+    """Wait for `proc` (started in its own session at monotonic `started`)
+    for at most `timeout_seconds` and never past a stop request, calling
+    `on_wait` every `on_wait_interval_seconds` meanwhile (the runtime keeps
+    its heartbeat fresh there). On timeout/stop the child's whole process
+    group is SIGKILLed and reaped (bounded), and the reason is returned;
+    None when the child exited by itself. `on_wait` failures are logged and
+    never interrupt the wait, the timeout or the kill. Shared by every
+    bounded runtime child (checkpoint preparation, outcome ingest)."""
+    reason: str | None = None
+    last_on_wait = started
+    while proc.poll() is None:
+        elapsed = time.monotonic() - started
+        if elapsed >= timeout_seconds:
+            reason = f"exceeded {timeout_seconds:.0f}s wall-clock bound"
+        elif stop_event is not None and stop_event.is_set():
+            reason = "runtime stop requested"
+        if reason is not None:
+            _kill_group(proc)
+            break
+        if on_wait is not None and time.monotonic() - last_on_wait >= on_wait_interval_seconds:
+            last_on_wait = time.monotonic()
+            try:
+                on_wait()
+            except Exception as exc:  # a heartbeat never decides the child's fate
+                logger.warning(
+                    "runtime child on_wait failed",
+                    extra={"fields": {"error": f"{type(exc).__name__}: {exc}"[:300]}},
+                )
+        time.sleep(_POLL_SECONDS)
+    return reason
+
+
 def _remove_staging_leftovers(layout: RuntimeLayout, *, lock_timeout_seconds: float) -> list[str]:
     """Unpublished staging directories a killed child left behind
     (`immutable_bundle.stage_bundle_dir`: hidden `.<id>.tmp-*` siblings of
@@ -321,6 +377,7 @@ def prepare_due_checkpoints_in_worker(
     lock_timeout_seconds: float = 60.0,
     market_mode: str = "live",
     max_checkpoints: int | None = None,
+    exclude_slots: frozenset[SlotKey] = frozenset(),
     timeout_seconds: float = DEFAULT_WORKER_TIMEOUT_SECONDS,
     stop_event: threading.Event | None = None,
     worker_argv: Sequence[str] = WORKER_ARGV,
@@ -363,6 +420,7 @@ def prepare_due_checkpoints_in_worker(
                 lock_timeout_seconds=lock_timeout_seconds,
                 market_mode=market_mode,
                 max_checkpoints=max_checkpoints,
+                exclude_slots=exclude_slots,
             ),
         )
         stderr_path = Path(tmp) / "worker.stderr"
@@ -381,27 +439,14 @@ def prepare_due_checkpoints_in_worker(
             raise CheckpointWorkerError(
                 f"could not start the checkpoint preparation worker: {exc}"
             ) from exc
-        reason: str | None = None
-        last_on_wait = started
-        while proc.poll() is None:
-            elapsed = time.monotonic() - started
-            if elapsed >= timeout_seconds:
-                reason = f"exceeded {timeout_seconds:.0f}s wall-clock bound"
-            elif stop_event is not None and stop_event.is_set():
-                reason = "runtime stop requested"
-            if reason is not None:
-                _kill_group(proc)
-                break
-            if on_wait is not None and time.monotonic() - last_on_wait >= on_wait_interval_seconds:
-                last_on_wait = time.monotonic()
-                try:
-                    on_wait()
-                except Exception as exc:  # a heartbeat never decides the pass
-                    logger.warning(
-                        "checkpoint worker on_wait failed",
-                        extra={"fields": {"error": f"{type(exc).__name__}: {exc}"[:300]}},
-                    )
-            time.sleep(_POLL_SECONDS)
+        reason = supervise_child(
+            proc,
+            started=started,
+            timeout_seconds=timeout_seconds,
+            stop_event=stop_event,
+            on_wait=on_wait,
+            on_wait_interval_seconds=on_wait_interval_seconds,
+        )
         elapsed = time.monotonic() - started
         # The child's stderr (its JSON logs, any traceback or Rust panic
         # message) is captured so a failure can be reported concretely, and
