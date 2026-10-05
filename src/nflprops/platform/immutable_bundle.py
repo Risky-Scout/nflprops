@@ -37,6 +37,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from nflprops.data.page_cache import drop_cached_pages
 from nflprops.errors import NflpropsError
 
 MANIFEST_FILENAME = "manifest.json"
@@ -149,6 +150,7 @@ def _sha256_file(path: Path) -> str:
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
+        drop_cached_pages(handle.fileno())
     return digest.hexdigest()
 
 

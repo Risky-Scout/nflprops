@@ -36,13 +36,14 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
 import polars as pl
 
 from nflprops.collection.models import RESOURCE_RUNS_TABLE
 from nflprops.data.injury_availability import injury_feed_available_at
 from nflprops.data.outcome_versions import as_known_at
-from nflprops.data.warehouse import Warehouse
+from nflprops.data.warehouse import Warehouse, read_table_scoped
 from nflprops.domain.hashing import hash_payload
 from nflprops.features.asof import filter_pit
 
@@ -80,8 +81,8 @@ class ManifestComponent:
 _HASH_CHUNK_ROWS = 2_048
 
 
-def _rows_sha256(ordered: pl.DataFrame) -> str:
-    """Exactly `hash_payload({"rows": ordered.to_dicts()})`, streamed.
+class _RowsDigest:
+    """`hash_payload({"rows": [...]})` over rows fed in order, in pieces.
 
     `hash_payload` hashes `json.dumps({"rows": [...]}, sort_keys=True,
     default=str, separators=(",", ":"))`; a list encodes as "[" + the
@@ -90,19 +91,33 @@ def _rows_sha256(ordered: pl.DataFrame) -> str:
     without ever holding every row as Python objects (plus one giant JSON
     string) at once -- that was the live runtime's multi-GiB peak for a
     game's full pre-cutoff prop/roster history."""
-    digest = hashlib.sha256(b'{"rows":[')
-    separator = b""
-    for chunk in ordered.iter_slices(_HASH_CHUNK_ROWS):
-        for row in chunk.to_dicts():
-            digest.update(separator)
-            digest.update(
-                json.dumps(row, sort_keys=True, default=str, separators=(",", ":")).encode(
-                    "utf-8"
+
+    def __init__(self) -> None:
+        self._digest = hashlib.sha256(b'{"rows":[')
+        self._separator = b""
+
+    def update(self, ordered: pl.DataFrame) -> None:
+        for chunk in ordered.iter_slices(_HASH_CHUNK_ROWS):
+            for row in chunk.to_dicts():
+                self._digest.update(self._separator)
+                self._digest.update(
+                    json.dumps(row, sort_keys=True, default=str, separators=(",", ":")).encode(
+                        "utf-8"
+                    )
                 )
-            )
-            separator = b","
-    digest.update(b"]}")
-    return digest.hexdigest()
+                self._separator = b","
+
+    def hexdigest(self) -> str:
+        digest = self._digest.copy()
+        digest.update(b"]}")
+        return digest.hexdigest()
+
+
+def _rows_sha256(ordered: pl.DataFrame) -> str:
+    """Exactly `hash_payload({"rows": ordered.to_dicts()})`, streamed."""
+    rows = _RowsDigest()
+    rows.update(ordered)
+    return rows.hexdigest()
 
 
 def _content_component(
@@ -184,6 +199,14 @@ def _select_target_game_row(
     return eligible.sort("available_at").tail(1)
 
 
+def _parquet_root(warehouse: object) -> Path | None:
+    """The Parquet directory behind a live `Warehouse` (whose files the
+    bounded reader scans directly); None for any other store, which keeps
+    the plain `read` path."""
+    root = getattr(warehouse, "root", None)
+    return root if isinstance(root, Path) and root.is_dir() else None
+
+
 def _read_scoped(warehouse: Warehouse, table: str, where: pl.Expr) -> pl.DataFrame:
     """Exactly `warehouse.read(table).filter(where)`, without materializing
     the rows `where` excludes -- the growing live snapshot tables must never
@@ -194,7 +217,11 @@ def _read_scoped(warehouse: Warehouse, table: str, where: pl.Expr) -> pl.DataFra
     alone, exactly as before), so the selected rows (and the manifest hash)
     are unchanged. Falls back to the plain read if the table lacks a filtered
     column, so the unchanged downstream checks behave exactly as before."""
+    root = _parquet_root(warehouse)
     try:
+        if root is not None:
+            # bounded memory, identical rows (see `read_table_scoped`)
+            return read_table_scoped(root, table, where=where)
         return warehouse.read(table, where=where)
     except (TypeError, pl.exceptions.ColumnNotFoundError):
         return warehouse.read(table)
@@ -209,6 +236,96 @@ def _relevant_player_ids(*frames: pl.DataFrame) -> set[str]:
             str(value) for value in frame["canonical_player_id"].drop_nulls().unique().to_list()
         )
     return player_ids
+
+
+_PLAYER_PROPS_TABLE = "player_prop_snapshots"
+_PLAYER_PROPS_SORT_KEYS = [
+    "canonical_game_id",
+    "canonical_player_id",
+    "prop_type",
+    "vendor",
+    "available_at",
+]
+#: Upper bound on one game's prop rows materialized at once by
+#: `_streamed_player_props_component` (a single player with more rows is
+#: still one batch).
+_PLAYER_PROPS_BATCH_ROWS = 50_000
+
+
+def _streamed_player_props_component(
+    warehouse: Warehouse, *, game_id: str, scheduled_as_of: datetime
+) -> ManifestComponent | None:
+    """The `player_props` component -- byte-identical to `_content_component`
+    over the game's whole pre-cutoff prop history -- without ever holding
+    that history (a Week-4 game's ~200k rows; the table is ~4.46M) at once.
+
+    The component's sort order is (game, player, prop_type, vendor,
+    available_at) and the game is fixed, so it is the concatenation, in
+    ascending player order, of each player's rows sorted the same way.
+    Players are hashed in ascending batches of at most
+    `_PLAYER_PROPS_BATCH_ROWS` rows into one running digest; row count and
+    min/max `available_at` combine exactly.
+
+    Returns None -- the caller then takes the original whole-frame path,
+    whose result this must equal -- whenever that equivalence is not
+    certain: not a Parquet `Warehouse`, a file without a filtered column, no
+    matching rows, a null player id, or a tie on the sort keys (whose
+    relative order only the original single sort defines)."""
+    root = _parquet_root(warehouse)
+    if root is None:
+        return None
+    where = (pl.col("canonical_game_id") == game_id) & (pl.col("available_at") <= scheduled_as_of)
+    try:
+        players = read_table_scoped(
+            root, _PLAYER_PROPS_TABLE, where=where, columns=["canonical_player_id"]
+        )
+        if players.is_empty() or players["canonical_player_id"].null_count():
+            return None
+        per_player = players.group_by("canonical_player_id").len().sort("canonical_player_id")
+        expected_rows = players.height
+        del players
+        batches: list[list[str]] = [[]]
+        batch_rows = 0
+        for player_id, count in per_player.iter_rows():
+            if batches[-1] and batch_rows + count > _PLAYER_PROPS_BATCH_ROWS:
+                batches.append([])
+                batch_rows = 0
+            batches[-1].append(player_id)
+            batch_rows += count
+        del per_player
+
+        rows = _RowsDigest()
+        row_count = 0
+        bounds: list[pl.DataFrame] = []
+        for batch in batches:
+            frame = read_table_scoped(
+                root,
+                _PLAYER_PROPS_TABLE,
+                where=where & pl.col("canonical_player_id").is_in(batch),
+            )
+            sort_keys = [key for key in _PLAYER_PROPS_SORT_KEYS if key in frame.columns]
+            if frame.select(sort_keys).is_duplicated().any():
+                return None
+            rows.update(frame.sort(sort_keys))
+            row_count += frame.height
+            bounds.append(
+                frame.select(
+                    pl.col("available_at").min().alias("low"),
+                    pl.col("available_at").max().alias("high"),
+                )
+            )
+            del frame
+    except (TypeError, pl.exceptions.ColumnNotFoundError, pl.exceptions.SchemaError):
+        return None
+    if row_count != expected_rows:
+        return None
+    combined = pl.concat(bounds)
+    return ManifestComponent(
+        row_count=row_count,
+        content_sha256=rows.hexdigest(),
+        min_available_at=_iso_or_none(combined["low"].min()),
+        max_available_at=_iso_or_none(combined["high"].max()),
+    )
 
 
 def build_checkpoint_manifest(
@@ -337,13 +454,21 @@ def build_checkpoint_manifest(
             return eligible.head(0)
         return eligible.filter(pl.col("canonical_game_id") == game_id)
 
+    player_props_component: ManifestComponent | None = None
     if market_mode == "live":
         # `_market_frames_for_mode`'s live branch, scoped to this game.
         game_odds = _read_scoped(
             warehouse, "game_odds_snapshots", (pl.col("canonical_game_id") == game_id) & pit
         )
-        prop_quotes = _read_scoped(
-            warehouse, "player_prop_snapshots", (pl.col("canonical_game_id") == game_id) & pit
+        player_props_component = _streamed_player_props_component(
+            warehouse, game_id=game_id, scheduled_as_of=scheduled_as_of
+        )
+        prop_quotes = (
+            _read_scoped(
+                warehouse, "player_prop_snapshots", (pl.col("canonical_game_id") == game_id) & pit
+            )
+            if player_props_component is None
+            else pl.DataFrame()
         )
     else:
         # Historical market modes only (never the live runtime): imported
@@ -355,13 +480,13 @@ def build_checkpoint_manifest(
         _scoped_by_game(game_odds), sort_keys=["canonical_game_id", "vendor", "available_at"]
     )
     del game_odds
-    prop_quotes_scoped = _scoped_by_game(prop_quotes)
+    if player_props_component is None:
+        prop_quotes_scoped = _scoped_by_game(prop_quotes)
+        player_props_component = _content_component(
+            prop_quotes_scoped, sort_keys=_PLAYER_PROPS_SORT_KEYS
+        )
+        del prop_quotes_scoped
     del prop_quotes
-    player_props_component = _content_component(
-        prop_quotes_scoped,
-        sort_keys=["canonical_game_id", "canonical_player_id", "prop_type", "vendor", "available_at"],
-    )
-    del prop_quotes_scoped
 
     players = (
         _read_scoped(warehouse, "players", pl.col("canonical_player_id").is_in(sorted(player_ids)))

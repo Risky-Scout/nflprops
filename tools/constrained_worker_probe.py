@@ -8,6 +8,15 @@ systemd limits (CI only -- `.github/workflows/constrained-worker.yml`).
                                the production thread count, run
                                `prepare_due_checkpoints_in_worker`, and report
                                exit, result, manifest hashes, peak tasks/memory
+    prepare-prod <dir>         build the PRODUCTION-SHAPED warehouse (4.46M
+                               player_prop_snapshots rows, legacy file + parts,
+                               11 simultaneously due T48H slots)
+    run-prod <dir> [passes]    the real runtime parent (`RuntimeLoop`) runs
+                               `passes` consecutive bounded preparation passes
+                               in real workers on it; reports parent RSS (idle /
+                               with worker), worker RSS/PSS peak and -- inside a
+                               cgroup -- memory.peak / memory.events, and gates
+                               them against MemoryHigh=384M with margin
 
 `default` disables the worker's POLARS_MAX_THREADS cap (diagnostic only).
 """
@@ -173,9 +182,159 @@ def run(out: Path, variant: str, label: str) -> int:
     return 0 if ok else 1
 
 
+#: The production-shaped gate: the whole service (runtime parent + worker)
+#: must peak at least this far below MemoryHigh=384M.
+MEMORY_HIGH_BYTES = 384 * 2**20
+REQUIRED_MARGIN_BYTES = 64 * 2**20
+PROD_PASSES = 3
+
+
+def prepare_prod(out: Path) -> None:
+    import prod_shaped_warehouse
+
+    print(json.dumps(prod_shaped_warehouse.build(out / "prod")))
+
+
+def _status_kib(pid: int, field: str) -> int:
+    for line in _read(Path(f"/proc/{pid}/status")).splitlines():
+        if line.startswith(field + ":"):
+            return int(line.split()[1])
+    return 0
+
+
+def _pss_kib(pid: int) -> int:
+    for line in _read(Path(f"/proc/{pid}/smaps_rollup")).splitlines():
+        if line.startswith("Pss:"):
+            return int(line.split()[1])
+    return 0
+
+
+def _descendants(root: int) -> set[int]:
+    parents: dict[int, int] = {}
+    for task in Path("/proc").glob("[0-9]*"):
+        ppid = _status_kib(int(task.name), "PPid")
+        parents[int(task.name)] = ppid
+    found: set[int] = set()
+    frontier = {root}
+    while frontier:
+        frontier = {pid for pid, ppid in parents.items() if ppid in frontier} - found
+        found |= frontier
+    return found
+
+
+def run_prod(out: Path, passes: int = PROD_PASSES) -> int:
+    from datetime import datetime, timedelta
+
+    import prod_shaped_warehouse as fx
+
+    from nflprops.platform.runtime_loop import RuntimeLoop, Target
+
+    mib = 1 / 1024
+    me = os.getpid()
+    cg = _cgroup_dir()
+    in_cgroup = _read(cg / "memory.high") not in ("n/a", "max")
+    info = json.loads((out / "prod" / "fixture.json").read_text())
+    env = fx.env_for(out / "prod")
+    now = datetime.fromisoformat(info["now"])
+
+    class _Clock:
+        def __init__(self) -> None:
+            self.now = now
+
+        def __call__(self) -> datetime:
+            return self.now
+
+    clock = _Clock()
+    from fake_provider import FakeProvider
+
+    # The provider that made the fixture's certified collection: the runtime
+    # checks collection is not due (collection first) before every worker.
+    loop = RuntimeLoop(layout=env["layout"], warehouse=env["warehouse"], config=env["config"],
+                       provider=FakeProvider(), migration_head=fx.HEAD, release_sha="a" * 40,
+                       clock=clock, season=fx.SEASON, checkpoint_startup_grace_seconds=0,
+                       checkpoint_cooldown_seconds=0)
+    games = env["warehouse"].read("games")
+    target = Target(season=fx.SEASON, week=fx.WEEK, nearest_kickoff=games["date"].min(),
+                    source="warehouse")
+    loop._write_status(now, target, state="running")
+    report: dict = {
+        "fixture": info,
+        "in_cgroup": in_cgroup,
+        "PARENT_RSS_IDLE_MIB": round(_status_kib(me, "VmRSS") * mib, 1),
+        "PARENT_ANON_IDLE_MIB": round(_status_kib(me, "RssAnon") * mib, 1),
+        "passes": [],
+    }
+    for number in range(1, passes + 1):
+        samples: list[tuple[float, ...]] = []
+        stop = threading.Event()
+
+        def sample(stop: threading.Event = stop, samples: list = samples) -> None:
+            while not stop.is_set():
+                kids = _descendants(me)
+                samples.append((
+                    _status_kib(me, "VmRSS") * mib,
+                    sum(_status_kib(pid, "VmRSS") for pid in kids) * mib,
+                    sum(_status_kib(pid, "RssAnon") for pid in kids) * mib,
+                    (_pss_kib(me) + sum(_pss_kib(pid) for pid in kids)) * mib,
+                ))
+                time.sleep(0.05)
+
+        sampler = threading.Thread(target=sample, daemon=True)
+        sampler.start()
+        started = time.monotonic()
+        loop._prepare_checkpoints(target, clock())
+        elapsed = time.monotonic() - started
+        stop.set()
+        sampler.join()
+        audit = loop._last.get("checkpoint_preparation", {})
+        report["passes"].append({
+            "pass": number,
+            "status": audit.get("status"),
+            "prepared": audit.get("prepared"),
+            "error": audit.get("error"),
+            "seconds": round(elapsed, 1),
+            "PARENT_RSS_WITH_WORKER_MIB": round(max(s[0] for s in samples), 1),
+            "WORKER_RSS_PEAK_MIB": round(max(s[1] for s in samples), 1),
+            "WORKER_ANON_PEAK_MIB": round(max(s[2] for s in samples), 1),
+            "SERVICE_PSS_PEAK_MIB": round(max(s[3] for s in samples), 1),
+        })
+        loop._checkpoint_cooldown_until = None
+        clock.now = clock.now + timedelta(seconds=1)
+    peak = _read(cg / "memory.peak")
+    events = _read(cg / "memory.events").replace("\n", " ")
+    report["CGROUP_MEMORY_PEAK_MIB"] = round(int(peak) / 2**20, 1) if peak.isdigit() else None
+    report["CGROUP_MEMORY_EVENTS"] = events
+    report["MEMORY_HIGH"] = _read(cg / "memory.high")
+    passes_ok = all(p["status"] == "OK" and p["prepared"] == 1 for p in report["passes"])
+    gate = {
+        "every_pass_prepared_one": passes_ok,
+        "every_pass_under_180s": all(p["seconds"] < MAX_WORKER_SECONDS for p in report["passes"]),
+        "parent_does_not_grow": max(p["PARENT_RSS_WITH_WORKER_MIB"] for p in report["passes"])
+        - report["PARENT_RSS_IDLE_MIB"] < 25,
+        "service_pss_below_high_with_margin": max(
+            p["SERVICE_PSS_PEAK_MIB"] for p in report["passes"]
+        ) * 2**20 < MEMORY_HIGH_BYTES - REQUIRED_MARGIN_BYTES,
+    }
+    if in_cgroup:
+        gate["cgroup_peak_below_high_with_margin"] = (
+            peak.isdigit() and int(peak) < MEMORY_HIGH_BYTES - REQUIRED_MARGIN_BYTES
+        )
+        gate["no_memory_high_max_oom_events"] = "high 0 max 0 oom 0 oom_kill 0" in events
+    report["gate"] = gate
+    report["gate_pass"] = all(gate.values())
+    print(json.dumps(report, indent=2))
+    (out / "report-prod.json").write_text(json.dumps(report, indent=2))
+    return 0 if report["gate_pass"] else 1
+
+
 if __name__ == "__main__":
     command, directory = sys.argv[1], Path(sys.argv[2])
     if command == "prepare":
         prepare(directory)
         raise SystemExit(0)
+    if command == "prepare-prod":
+        prepare_prod(directory)
+        raise SystemExit(0)
+    if command == "run-prod":
+        raise SystemExit(run_prod(directory, *(int(a) for a in sys.argv[3:4])))
     raise SystemExit(run(directory, sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else sys.argv[3]))

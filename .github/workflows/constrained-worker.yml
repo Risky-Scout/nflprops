@@ -12,6 +12,9 @@ on:
   pull_request:
     paths:
       - "src/nflprops/platform/**"
+      - "src/nflprops/data/**"
+      - "src/nflprops/orchestration/**"
+      - "tests/platform/prod_shaped_warehouse.py"
       - "tools/constrained_worker_probe.py"
       - "deploy/systemd/nflprops-runtime.service"
       - ".github/workflows/constrained-worker.yml"
@@ -65,3 +68,57 @@ jobs:
             done
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$capped_rc"
+
+  production-shaped-memory:
+    # 2026-10-04: on Wizard's ~4.46M-row prop history, checkpoint-preparation
+    # workers 2+ sat at MemoryHigh=384M and timed out. The REAL runtime
+    # parent + three consecutive real workers on a production-shaped
+    # warehouse, inside a transient service with nflprops-runtime.service's
+    # exact limits. Gate: every pass prepares one checkpoint in < 180 s,
+    # cgroup memory.peak >= 64 MiB below MemoryHigh, zero memory.high /
+    # max / oom events, parent RSS flat.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev,orchestration,runtime]"
+
+      - name: Build the production-shaped warehouse (outside the limits)
+        run: python tools/constrained_worker_probe.py prepare-prod "$RUNNER_TEMP/prod-probe"
+
+      - name: Three preparation passes under Wizard limits
+        run: |
+          set -u
+          python -c "import polars; print('polars', polars.__version__)"; uname -m
+          # Limits must match deploy/systemd/nflprops-runtime.service.
+          unit=deploy/systemd/nflprops-runtime.service
+          high="$(sed -n 's/^MemoryHigh=//p' "$unit")"
+          max="$(sed -n 's/^MemoryMax=//p' "$unit")"
+          swap="$(sed -n 's/^MemorySwapMax=//p' "$unit")"
+          tasks="$(sed -n 's/^TasksMax=//p' "$unit")"
+          cpu="$(sed -n 's/^CPUQuota=//p' "$unit")"
+          test "$high" = 384M
+          # Ephemeral runner only: evict the fixture's page cache (charged to
+          # the build step) so every byte the probe reads is charged to the
+          # probe unit, as on Wizard.
+          sync; echo 1 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+          set +e
+          sudo systemd-run --unit=nflprops-prod-memory-probe --wait --pipe --collect \
+            --uid="$(id -u)" --gid="$(id -g)" \
+            -p "TasksMax=$tasks" -p "MemoryHigh=$high" -p "MemoryMax=$max" \
+            -p "MemorySwapMax=$swap" -p "CPUQuota=$cpu" -p AllowedCPUs=0 -p Nice=10 \
+            -p ProtectSystem=strict -p "ReadWritePaths=$RUNNER_TEMP/prod-probe" \
+            -p PrivateTmp=true -p NoNewPrivileges=true \
+            -p "WorkingDirectory=$GITHUB_WORKSPACE" \
+            -E "HOME=$HOME" -E "PATH=$PATH" -E PYTHONDONTWRITEBYTECODE=1 \
+            "$(command -v python)" tools/constrained_worker_probe.py run-prod "$RUNNER_TEMP/prod-probe" 3
+          rc=$?
+          set -e
+          {
+            echo "### Production-shaped checkpoint-preparation memory"
+            echo '```json'; cat "$RUNNER_TEMP/prod-probe/report-prod.json" 2>/dev/null || echo "no report"; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"

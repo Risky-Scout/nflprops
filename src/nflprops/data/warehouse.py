@@ -17,6 +17,8 @@ from typing import Any
 import duckdb
 import polars as pl
 
+from nflprops.data.page_cache import drop_file_pages
+
 
 def _plain(value: Any) -> Any:
     if isinstance(value, Enum):
@@ -216,6 +218,47 @@ def read_table(root: Path, table: str, *, where: pl.Expr | None = None) -> pl.Da
     if where is not None:
         lazy = lazy.filter(where)
     return _sort_logical(table, lazy.collect())
+
+
+def _owning_strings(lazy: pl.LazyFrame) -> pl.LazyFrame:
+    """Re-materialize every String column so the rows a filter KEEPS own
+    their bytes. Polars string columns are views into the decoded page
+    buffers, so a filtered frame otherwise pins the whole decoded file (one
+    game's 2.6k prop rows held ~290 MiB of a 4.46M-row table alive).
+    Values (nulls included) and dtypes are unchanged."""
+    strings = [name for name, dtype in lazy.collect_schema().items() if dtype == pl.String]
+    if not strings:
+        return lazy
+    return lazy.with_columns(
+        pl.concat_str([pl.col(name), pl.lit("")]).alias(name) for name in strings
+    )
+
+
+def read_table_scoped(
+    root: Path, table: str, *, where: pl.Expr, columns: Sequence[str] | None = None
+) -> pl.DataFrame:
+    """Exactly `read_table(root, table, where=where)` (optionally projected
+    to `columns`), in bounded memory: each file is scanned on its own by the
+    streaming engine -- a row group at a time, never the whole decoded
+    file -- and only the matching rows are kept, owning their bytes. For the
+    checkpoint-preparation worker, whose `MemoryHigh` budget a whole-file
+    decode of the live prop history exceeds. Each file's page cache is
+    released once it has been scanned (`page_cache.drop_file_pages`).
+
+    Raises like `read_table` (e.g. `ColumnNotFoundError` when a file lacks a
+    filtered or projected column)."""
+    files = table_files(root, table)
+    if not files:
+        return pl.DataFrame()
+    frames = []
+    for path in files:
+        lazy = pl.scan_parquet(path, low_memory=True).filter(where)
+        if columns is not None:
+            lazy = lazy.select(list(columns))
+        frames.append(_owning_strings(lazy).collect(engine="streaming"))
+        drop_file_pages(path)
+    out = frames[0] if len(frames) == 1 else pl.concat(frames, how="diagonal_relaxed")
+    return _sort_logical(table, out)
 
 
 class Warehouse:

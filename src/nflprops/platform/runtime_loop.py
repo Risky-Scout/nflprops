@@ -67,9 +67,11 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
+import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -91,9 +93,18 @@ from nflprops.orchestration.dispatch_plan import as_run_store_backend
 from nflprops.orchestration.run_store import checkpoint_satisfied
 from nflprops.pipelines.games_asof import _latest_games_asof
 from nflprops.platform.checkpoint_prepare import (
+    SlotKey,
+    next_preparation_slot,
+    preparation_slot_keys,
     preparation_work_pending,
     prepare_due_checkpoints,
     protected_snapshot_ids,
+)
+from nflprops.platform.checkpoint_retry import (
+    DEFAULT_SLOT_RETRY_BASE_SECONDS,
+    DEFAULT_SLOT_RETRY_MAX_SECONDS,
+    RETRY_STATE_FILE,
+    SlotRetryBook,
 )
 from nflprops.platform.checkpoint_worker import (
     DEFAULT_WORKER_TIMEOUT_SECONDS,
@@ -101,6 +112,7 @@ from nflprops.platform.checkpoint_worker import (
     CheckpointWorkerError,
     CheckpointWorkerTimeoutError,
     prepare_due_checkpoints_in_worker,
+    supervise_child,
 )
 from nflprops.platform.runtime_layout import RuntimeLayout
 from nflprops.platform.storage_guard import (
@@ -410,6 +422,10 @@ class RuntimeLoop:
     checkpoint_cooldown_seconds: float = DEFAULT_CHECKPOINT_COOLDOWN_SECONDS
     checkpoint_startup_grace_seconds: float = DEFAULT_CHECKPOINT_STARTUP_GRACE_SECONDS
     checkpoint_heartbeat_seconds: float = DEFAULT_CHECKPOINT_HEARTBEAT_SECONDS
+    #: Per-slot deferral after an operational worker timeout/failure
+    #: (`platform.checkpoint_retry`): base * 2**(n-1), capped.
+    checkpoint_slot_retry_base_seconds: float = DEFAULT_SLOT_RETRY_BASE_SECONDS
+    checkpoint_slot_retry_max_seconds: float = DEFAULT_SLOT_RETRY_MAX_SECONDS
     housekeeping_interval_seconds: float = DEFAULT_HOUSEKEEPING_INTERVAL_SECONDS
     raw_compress_batch: int = DEFAULT_RAW_COMPRESS_BATCH
     #: Finite raw retention, always on: <= 30 days (an override may only
@@ -431,6 +447,7 @@ class RuntimeLoop:
     _checkpoint_consecutive_failures: int = 0
     _checkpoint_timeouts_total: int = 0
     _checkpoint_failures_total: int = 0
+    _slot_retries: SlotRetryBook | None = None
     _housekeeping_at: datetime | None = None
     _disk_level: str = LEVEL_OK
     _started_at: datetime | None = None
@@ -496,6 +513,22 @@ class RuntimeLoop:
         )
         return result
 
+    def _collection_is_due(self, target: Target, now: datetime) -> bool:
+        return collection_due(
+            warehouse=self.warehouse,
+            provider_name=getattr(self.provider, "name", "unknown"),
+            season=target.season,
+            week=target.week,
+            now=now,
+            config=self.config,
+        )
+
+    def _collect_if_due(self, target: Target | None, now: datetime) -> bool:
+        if target is None or not self._collection_is_due(target, now):
+            return False
+        self.collect(target, now, trigger=TRIGGER_SCHEDULED)
+        return True
+
     def _checkpoint_counters(self) -> dict[str, Any]:
         return {
             "consecutive_failures": self._checkpoint_consecutive_failures,
@@ -508,9 +541,15 @@ class RuntimeLoop:
             "startup_grace_seconds": self.checkpoint_startup_grace_seconds,
         }
 
-    def _prepare_checkpoints(self, target: Target, now: datetime) -> None:
+    def _retry_book(self) -> SlotRetryBook:
+        if self._slot_retries is None:
+            self._slot_retries = SlotRetryBook.load(self.layout.state / RETRY_STATE_FILE)
+        return self._slot_retries
+
+    def _prepare_checkpoints(self, target: Target, now: datetime) -> bool:
         """One BOUNDED preparation pass (`checkpoint_batch_limit`
         checkpoints, earliest first); later ticks continue the queue.
+        Returns True when a worker ran (successfully or not).
 
         A worker failure or timeout is a checkpoint-subsystem failure, never
         a failed tick: the child's process group is already killed and
@@ -521,11 +560,22 @@ class RuntimeLoop:
         was OBSERVED -- while collection, status, snapshots and housekeeping
         carry on.
 
+        The failure is also charged to the SLOT the pass was working on
+        (`next_preparation_slot`, computed read-only before the worker
+        starts): that slot is deferred (`platform.checkpoint_retry`:
+        retry_count / last_timeout_at / next_retry_at / last_failure_reason,
+        exponential backoff, capped) and excluded from later passes until
+        `next_retry_at`, so the next eligible checkpoint advances instead of
+        the same slot heading the queue forever. The deferred checkpoint is
+        untouched -- scientifically pending, never NOT_EXECUTABLE for an
+        operational failure -- and is eligible again when its deferral ends. A success clears the slot's entry.
+
         A completed pass starts a cooldown (`checkpoint_cooldown_seconds`,
         from completion) before the next worker may start; the queue order
         (unfinished PREPARING first, then earliest cutoff) is unchanged.
         No worker starts during the startup grace after the loop started
-        (recorded as STARTUP_GRACE -- never FAILED/DEGRADED)."""
+        (recorded as STARTUP_GRACE -- never FAILED/DEGRADED), nor while a
+        collection cycle is due: collection always runs first."""
         if self._started_at is not None:
             grace_until = self._started_at + timedelta(
                 seconds=self.checkpoint_startup_grace_seconds
@@ -539,19 +589,49 @@ class RuntimeLoop:
                     "remaining_seconds": round((grace_until - now).total_seconds(), 1),
                     **self._checkpoint_counters(),
                 }
-                return
+                return False
         if self._checkpoint_retry_at is not None and now < self._checkpoint_retry_at:
-            return
+            return False
         if self._checkpoint_cooldown_until is not None and now < self._checkpoint_cooldown_until:
-            return
-        if not preparation_work_pending(
+            return False
+        book = self._retry_book()
+        deferred = book.deferred(now)
+        # Two deterministic tiers: slots with no operational failure first;
+        # slots eligible again after one only when none of those is left.
+        exclude = deferred
+        for candidate in (book.retried(), deferred):
+            if preparation_work_pending(
+                warehouse=self.warehouse,
+                config=self.config,
+                season=target.season,
+                week=target.week,
+                now=now,
+                exclude=candidate,
+            ):
+                exclude = candidate
+                break
+        else:
+            if deferred:
+                retry_at = book.next_retry_at(now)
+                self._last["checkpoint_preparation"] = {
+                    **self._last.get("checkpoint_preparation", {}),
+                    "state": "DEFERRED",
+                    "deferred_at": now.isoformat(),
+                    "deferred_slots": book.summary(now),
+                    "next_slot_retry_at": retry_at.isoformat() if retry_at else None,
+                }
+            return False
+        if self.checkpoint_worker and self._collection_is_due(target, now):
+            # Collection first: the next tick collects, then prepares.
+            return False
+        slot: SlotKey | None = next_preparation_slot(
             warehouse=self.warehouse,
             config=self.config,
             season=target.season,
             week=target.week,
             now=now,
-        ):
-            return
+            exclude=exclude,
+        )
         inputs: dict[str, Any] = {
             "layout": self.layout,
             "warehouse": self.warehouse,
@@ -564,6 +644,7 @@ class RuntimeLoop:
             "release_sha": self.release_sha,
             "lock_timeout_seconds": self.lock_timeout_seconds,
             "max_checkpoints": self.checkpoint_batch_limit,
+            "exclude_slots": exclude,
         }
         try:
             if self.checkpoint_worker:
@@ -595,6 +676,17 @@ class RuntimeLoop:
             self._checkpoint_retry_at = observed + timedelta(
                 seconds=self.checkpoint_retry_seconds
             )
+            slot_retry = None
+            if slot is not None and not self.stop_event.is_set():
+                slot_retry = book.record_failure(
+                    slot,
+                    at=observed,
+                    timed_out=timed_out,
+                    reason=str(exc),
+                    base_seconds=self.checkpoint_slot_retry_base_seconds,
+                    max_seconds=self.checkpoint_slot_retry_max_seconds,
+                )
+                book.save()
             counters = self._checkpoint_counters()
             self._last["checkpoint_preparation"] = {
                 "status": "TIMEOUT" if timed_out else "FAILED",
@@ -604,6 +696,9 @@ class RuntimeLoop:
                 "week": target.week,
                 "error": str(exc)[:500],
                 "retry_not_before": self._checkpoint_retry_at.isoformat(),
+                "slot": list(slot) if slot else None,
+                "slot_retry": asdict(slot_retry) if slot_retry else None,
+                "deferred_slots": book.summary(observed),
                 **counters,
             }
             _log(
@@ -613,17 +708,42 @@ class RuntimeLoop:
                 week=target.week,
                 error=str(exc)[:500],
                 retry_not_before=self._checkpoint_retry_at,
+                slot=list(slot) if slot else None,
                 **counters,
             )
+            if slot_retry is not None:
+                _log(
+                    "checkpoint_slot_deferred",
+                    logging.WARNING,
+                    game_id=slot_retry.game_id,
+                    checkpoint_name=slot_retry.checkpoint_name,
+                    scheduled_as_of=slot_retry.scheduled_as_of,
+                    retry_count=slot_retry.retry_count,
+                    next_retry_at=slot_retry.next_retry_at,
+                    last_failure_kind=slot_retry.last_failure_kind,
+                )
             if counters["degraded"]:
                 _log("checkpoint_preparation_degraded", logging.CRITICAL, **counters)
-            return
+            return True
         completed = self.clock()
         self._checkpoint_retry_at = None
         self._checkpoint_consecutive_failures = 0
         self._checkpoint_cooldown_until = completed + timedelta(
             seconds=self.checkpoint_cooldown_seconds
         )
+        if book.entries:
+            cleared = slot is not None and book.clear(slot)
+            pruned = book.prune(
+                preparation_slot_keys(
+                    warehouse=self.warehouse,
+                    config=self.config,
+                    season=target.season,
+                    week=target.week,
+                    now=completed,
+                )
+            )
+            if cleared or pruned:
+                book.save()
         self._last["checkpoint_preparation"] = {
             "status": "OK",
             "at": completed.isoformat(),
@@ -631,10 +751,12 @@ class RuntimeLoop:
             "pass_started_at": now.isoformat(),
             "season": target.season,
             "week": target.week,
+            "slot": list(slot) if slot else None,
             "claimed": len(result.claimed),
             "missed": len(result.missed),
             "prepared": len(result.prepared),
             "blocked": len(result.blocked),
+            "deferred_slots": book.summary(completed),
             **self._checkpoint_counters(),
         }
         if result.claimed or result.missed or result.prepared or result.blocked:
@@ -648,6 +770,7 @@ class RuntimeLoop:
                 batch_limit=self.checkpoint_batch_limit,
             )
             self._prune()
+        return self.checkpoint_worker
 
     def _housekeeping(self, now: datetime) -> None:
         """Bounded storage, every `housekeeping_interval_seconds`, under the
@@ -754,24 +877,10 @@ class RuntimeLoop:
             "--recent-days", str(OUTCOME_INGEST_RECENT_DAYS),
         ]
         record: dict[str, Any] = {"at": now.isoformat(), "season": target.season}
-        try:
-            completed = subprocess.run(
-                argv,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                timeout=self.outcome_ingest_timeout_seconds,
-                env={**os.environ, **OUTCOME_INGEST_ENV_OVERRIDES},
-                check=False,
-            )
-            record["exit_code"] = completed.returncode
-            record["ok"] = completed.returncode == 0
-            tail = (completed.stdout if record["ok"] else completed.stderr)[-2000:]
-            record["detail"] = tail.decode("utf-8", errors="replace").strip()
-        except subprocess.TimeoutExpired:
-            record.update(ok=False, exit_code=None,
-                          detail=f"exceeded {self.outcome_ingest_timeout_seconds:.0f}s")
-        except OSError as exc:
-            record.update(ok=False, exit_code=None, detail=f"could not start: {exc}")
+        # Fresh heartbeat before a child that may block this thread for up to
+        # `outcome_ingest_timeout_seconds`; it is refreshed while it runs.
+        self._write_status(now, target, state="running")
+        record.update(self._run_outcome_ingest_child(argv, started_at=now))
         wait = (
             self.outcome_ingest_interval_seconds
             if record["ok"]
@@ -784,6 +893,58 @@ class RuntimeLoop:
             logging.INFO if record["ok"] else logging.WARNING,
             **{k: v for k, v in record.items() if k != "detail"},
         )
+
+    def _run_outcome_ingest_child(self, argv: list[str], *, started_at: datetime) -> dict[str, Any]:
+        """The ingest child, supervised exactly like the checkpoint worker
+        (`checkpoint_worker.supervise_child`): its own session, bounded by
+        `outcome_ingest_timeout_seconds` and any stop request, its whole
+        process group SIGKILLed and reaped on either -- its writer lock (an
+        flock on its own descriptor) dies with it, so this process never
+        mutates the warehouse concurrently and never waits on a hung
+        writer. Meanwhile only this process's status-file heartbeat is
+        refreshed (no warehouse read). Output goes to files, never pipes,
+        so a chatty child can never block on a full pipe."""
+        with tempfile.TemporaryDirectory(prefix="nflprops-outcome-ingest-") as tmp:
+            stdout_path, stderr_path = Path(tmp) / "stdout", Path(tmp) / "stderr"
+            started = time.monotonic()
+            try:
+                with stdout_path.open("wb") as out, stderr_path.open("wb") as err:
+                    proc = subprocess.Popen(
+                        argv,
+                        stdin=subprocess.DEVNULL,
+                        stdout=out,
+                        stderr=err,
+                        env={**os.environ, **OUTCOME_INGEST_ENV_OVERRIDES},
+                        close_fds=True,
+                        start_new_session=True,
+                    )
+            except OSError as exc:
+                return {"ok": False, "exit_code": None, "detail": f"could not start: {exc}"}
+            reason = supervise_child(
+                proc,
+                started=started,
+                timeout_seconds=self.outcome_ingest_timeout_seconds,
+                stop_event=self.stop_event,
+                on_wait=lambda: self._refresh_heartbeat(
+                    worker_started_at=started_at, kind="outcome_ingest_worker"
+                ),
+                on_wait_interval_seconds=self.checkpoint_heartbeat_seconds,
+            )
+            if reason is not None:
+                return {
+                    "ok": False,
+                    "exit_code": None,
+                    "pid": proc.pid,
+                    "detail": f"killed after {time.monotonic() - started:.0f}s: {reason}",
+                }
+            ok = proc.returncode == 0
+            tail = (stdout_path if ok else stderr_path).read_bytes()[-2000:]
+            return {
+                "ok": ok,
+                "exit_code": proc.returncode,
+                "pid": proc.pid,
+                "detail": tail.decode("utf-8", errors="replace").strip(),
+            }
 
     # -- schedule introspection (read-only) ----------------------------
 
@@ -856,11 +1017,14 @@ class RuntimeLoop:
         _write_json_atomically(self.layout.runtime_status, payload)
         self._status_payload = payload
 
-    def _refresh_heartbeat(self, *, worker_started_at: datetime) -> None:
-        """Called while a checkpoint-preparation worker runs: rewrite the
-        last full status with a fresh heartbeat. Reads nothing from the
-        warehouse (the worker may be writing it) -- only this process's
-        own status file is written, from this same thread."""
+    def _refresh_heartbeat(
+        self, *, worker_started_at: datetime, kind: str = "checkpoint_worker"
+    ) -> None:
+        """Called while a bounded child (checkpoint preparation, outcome
+        ingest) runs: rewrite the last full status with a fresh heartbeat.
+        Reads nothing from the warehouse (the child may be writing it) --
+        only this process's own status file is written, from this same
+        thread."""
         if self._status_payload is None:
             return
         now = self.clock()
@@ -869,7 +1033,7 @@ class RuntimeLoop:
             {
                 **self._status_payload,
                 "heartbeat_at": now,
-                "checkpoint_worker": {
+                kind: {
                     "running": True,
                     "started_at": worker_started_at,
                     "elapsed_seconds": round((now - worker_started_at).total_seconds(), 1),
@@ -886,17 +1050,7 @@ class RuntimeLoop:
         self._ensure_reference_data()
         assert self.resolver is not None
         target = self.resolver.resolve(self.warehouse, now)
-        if target is not None:
-            provider_name = getattr(self.provider, "name", "unknown")
-            if collection_due(
-                warehouse=self.warehouse,
-                provider_name=provider_name,
-                season=target.season,
-                week=target.week,
-                now=now,
-                config=self.config,
-            ):
-                self.collect(target, now, trigger=TRIGGER_SCHEDULED)
+        self._collect_if_due(target, now)
         self._housekeeping(self.clock())
         if self._disk_level == LEVEL_FAIL_CLOSED:
             # Fail closed: no new snapshot copy and no checkpoint claim on a
@@ -905,8 +1059,12 @@ class RuntimeLoop:
             # caught up or recorded missed by the certified planner later.
             _log("storage_fail_closed", logging.ERROR, free_gib=self._last.get("storage", {}).get("free_gib"))
         else:
-            if target is not None:
-                self._prepare_checkpoints(target, self.clock())
+            if target is not None and self._prepare_checkpoints(target, self.clock()):
+                # A worker just held this thread for up to
+                # `checkpoint_timeout_seconds`: a collection that came due
+                # meanwhile runs now, before anything else (and before any
+                # later worker -- see `_prepare_checkpoints`).
+                self._collect_if_due(target, self.clock())
             self._periodic_snapshot(self.clock())
             self._ingest_outcomes(target, self.clock())
         self._write_status(self.clock(), target, state="running")

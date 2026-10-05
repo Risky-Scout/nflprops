@@ -198,6 +198,22 @@ def warehouses(tmp_path_factory: pytest.TempPathFactory) -> tuple[Warehouse, War
     return legacy, parted
 
 
+def _spy_scoped_reads(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """Full rows each table materialized for the manifest (summed over the
+    batched props reads; projected key-only reads are not row loads)."""
+    loaded: dict[str, int] = {}
+    original = manifest_module.read_table_scoped
+
+    def spy(root: Path, table: str, *, where: pl.Expr, columns: list[str] | None = None) -> pl.DataFrame:
+        frame = original(root, table, where=where, columns=columns)
+        if columns is None:
+            loaded[table] = loaded.get(table, 0) + frame.height
+        return frame
+
+    monkeypatch.setattr(manifest_module, "read_table_scoped", spy)
+    return loaded
+
+
 CUTOFFS = [T0 - timedelta(hours=1), _ts(0), _ts(2) + timedelta(minutes=30), _ts(CYCLES + 1)]
 
 
@@ -223,6 +239,9 @@ def test_scoped_reads_leave_the_manifest_hash_unchanged(
             manifest_module, "_read_scoped", lambda wh, table, where: wh.read(table)
         )
         unscoped.setattr(
+            manifest_module, "_streamed_player_props_component", lambda wh, **kw: None
+        )
+        unscoped.setattr(
             manifest_module,
             "_rows_sha256",
             lambda frame: hash_payload({"rows": frame.to_dicts()}),
@@ -236,15 +255,8 @@ def test_scoped_manifest_never_loads_other_games_or_future_rows(
 ) -> None:
     _, parted = warehouses
     cutoff = _ts(2) + timedelta(minutes=30)
-    loaded: dict[str, int] = {}
+    loaded = _spy_scoped_reads(monkeypatch)
     original = Warehouse.read
-
-    def spy(self: Warehouse, table: str, *, where: pl.Expr | None = None) -> pl.DataFrame:
-        frame = original(self, table, where=where)
-        loaded[table] = frame.height
-        return frame
-
-    monkeypatch.setattr(Warehouse, "read", spy)
     compute_data_manifest_sha256(parted, game_id="g1", scheduled_as_of=cutoff)
     full_props = original(parted, "player_prop_snapshots").height
     # g1's props at cycles 0..2 only: 3 players x 2 vendors x 3 cycles.
@@ -257,15 +269,8 @@ def test_stats_and_reference_players_are_read_scoped(
 ) -> None:
     _, parted = warehouses
     cutoff = _ts(2) + timedelta(minutes=30)
-    loaded: dict[str, int] = {}
+    loaded = _spy_scoped_reads(monkeypatch)
     original = Warehouse.read
-
-    def spy(self: Warehouse, table: str, *, where: pl.Expr | None = None) -> pl.DataFrame:
-        frame = original(self, table, where=where)
-        loaded[table] = frame.height
-        return frame
-
-    monkeypatch.setattr(Warehouse, "read", spy)
     compute_data_manifest_sha256(parted, game_id="g1", scheduled_as_of=cutoff)
     # g1 = t2 vs t3; only the pre-history stats row is at/before the cutoff.
     assert loaded["player_game_stats"] == 2 * 2 < original(parted, "player_game_stats").height
