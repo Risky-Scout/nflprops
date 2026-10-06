@@ -264,23 +264,27 @@ def test_ingest_resumes_after_a_crash_and_refuses_a_different_bundle(
     assert live.read(RESULTS_TABLE)["bundle_manifest_sha256"].to_list() == [manifest_sha]
 
 
-def test_executor_refuses_config_drift(wizard: dict, tmp_path: Path) -> None:
-    drifted = load(cli_overrides={"run.log_level": "DEBUG"})
-    with pytest.raises(RemoteExecutionError, match="config SHA"):
+def test_executor_refuses_scientific_config_drift_operationally(
+    wizard: dict, tmp_path: Path
+) -> None:
+    drifted = load(cli_overrides={"simulation.baseline.pace_shock_sd": 0.05})
+    with pytest.raises(RemoteExecutionError, match="scientific config SHA") as info:
         _github_execute(wizard, tmp_path, config=drifted)
+    assert info.value.refusal_class == "OPERATIONAL"
+    assert info.value.refusal_code == "CONFIG_IDENTITY_MISMATCH"
 
 
-def test_execute_cli_exits_3_on_a_deterministic_verification_refusal(
+def test_execute_cli_exits_4_on_an_operational_config_refusal(
     wizard: dict, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """checkpoint-execute.yml records exit 3 as NOT_EXECUTABLE (never
-    retried); every other failure stays retryable."""
+    """checkpoint-execute.yml records exit 3 (SCIENTIFIC) as NOT_EXECUTABLE;
+    a config mismatch is OPERATIONAL: exit 4, the request stays pending."""
     from typer.testing import CliRunner
 
     import nflprops.config as config_module
     from nflprops.platform.wizard_runtime import app
 
-    drifted = load(cli_overrides={"run.log_level": "DEBUG"})
+    drifted = load(cli_overrides={"simulation.baseline.pace_shock_sd": 0.05})
     monkeypatch.setattr(config_module, "load", lambda *a, **k: drifted)
     monkeypatch.setenv("GITHUB_ACTIONS", "true")
     monkeypatch.delenv("NFLPROPS_RUNTIME_ROOT", raising=False)
@@ -296,9 +300,13 @@ def test_execute_cli_exits_3_on_a_deterministic_verification_refusal(
         "--out-dir", str(tmp_path / "out"),
         "--science-sha", "b" * 40,
         "--workflow-run", "test",
+        "--refusal-file", str(tmp_path / "refusal.json"),
     ])
-    assert result.exit_code == 3, result.output
+    assert result.exit_code == 4, result.output
     assert not (tmp_path / "out" / "result.json").exists()
+    refusal = json.loads((tmp_path / "refusal.json").read_text())
+    assert refusal["refusal_class"] == "OPERATIONAL"
+    assert refusal["refusal_code"] == "CONFIG_IDENTITY_MISMATCH"
 
 
 def test_execute_cli_verify_only_never_simulates(
@@ -334,13 +342,20 @@ def test_refusal_marks_not_executable_idempotently_and_never_touches_completed(
     run_id = wizard["prepared"].run_id
     live = wizard["warehouse"]
     lock = wizard["layout"].writer_lock
-    assert refuse_request(live, run_id, detail="github run x", lock_path=lock) == "NOT_EXECUTABLE"
+    assert refuse_request(
+        live, run_id, refusal_code="INSUFFICIENT_PRE_CUTOFF_PIT_DATA", detail="github run x",
+        lock_path=lock,
+    ) == "NOT_EXECUTABLE"
     request = live.read(REMOTE_REQUESTS_TABLE).filter(pl.col("run_id") == run_id)
     assert request["state"].to_list() == ["NOT_EXECUTABLE"]
     run = get_run(live, run_id)
     assert run.status.value == "FAILED"
     assert run.failure_code == FAILURE_REMOTE_EXECUTION_REFUSED
-    assert refuse_request(live, run_id, detail="again", lock_path=lock) == "ALREADY_NOT_EXECUTABLE"
+    assert run.failure_detail == "INSUFFICIENT_PRE_CUTOFF_PIT_DATA: github run x"
+    assert refuse_request(
+        live, run_id, refusal_code="INSUFFICIENT_PRE_CUTOFF_PIT_DATA", detail="again",
+        lock_path=lock,
+    ) == "ALREADY_NOT_EXECUTABLE"
     # A refused request can never be completed by a late result bundle
     # (the snapshot predates the refusal, so the GitHub side still verifies;
     # the Wizard ingest is what refuses).
@@ -360,7 +375,10 @@ def test_refusal_never_touches_a_completed_request(wizard: dict, tmp_path: Path)
     ingest_result_bundle(live, final, expected_manifest_sha256=sha, lock_path=lock,
                          now=datetime.now(UTC))
     with pytest.raises(ResultIngestError, match="COMPLETED"):
-        refuse_request(live, run_id, detail="late", lock_path=lock)
+        refuse_request(
+            live, run_id, refusal_code="INSUFFICIENT_PRE_CUTOFF_PIT_DATA", detail="late",
+            lock_path=lock,
+        )
     assert get_run(live, run_id).status.value == executed["result"]["run"]["status"]
 
 

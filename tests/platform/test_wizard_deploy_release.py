@@ -540,6 +540,8 @@ def test_ops_workflow_is_main_only_fixed_menu() -> None:
         "outcome-ingest-hold", "outcome-ingest-release", "outcome-report",
         # read-only runtime diagnostics (restart-loop investigation)
         "runtime-diagnostics",
+        # PR #19: audited remediation of ONE pinned false NOT_EXECUTABLE refusal
+        "checkpoint-repair-false-refusal",
     ]
     assert "refs/heads/main" in WIZARD_OPS.read_text()
     assert doc["jobs"]["ops"]["environment"] == "wizardofodds.com"

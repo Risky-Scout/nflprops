@@ -21,6 +21,9 @@ name: Wizard Runtime Ops
 #   outcome-ingest-hold / -release      BLOCK 4: pause / resume the runtime's
 #                                       recurring outcome ingest (hold file)
 #   outcome-report                      BLOCK 4: read-only outcome-table check
+#   checkpoint-repair-false-refusal     BLOCK 4: audited remediation of ONE
+#                                       pinned false NOT_EXECUTABLE refusal
+#                                       (refusal_repair; refuses anything else)
 #   runtime-diagnostics                 read-only nflprops-runtime journal tail,
 #                                       cgroup memory/tasks, NRestarts,
 #                                       checkpoint-preparation counters
@@ -50,6 +53,7 @@ on:
           - outcome-ingest-release
           - outcome-report
           - runtime-diagnostics
+          - checkpoint-repair-false-refusal
       game_id:
         description: "manual-checkpoint: canonical game id (UUID)"
         required: false
@@ -82,6 +86,10 @@ on:
         description: "ingest-stats: optional comma-separated weeks, e.g. 1,2,3,4 (season is required)"
         required: false
         type: string
+      repair_target:
+        description: "checkpoint-repair-false-refusal: <run_id>:<incident_id> of the pinned incident"
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -110,6 +118,7 @@ jobs:
           BUNDLE_ID: ${{ inputs.bundle_id }}
           MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
           WEEKS: ${{ inputs.weeks }}
+          REPAIR_TARGET: ${{ inputs.repair_target }}
         run: |
           if [ "${{ github.ref }}" != "refs/heads/main" ]; then
             echo "::error::Wizard ops may only run from main (got ${{ github.ref }})"; exit 1
@@ -130,6 +139,9 @@ jobs:
               ;;
             outcome-report)
               [[ -z "$AS_OF" || "$AS_OF" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\+00:00|Z)$ ]] || { echo "::error::as_of must be ISO-8601 UTC"; exit 1; }
+              ;;
+            checkpoint-repair-false-refusal)
+              [[ "$REPAIR_TARGET" =~ ^[0-9a-f]{64}:INC-[A-Za-z0-9-]{1,80}$ ]] || { echo "::error::repair_target must be <run_id>:<incident_id>"; exit 1; }
               ;;
             ingest-stats)
               [[ "$SEASON" =~ ^20[0-9]{2}$ ]] || { echo "::error::season must be a year"; exit 1; }
@@ -162,6 +174,7 @@ jobs:
           BUNDLE_ID: ${{ inputs.bundle_id }}
           MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
           WEEKS: ${{ inputs.weeks }}
+          REPAIR_TARGET: ${{ inputs.repair_target }}
         run: |
           REMOTE="${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}"
           ARGS=()
@@ -171,6 +184,7 @@ jobs:
             result-ingest) ARGS=("$BUNDLE_ID" "$MANIFEST_SHA256") ;;
             ingest-stats) ARGS=("$SEASON"); [ -n "$WEEKS" ] && ARGS+=("$WEEKS") ;;
             outcome-report) [ -n "$AS_OF" ] && ARGS=("$AS_OF") ;;
+            checkpoint-repair-false-refusal) ARGS=("${REPAIR_TARGET%%:*}" "${REPAIR_TARGET#*:}") ;;
           esac
           # shellcheck disable=SC2086
           ssh $SSH_OPTS "$REMOTE" bash -s -- "$OPERATION" "$RUNTIME_ROOT" "${ARGS[@]}" \
