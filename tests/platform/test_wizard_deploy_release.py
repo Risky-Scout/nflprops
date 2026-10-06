@@ -542,6 +542,8 @@ def test_ops_workflow_is_main_only_fixed_menu() -> None:
         "runtime-diagnostics",
         # PR #19: audited remediation of ONE pinned false NOT_EXECUTABLE refusal
         "checkpoint-repair-false-refusal",
+        # PR #20: read-only outcome certification of one verified snapshot
+        "snapshot-outcome-report",
     ]
     assert "refs/heads/main" in WIZARD_OPS.read_text()
     assert doc["jobs"]["ops"]["environment"] == "wizardofodds.com"

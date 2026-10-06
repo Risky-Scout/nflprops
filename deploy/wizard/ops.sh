@@ -10,6 +10,9 @@
 #                          listeners/unrelated-service state + runtime status
 #                          + full platform health (reported, not gated)
 #   report                 READ-ONLY: live-warehouse certification report
+#                          (bounded memory, PR #20; polars pinned to
+#                          REPORT_POLARS_THREADS threads -- its decode buffers
+#                          scale with the thread count on this small host)
 #   collect-once           ONE explicit MANUAL collection cycle
 #   manual-checkpoint GAME_ID AS_OF SEASON WEEK
 #                          claim + PREPARE one MANUAL checkpoint (no science)
@@ -50,6 +53,10 @@
 #   outcome-ingest-release BLOCK 4: remove that hold file
 #   outcome-report [AS_OF] READ-ONLY (BLOCK 4): versioned outcome-table
 #                          certification (+ what a cutoff AS_OF could see)
+#   snapshot-outcome-report SNAPSHOT_ID [AS_OF]
+#                          READ-ONLY (PR #20): verify one immutable snapshot's
+#                          manifest, then the same outcome certification over
+#                          the snapshot's own outcome tables
 #   ingest-stats SEASON [WEEKS]
 #                          BLOCK 4: append final-game outcome versions
 #                          (genuine receipt time; never fabricated PIT)
@@ -62,6 +69,9 @@
 set -uo pipefail
 
 UNIT=nflprops-runtime.service
+#: Polars worker threads for the read-only report (PR #20): bounded,
+#: deterministic memory on any core count; results do not depend on it.
+REPORT_POLARS_THREADS=2
 
 die() {
   echo "::error::OPS FAILED: $*" >&2
@@ -465,7 +475,10 @@ main() {
 
   case "$op" in
     status) op_status ;;
-    report) runtime_python -m nflprops.platform.wizard_runtime report || die "report failed" ;;
+    report)
+      POLARS_MAX_THREADS="$REPORT_POLARS_THREADS" \
+        runtime_python -m nflprops.platform.wizard_runtime report || die "report failed"
+      ;;
     collect-once) runtime_python -m nflprops.platform.wizard_runtime once || die "collect-once failed" ;;
     manual-checkpoint)
       [ "$#" -eq 4 ] || die "manual-checkpoint needs GAME_ID AS_OF SEASON WEEK"
@@ -498,6 +511,18 @@ main() {
     outcome-ingest-release)
       rm -f "$ROOT/state/outcome_ingest.hold" || die "could not remove hold file"
       echo "RELEASED: recurring outcome ingest may run"
+      ;;
+    snapshot-outcome-report)
+      [ "$#" -ge 1 ] && [ "$#" -le 2 ] || die "snapshot-outcome-report needs SNAPSHOT_ID [AS_OF]"
+      [[ "$1" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$ ]] || die "snapshot_id format"
+      if [ "$#" -eq 2 ]; then
+        [[ "$2" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\+00:00|Z)$ ]] || die "as_of format"
+        runtime_python -m nflprops.platform.wizard_runtime outcome-report \
+          --snapshot-id "$1" --as-of "$2" || die "snapshot outcome report failed"
+      else
+        runtime_python -m nflprops.platform.wizard_runtime outcome-report \
+          --snapshot-id "$1" || die "snapshot outcome report failed"
+      fi
       ;;
     outcome-report)
       [ "$#" -le 1 ] || die "outcome-report takes at most one AS_OF"

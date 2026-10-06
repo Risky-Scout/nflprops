@@ -21,6 +21,8 @@ name: Wizard Runtime Ops
 #   outcome-ingest-hold / -release      BLOCK 4: pause / resume the runtime's
 #                                       recurring outcome ingest (hold file)
 #   outcome-report                      BLOCK 4: read-only outcome-table check
+#   snapshot-outcome-report             PR #20: read-only outcome-table check of
+#                                       ONE verified immutable snapshot
 #   checkpoint-repair-false-refusal     BLOCK 4: audited remediation of ONE
 #                                       pinned false NOT_EXECUTABLE refusal
 #                                       (refusal_repair; refuses anything else)
@@ -54,6 +56,7 @@ on:
           - outcome-report
           - runtime-diagnostics
           - checkpoint-repair-false-refusal
+          - snapshot-outcome-report
       game_id:
         description: "manual-checkpoint: canonical game id (UUID)"
         required: false
@@ -133,6 +136,10 @@ jobs:
             verify-snapshot)
               [[ "$SNAPSHOT_ID" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$ ]] || { echo "::error::snapshot_id format"; exit 1; }
               ;;
+            snapshot-outcome-report)
+              [[ "$SNAPSHOT_ID" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$ ]] || { echo "::error::snapshot_id format"; exit 1; }
+              [[ -z "$AS_OF" || "$AS_OF" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\+00:00|Z)$ ]] || { echo "::error::as_of must be ISO-8601 UTC"; exit 1; }
+              ;;
             result-ingest)
               [[ "$BUNDLE_ID" =~ ^checkpoint-result-[0-9a-f]{64}$ ]] || { echo "::error::bundle_id must be checkpoint-result-<run_id>"; exit 1; }
               [[ "$MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::manifest_sha256 must be 64 hex"; exit 1; }
@@ -184,6 +191,7 @@ jobs:
             result-ingest) ARGS=("$BUNDLE_ID" "$MANIFEST_SHA256") ;;
             ingest-stats) ARGS=("$SEASON"); [ -n "$WEEKS" ] && ARGS+=("$WEEKS") ;;
             outcome-report) [ -n "$AS_OF" ] && ARGS=("$AS_OF") ;;
+            snapshot-outcome-report) ARGS=("$SNAPSHOT_ID"); [ -n "$AS_OF" ] && ARGS+=("$AS_OF") ;;
             checkpoint-repair-false-refusal) ARGS=("${REPAIR_TARGET%%:*}" "${REPAIR_TARGET#*:}") ;;
           esac
           # shellcheck disable=SC2086
