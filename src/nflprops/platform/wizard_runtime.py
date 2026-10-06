@@ -775,20 +775,41 @@ def outcome_report_cmd(
     as_of: list[str] = typer.Option(  # noqa: B008
         [], help="ISO-8601 UTC cutoff(s): how many outcomes a checkpoint then could see."
     ),
+    snapshot_id: str = typer.Option(
+        "", help="Certify this immutable snapshot's outcome tables instead of the live ones."
+    ),
 ) -> None:
     """Read-only: certify the versioned outcome tables (rows, versions,
-    receipt times, never-visible-before-first-seen, per-week coverage)."""
+    receipt times, never-visible-before-first-seen, per-week coverage). With
+    --snapshot-id the snapshot's manifest is verified first (fail closed)
+    and the report covers exactly that snapshot's outcome tables."""
     import json
+    import re
     from datetime import datetime
 
     from nflprops.data.warehouse import Warehouse
     from nflprops.platform.stats_backfill import outcome_report
+    from nflprops.platform.warehouse_snapshot import verify_snapshot
 
     probes = [datetime.fromisoformat(value.replace("Z", "+00:00")) for value in as_of]
     if any(p.tzinfo is None for p in probes):
         raise typer.BadParameter("--as-of must carry a UTC offset")
     layout = _layout()
-    report = outcome_report(Warehouse(layout.warehouse_root), as_of_probes=probes)
+    if not snapshot_id:
+        report = outcome_report(Warehouse(layout.warehouse_root), as_of_probes=probes)
+        typer.echo(json.dumps(report, indent=2, sort_keys=True, default=str))
+        return
+    if not re.fullmatch(r"\d{8}T\d{6}Z-[0-9a-f]{12}", snapshot_id):
+        raise typer.BadParameter("snapshot_id format")
+    try:
+        info = verify_snapshot(layout.snapshots, snapshot_id)
+    except (BundleError, WarehouseSnapshotError) as exc:
+        typer.echo(f"FAILED: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    # The verified snapshot directory is a warehouse root; outcome_report
+    # only reads it (Warehouse() creates nothing in an existing directory).
+    report = outcome_report(Warehouse(layout.snapshots / snapshot_id), as_of_probes=probes)
+    report["snapshot"] = {"snapshot_id": info.snapshot_id, "manifest_sha256": info.manifest_sha256}
     typer.echo(json.dumps(report, indent=2, sort_keys=True, default=str))
 
 

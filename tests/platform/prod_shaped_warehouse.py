@@ -146,9 +146,13 @@ def _store_like_production(warehouse: Warehouse, synthetic: Any, rows: int) -> d
     return {"rows": rows + collected.height, "parts": len(list(parts.glob("*.parquet")))}
 
 
-def build(root: Path, *, prop_rows: int = PROD_PROP_ROWS) -> dict[str, Any]:
+def build(
+    root: Path, *, prop_rows: int = PROD_PROP_ROWS, extra_seed: Any = None
+) -> dict[str, Any]:
     """Build the warehouse under `root`; returns (and writes to
-    `root/fixture.json`) the `now` at which all 11 T48H slots are due."""
+    `root/fixture.json`) the `now` at which all 11 T48H slots are due.
+    `extra_seed(provider, base)` may seed more provider data before the
+    certified collection (the report fixture seeds injuries and odds)."""
     base = datetime.now(UTC).replace(microsecond=0) + 5 * M
     provider = FakeProvider()
     provider.seed_team("t1", nickname="Home", abbreviation="HOM")
@@ -167,6 +171,8 @@ def build(root: Path, *, prop_rows: int = PROD_PROP_ROWS) -> dict[str, Any]:
                                   vendor="draftkings", prop_type="passing_yards",
                                   line_value="250.5", over_odds=-110, under_odds=-110,
                                   collector_received_at=base)
+    if extra_seed is not None:
+        extra_seed(provider, base)
     env = env_for(root)
     loop = RuntimeLoop(layout=env["layout"], warehouse=env["warehouse"], config=env["config"],
                        provider=provider, migration_head=HEAD, release_sha="a" * 40,

@@ -16,6 +16,9 @@ on:
       - "src/nflprops/orchestration/**"
       - "tests/platform/prod_shaped_warehouse.py"
       - "tools/constrained_worker_probe.py"
+      - "tools/report_memory_probe.py"
+      - "tests/platform/prod_shaped_report_warehouse.py"
+      - "deploy/wizard/ops.sh"
       - "deploy/systemd/nflprops-runtime.service"
       - ".github/workflows/constrained-worker.yml"
   workflow_dispatch:
@@ -122,3 +125,50 @@ jobs:
             echo '```json'; cat "$RUNNER_TEMP/prod-probe/report-prod.json" 2>/dev/null || echo "no report"; echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit "$rc"
+
+  production-shaped-report:
+    # 2026-10-06: the read-only `report` op was OOM-killed twice on Wizard
+    # (it runs OUTSIDE the runtime cgroup, ~1.3 GiB available, swap full):
+    # its whole-table natural-key n_unique peaked ~2.4 GiB on the 4.8M-row
+    # prop table. Gate (PR #20), on a production-shaped warehouse (props
+    # 4.8M, roster 965k, injuries 420k, odds 61k), one CPU, polars at the
+    # ops op's thread count: the bounded report gives byte-identical PIT /
+    # duplicate answers to the frozen PR #19 report and peaks <= 320 MiB;
+    # installing a 200x-inflated checkpoint result peaks <= 320 MiB.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev,orchestration,runtime,science]"
+
+      - name: Build the production-shaped warehouse and result bundle
+        run: |
+          python tools/report_memory_probe.py prepare "$RUNNER_TEMP/report-probe"
+          python tools/report_memory_probe.py prepare-ingest "$RUNNER_TEMP/ingest-probe"
+
+      - name: Old vs bounded report, and result ingest (one CPU)
+        run: |
+          set -u
+          python -c "import polars; print('polars', polars.__version__)"; uname -m
+          threads="$(sed -n 's/^REPORT_POLARS_THREADS=//p' deploy/wizard/ops.sh)"
+          test -n "$threads"
+          sync; echo 1 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+          set +e
+          POLARS_MAX_THREADS="$threads" taskset -c 0 \
+            python tools/report_memory_probe.py gate "$RUNNER_TEMP/report-probe"
+          rc_report=$?
+          POLARS_MAX_THREADS="$threads" taskset -c 0 \
+            python tools/report_memory_probe.py gate-ingest "$RUNNER_TEMP/ingest-probe"
+          rc_ingest=$?
+          set -e
+          {
+            echo "### Production-shaped integrity report + result ingest memory"
+            echo '```json'
+            cat "$RUNNER_TEMP/report-probe/report-memory.json" 2>/dev/null || echo "no report"
+            cat "$RUNNER_TEMP/ingest-probe/ingest-memory.json" 2>/dev/null || echo "no ingest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          test "$rc_report" -eq 0 && test "$rc_ingest" -eq 0
