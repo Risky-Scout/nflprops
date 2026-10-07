@@ -2,7 +2,7 @@
 
 Root cause of the T90M canary failure: the runtime's schedule discovery
 (`runtime_loop.ScheduleDiscovery._discover`) fetches whole-season
-`/nfl/v1/games` pages -- persisted as immutable raw receipts -- but only
+BDL games-endpoint pages -- persisted as immutable raw receipts -- but only
 caches them; the `games` table is written by the per-week collector alone,
 which never ran for 2026 Weeks 1-2. Stats for those weeks therefore
 reference games with no `games` metadata.
@@ -11,7 +11,7 @@ This module rebuilds exactly those `games` rows, and nothing else:
 
 * **raw/provider-derived rows only** -- every row is the certified
   `providers.bdl.mapper.map_game` of one record inside one stored
-  `/nfl/v1/games` receipt, whose payload re-hashes to its content address;
+  BDL games-endpoint receipt (`endpoints.GAMES`), whose payload re-hashes to its content address;
 * **genuine receipt timestamps only** -- `available_at == ingested_at ==`
   the receipt's recorded first-seen `received_at`, never estimated
   (`available_at_is_estimated = False`); a receipt without a timezone-aware
@@ -146,7 +146,7 @@ def _received_at(meta: dict[str, Any], path: Path) -> datetime:
 
 
 def iter_game_receipts(raw_root: Path) -> Iterator[GameReceipt]:
-    """Every stored `/nfl/v1/games` receipt, one at a time (bounded memory),
+    """Every stored BDL games-endpoint receipt, one at a time (bounded memory),
     content-verified: the payload must re-hash to its recorded address."""
     directory = raw_root / GAMES_RECEIPT_DIR
     if not directory.is_dir():

@@ -62,7 +62,7 @@
 #                          the snapshot's own outcome tables
 #   games-backfill SEASON WEEKS EXPECTED_IDS [apply]
 #                          PR #21: restore missing games rows from genuine
-#                          stored /nfl/v1/games receipts (receipt-time PIT
+#                          stored BDL games-endpoint receipts (receipt-time PIT
 #                          only, exact expected-ID guard, idempotent).
 #                          READ-ONLY dry-run unless the literal 'apply'.
 #   ingest-stats SEASON [WEEKS]

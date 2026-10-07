@@ -848,7 +848,7 @@ def games_backfill(
     ),
 ) -> None:
     """PR #21: restore missing `games` rows from GENUINE stored BDL
-    `/nfl/v1/games` receipts (`platform.games_backfill`): receipt-time
+    BDL games-endpoint receipts (`platform.games_backfill`): receipt-time
     availability only, exact expected-ID guard, idempotent, never replaces
     a row, never touches an immutable snapshot. DRY-RUN unless --apply."""
     import json
