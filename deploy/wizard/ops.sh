@@ -35,11 +35,14 @@
 #   result-ingest BUNDLE_ID MANIFEST_SHA256
 #                          BLOCK 4: validate + install ONE published GitHub
 #                          result bundle (runtime owner, writer lock; idempotent)
-#   checkpoint-refuse RUN_ID WORKFLOW_RUN_URL REFUSAL_CODE
+#   checkpoint-refuse RUN_ID WORKFLOW_RUN_URL REFUSAL_CODE [EVIDENCE_B64]
 #                          BLOCK 4: the executor's verification SCIENTIFICALLY
 #                          refused this request -> NOT_EXECUTABLE (fail
 #                          closed; idempotent). An operational refusal code
-#                          is rejected: the request stays pending.
+#                          is rejected: the request stays pending. PR #21:
+#                          EVIDENCE_B64 (mandatory for
+#                          MISSING_REQUIRED_GAME_METADATA) is appended in full
+#                          to state/checkpoint_refusal_evidence.jsonl.
 #   checkpoint-operational-failure RUN_ID WORKFLOW_RUN_URL FAILURE_CODE
 #                          BLOCK 4: append one OPERATIONAL execution failure
 #                          to state/checkpoint_execute_operational_failures.jsonl;
@@ -57,6 +60,11 @@
 #                          READ-ONLY (PR #20): verify one immutable snapshot's
 #                          manifest, then the same outcome certification over
 #                          the snapshot's own outcome tables
+#   games-backfill SEASON WEEKS EXPECTED_IDS [apply]
+#                          PR #21: restore missing games rows from genuine
+#                          stored /nfl/v1/games receipts (receipt-time PIT
+#                          only, exact expected-ID guard, idempotent).
+#                          READ-ONLY dry-run unless the literal 'apply'.
 #   ingest-stats SEASON [WEEKS]
 #                          BLOCK 4: append final-game outcome versions
 #                          (genuine receipt time; never fabricated PIT)
@@ -536,12 +544,15 @@ main() {
       echo "hold_file_present=$([ -e "$ROOT/state/outcome_ingest.hold" ] && echo yes || echo no)"
       ;;
     checkpoint-refuse)
-      [ "$#" -eq 3 ] || die "checkpoint-refuse needs RUN_ID WORKFLOW_RUN_URL REFUSAL_CODE"
+      { [ "$#" -eq 3 ] || [ "$#" -eq 4 ]; } || die "checkpoint-refuse needs RUN_ID WORKFLOW_RUN_URL REFUSAL_CODE [EVIDENCE_B64]"
       [[ "$1" =~ ^[0-9a-f]{64}$ ]] || die "run_id format"
       [[ "$2" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+$ ]] || die "workflow run url format"
       [[ "$3" =~ ^[A-Z][A-Z_]{2,63}$ ]] || die "refusal code format"
+      evidence="${4:-}"
+      [ -z "$evidence" ] || [[ "$evidence" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || die "evidence format"
       runtime_python -m nflprops.platform.wizard_runtime checkpoint refuse \
-        --run-id "$1" --workflow-run "$2" --refusal-code "$3" || die "checkpoint refuse failed"
+        --run-id "$1" --workflow-run "$2" --refusal-code "$3" --evidence-b64 "$evidence" \
+        || die "checkpoint refuse failed"
       ;;
     checkpoint-operational-failure)
       [ "$#" -eq 3 ] || die "checkpoint-operational-failure needs RUN_ID WORKFLOW_RUN_URL FAILURE_CODE"
@@ -568,6 +579,20 @@ main() {
       else
         runtime_python -m nflprops.platform.wizard_runtime ingest-stats \
           --seasons "$1" || die "ingest-stats failed"
+      fi
+      ;;
+    games-backfill)
+      { [ "$#" -eq 3 ] || [ "$#" -eq 4 ]; } || die "games-backfill needs SEASON WEEKS EXPECTED_IDS [apply]"
+      [[ "$1" =~ ^20[0-9]{2}$ ]] || die "season format"
+      [[ "$2" =~ ^[0-9]{1,2}(,[0-9]{1,2})*$ ]] || die "weeks format"
+      [[ "$3" =~ ^[0-9a-f-]{36}(,[0-9a-f-]{36})*$ ]] || die "expected ids format"
+      if [ "$#" -eq 4 ]; then
+        [ "$4" = "apply" ] || die "4th argument must be the literal 'apply'"
+        runtime_python -m nflprops.platform.wizard_runtime games-backfill \
+          --season "$1" --weeks "$2" --expected-ids "$3" --apply || die "games-backfill failed"
+      else
+        runtime_python -m nflprops.platform.wizard_runtime games-backfill \
+          --season "$1" --weeks "$2" --expected-ids "$3" || die "games-backfill dry-run failed"
       fi
       ;;
     *) die "unknown operation $op" ;;

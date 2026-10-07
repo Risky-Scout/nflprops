@@ -675,21 +675,42 @@ def checkpoint_refuse(
     refusal_code: str = typer.Option(
         ..., help="The executor's SCIENTIFIC refusal code (remote_checkpoint)."
     ),
+    evidence_b64: str = typer.Option(
+        "", help="Base64 of the executor's refusal evidence JSON (refusal.json 'evidence')."
+    ),
 ) -> None:
     """WIZARD SIDE: record that the GitHub executor's verification
     SCIENTIFICALLY refused one pending request (-> NOT_EXECUTABLE, run
     FAILED, failure_detail "<refusal_code>: ..."). An operational refusal
-    code is refused (the request stays pending). Only narrows publication;
-    idempotent; never touches a completed request."""
+    code is refused (the request stays pending). Evidence, when given (and
+    always for MISSING_REQUIRED_GAME_METADATA), is validated and appended in
+    full to state/checkpoint_refusal_evidence.jsonl first. Only narrows
+    publication; idempotent; never touches a completed request."""
+    import base64
+    import binascii
+    import json
     import re
 
     from nflprops.data.warehouse import Warehouse
-    from nflprops.platform.result_ingest import ResultIngestError, refuse_request
+    from nflprops.platform.result_ingest import (
+        MAX_REFUSAL_EVIDENCE_BYTES,
+        REFUSAL_EVIDENCE_FILE,
+        ResultIngestError,
+        refuse_request,
+    )
 
     if not re.fullmatch(r"[0-9a-f]{64}", run_id):
         raise typer.BadParameter("run_id must be 64 hex")
     if not re.fullmatch(r"https://github\.com/[\w.-]+/[\w.-]+/actions/runs/\d+", workflow_run):
         raise typer.BadParameter("workflow_run must be a GitHub Actions run URL")
+    evidence = None
+    if evidence_b64:
+        if len(evidence_b64) > 2 * MAX_REFUSAL_EVIDENCE_BYTES:
+            raise typer.BadParameter("evidence is too large")
+        try:
+            evidence = json.loads(base64.b64decode(evidence_b64, validate=True))
+        except (binascii.Error, ValueError) as exc:
+            raise typer.BadParameter(f"evidence is not base64 JSON: {exc}") from exc
     layout = _layout()
     try:
         status = refuse_request(
@@ -698,6 +719,8 @@ def checkpoint_refuse(
             refusal_code=refusal_code,
             detail=f"GitHub executor verification refused the request: {workflow_run}",
             lock_path=layout.writer_lock,
+            evidence=evidence,
+            evidence_log=layout.state / REFUSAL_EVIDENCE_FILE,
         )
     except (ResultIngestError, WriterLockError) as exc:
         typer.echo(f"FAILED: {exc}", err=True)
@@ -813,6 +836,53 @@ def outcome_report_cmd(
     typer.echo(json.dumps(report, indent=2, sort_keys=True, default=str))
 
 
+@app.command("games-backfill")
+def games_backfill(
+    season: int = typer.Option(..., help="Season, e.g. 2026."),
+    weeks: str = typer.Option(..., help="Comma-separated weeks, e.g. 1,2."),
+    expected_ids: str = typer.Option(
+        ..., help="Comma-separated EXACT canonical game ids the receipts must restore."
+    ),
+    apply: bool = typer.Option(
+        False, "--apply", help="Write (writer lock). Default: dry-run, read-only."
+    ),
+) -> None:
+    """PR #21: restore missing `games` rows from GENUINE stored BDL
+    `/nfl/v1/games` receipts (`platform.games_backfill`): receipt-time
+    availability only, exact expected-ID guard, idempotent, never replaces
+    a row, never touches an immutable snapshot. DRY-RUN unless --apply."""
+    import json
+    from datetime import UTC, datetime
+
+    from nflprops.data.warehouse import Warehouse
+    from nflprops.platform.games_backfill import (
+        GamesBackfillError,
+        apply_games_backfill,
+        plan_games_backfill,
+    )
+
+    ids = tuple(part.strip() for part in expected_ids.split(",") if part.strip())
+    week_tuple = tuple(int(part) for part in weeks.split(",") if part.strip())
+    layout = _layout()
+    warehouse = Warehouse(layout.warehouse_root)
+    try:
+        if apply:
+            summary = apply_games_backfill(
+                warehouse, layout.raw_root, season=season, weeks=week_tuple,
+                expected_game_ids=ids, lock_path=layout.writer_lock, now=datetime.now(UTC),
+            )
+        else:
+            plan = plan_games_backfill(
+                warehouse, layout.raw_root, season=season, weeks=week_tuple,
+                expected_game_ids=ids,
+            )
+            summary = {"applied": False, "dry_run": True, **plan.summary()}
+    except (GamesBackfillError, WriterLockError) as exc:
+        typer.echo(f"FAILED: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(summary, indent=2, sort_keys=True))
+
+
 @app.command("ingest-stats")
 def ingest_stats(
     seasons: str = typer.Option(..., help="Comma-separated seasons, e.g. 2024,2025,2026."),
@@ -877,21 +947,30 @@ def execute_checkpoint_cmd(
     files. Refuses to run on the Wizard host (NFLPROPS_RUNTIME_ROOT set).
 
     Exit 3 = a SCIENTIFIC, deterministic verification refusal (the only
-    case the workflow may record NOT_EXECUTABLE); exit 4 = an OPERATIONAL
-    verification refusal (executor/environment/config-runtime mismatch:
-    the request stays pending); exit 1 = any other (possibly transient)
-    failure. Exits 3 and 4 write `--refusal-file` (class, code, message)."""
+    case the workflow may record NOT_EXECUTABLE) -- including the
+    pre-simulation science readiness gate (MISSING_REQUIRED_GAME_METADATA);
+    exit 4 = an OPERATIONAL verification refusal (executor/environment/
+    config-runtime mismatch: the request stays pending); exit 5 = model code
+    failed unexpectedly inside the flow (MODEL_EXECUTION_FAILED: no result
+    files, never COMPLETED, the request stays pending for a reviewed
+    re-execution); exit 1 = any other (possibly transient) failure. Exits
+    3, 4 and 5 write `--refusal-file` (class, code, message[, evidence])."""
     import json
     import os
 
     from nflprops.config import load
     from nflprops.data.warehouse import Warehouse
     from nflprops.platform.remote_checkpoint import (
+        ModelExecutionError,
         RemoteExecutionError,
         execute_checkpoint,
         load_verified_request,
         verify_request_against_snapshot,
     )
+
+    def _write_refusal(payload: dict[str, object]) -> None:
+        if refusal_file:
+            Path(refusal_file).write_text(json.dumps(payload, sort_keys=True) + "\n")
 
     if os.environ.get("NFLPROPS_RUNTIME_ROOT") or os.environ.get("GITHUB_ACTIONS") != "true":
         typer.echo("FAILED: execute-checkpoint runs only on GitHub Actions", err=True)
@@ -912,26 +991,32 @@ def execute_checkpoint_cmd(
                 snapshot_id=info.snapshot_id,
                 snapshot_manifest_sha256=info.manifest_sha256,
             )
+            if verify_only:
+                typer.echo(
+                    f"VERIFIED: run {run.run_id} is executable against snapshot "
+                    f"{info.snapshot_id}"
+                )
+                return
+            executed = execute_checkpoint(
+                request,
+                run,
+                warehouse,
+                cfg,
+                out_dir=Path(out_dir),
+                request_bundle_sha256=request_sha,
+                science_sha=science_sha,
+                workflow_run=workflow_run,
+            )
         except RemoteExecutionError as exc:
-            if refusal_file:
-                Path(refusal_file).write_text(json.dumps(exc.as_dict(), sort_keys=True) + "\n")
+            _write_refusal(exc.as_dict())
             typer.echo(f"REFUSED [{exc.refusal_class}/{exc.refusal_code}]: {exc}", err=True)
             # Only a SCIENTIFIC refusal can never execute as claimed; an
             # OPERATIONAL one must leave the request pending.
             raise typer.Exit(3 if exc.scientific else 4) from exc
-        if verify_only:
-            typer.echo(f"VERIFIED: run {run.run_id} is executable against snapshot {info.snapshot_id}")
-            return
-        executed = execute_checkpoint(
-            request,
-            run,
-            warehouse,
-            cfg,
-            out_dir=Path(out_dir),
-            request_bundle_sha256=request_sha,
-            science_sha=science_sha,
-            workflow_run=workflow_run,
-        )
+        except ModelExecutionError as exc:
+            _write_refusal(exc.as_dict())
+            typer.echo(f"MODEL_EXECUTION_FAILED: {exc}", err=True)
+            raise typer.Exit(5) from exc
     except (RemoteExecutionError, BundleError, WarehouseSnapshotError) as exc:
         typer.echo(f"FAILED: {exc}", err=True)
         raise typer.Exit(1) from exc

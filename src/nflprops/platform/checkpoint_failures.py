@@ -28,7 +28,11 @@ from typing import Any
 from nflprops.data.warehouse import Warehouse
 from nflprops.errors import NflpropsError
 from nflprops.platform.checkpoint_prepare import _read_requests
-from nflprops.platform.remote_checkpoint import OPERATIONAL_REFUSAL_CODES
+from nflprops.platform.remote_checkpoint import (
+    MODEL_EXECUTION_FAILED,
+    MODEL_FAILURE_CLASS,
+    OPERATIONAL_REFUSAL_CODES,
+)
 from nflprops.platform.runtime_layout import RuntimeLayout
 
 OPERATIONAL_FAILURES_FILE = "checkpoint_execute_operational_failures.jsonl"
@@ -48,7 +52,14 @@ WORKFLOW_FAILURE_CODES: frozenset[str] = frozenset({
     FAILURE_PUBLISH,
     FAILURE_INGEST,
 })
-OPERATIONAL_FAILURE_CODES: frozenset[str] = OPERATIONAL_REFUSAL_CODES | WORKFLOW_FAILURE_CODES
+#: PR #21: model code failed unexpectedly inside the flow (executor exit 5).
+#: Logged here, never COMPLETED and never NOT_EXECUTABLE: the request stays
+#: pending, but -- unlike an operational failure -- a blind retry of the
+#: same code cannot be expected to succeed (class MODEL_FAILURE).
+MODEL_FAILURE_CODES: frozenset[str] = frozenset({MODEL_EXECUTION_FAILED})
+OPERATIONAL_FAILURE_CODES: frozenset[str] = (
+    OPERATIONAL_REFUSAL_CODES | WORKFLOW_FAILURE_CODES | MODEL_FAILURE_CODES
+)
 
 _RUN_ID = re.compile(r"[0-9a-f]{64}")
 _WORKFLOW_RUN = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/actions/runs/\d+")
@@ -88,7 +99,9 @@ def record_operational_failure(
         "recorded_at": (now or datetime.now(UTC)).astimezone(UTC).isoformat(),
         "run_id": run_id,
         "workflow_run": workflow_run,
-        "failure_class": "OPERATIONAL",
+        "failure_class": (
+            MODEL_FAILURE_CLASS if failure_code in MODEL_FAILURE_CODES else "OPERATIONAL"
+        ),
         "failure_code": failure_code,
         "request_state": rows["state"][0] if rows.height else None,
     }
