@@ -52,6 +52,7 @@ from nflprops.backtest.provenance import StateProvenanceContext
 from nflprops.collection.service import source_sha256
 from nflprops.config import Config, config_sha256
 from nflprops.data.warehouse import Warehouse
+from nflprops.domain.model_profile import ModelProfile, resolve_model_profile
 from nflprops.errors import LeakageError as CoreLeakageError
 from nflprops.orchestration.checkpoints import (
     OFFICIAL_CHECKPOINTS,
@@ -120,6 +121,8 @@ class CheckpointRunContext:
     retain_joint_draws: int
     max_confidence_tier: int
     market_mode: str
+    #: Required: an official execution never infers its model profile.
+    model_profile: ModelProfile
     simulation_config: SimulationConfig | None = None
     player_state_config: PlayerStateConfig | None = None
     team_state_config: TeamStateConfig | None = None
@@ -258,6 +261,7 @@ def _run_game_checkpoint_task(
         max_confidence_tier=ctx.max_confidence_tier,
         market_mode=ctx.market_mode,
         state_context_callback=on_state_context,
+        model_profile=ctx.model_profile,
     )
     if computation is None:
         return _CheckpointExecution(
@@ -743,6 +747,9 @@ def checkpoint_dispatch_flow(
     resolved_model_version = model_version or str(
         config.get_path("model.version", "2026.1.0")
     )
+    # Fail closed before claiming anything: the profile is part of the
+    # config identity (config_sha256 -> run_id) and must be explicit.
+    resolved_model_profile = resolve_model_profile(config)
     resolved_n_draws = (
         n_draws if n_draws is not None else int(config.get_path("simulation.n_draws", 20_000))
     )
@@ -876,6 +883,7 @@ def checkpoint_dispatch_flow(
                 retain_joint_draws=resolved_retain,
                 max_confidence_tier=resolved_tier,
                 market_mode=market_mode,
+                model_profile=resolved_model_profile,
                 simulation_config=simulation_config,
                 player_state_config=player_state_config,
                 team_state_config=team_state_config,

@@ -50,12 +50,10 @@ from nflprops.calibration.artifact import DIRECTLY_LABELED_PROP_TYPES
 from nflprops.calibration.challenger import LabeledGame, PropLabel
 from nflprops.data.injury_availability import injury_feed_available_at
 from nflprops.domain.enums import PropType
+from nflprops.domain.model_profile import ModelProfile
 from nflprops.features.historical_evidence import (
-    EVENT_CHRONOLOGY_COL,
     EvidenceMode,
     build_slate_chronology,
-    certify_event_derived,
-    certify_pregame_observations,
     schedule_identity,
 )
 from nflprops.market.rules import (
@@ -64,16 +62,19 @@ from nflprops.market.rules import (
     evaluate_actual_value,
     load_settlement_rules,
 )
+from nflprops.pipelines.model_inputs import build_model_inputs
 from nflprops.pipelines.pregame import simulate_game_for_prediction
 from nflprops.simulation.game import SimulationConfig
-from nflprops.state.player import PlayerStateConfig, build_player_states
-from nflprops.state.team import TeamStateConfig, build_team_states
+from nflprops.state.player import PlayerStateConfig
+from nflprops.state.team import TeamStateConfig
 
 if TYPE_CHECKING:
     from nflprops.data.storage.base import StorageBackend
 
-#: Historical replay's only evidence mode; recorded in the 10C3A report.
+#: Historical replay's only evidence mode and the only model profile it can
+#: certify; both are recorded in the 10C3A report and calibration artifact.
 EVIDENCE_MODE = EvidenceMode.HISTORICAL_WALK_FORWARD
+MODEL_PROFILE = ModelProfile.STRUCTURAL_CORE
 
 _REQUIRED_WAREHOUSE_TABLES: tuple[str, ...] = (
     "games",
@@ -110,6 +111,19 @@ class WarehouseTables:
     injuries: pl.DataFrame
     injury_runs: pl.DataFrame
     game_odds: pl.DataFrame
+
+    def as_table_mapping(self) -> dict[str, pl.DataFrame]:
+        """These frames keyed by their warehouse table name."""
+        return {
+            "games": self.games,
+            "player_game_stats": self.player_stats,
+            "team_game_stats": self.team_stats,
+            "players": self.players,
+            "roster_snapshots": self.roster,
+            "injury_snapshots": self.injuries,
+            "collector_resource_runs": self.injury_runs,
+            "game_odds_snapshots": self.game_odds,
+        }
 
 
 def load_warehouse_tables(backend: StorageBackend) -> WarehouseTables:
@@ -206,6 +220,7 @@ def build_labeled_game(
     team_state_config: TeamStateConfig | None = None,
     settlement_rules: SettlementRuleSet | None = None,
     tables: WarehouseTables | None = None,
+    model_profile: ModelProfile = ModelProfile.STRUCTURAL_CORE,
 ) -> LabeledGame | GameReplaySkip:
     """Real historical replay of one game: build PIT-safe states from data
     strictly available at kickoff, run the certified
@@ -233,38 +248,24 @@ def build_labeled_game(
     injury_runs = loaded.injury_runs
     game_odds = loaded.game_odds
 
-    # HISTORICAL_WALK_FORWARD: completed-game history by slate order (Class
-    # A); pregame observations by genuine availability only (Class B).
+    # STRUCTURAL_CORE under HISTORICAL_WALK_FORWARD, through the SAME
+    # assembly live execution uses (nflprops.pipelines.model_inputs): history
+    # by slate order, recency by source kickoff, no market/injury/roster
+    # input. LIVE_ENHANCED is refused there, before any simulation.
     chronology = build_slate_chronology(games)
-    history_ps = certify_event_derived(
-        player_stats, chronology, target_game_id=game_id, as_of=as_of
-    )
-    history_ts = certify_event_derived(
-        team_stats, chronology, target_game_id=game_id, as_of=as_of
-    )
-    pregame_roster = certify_pregame_observations(roster, as_of=as_of)
-    pregame_injuries = certify_pregame_observations(injuries, as_of=as_of)
-    pregame_odds = certify_pregame_observations(
-        game_odds, as_of=as_of, time_col="collector_received_at"
-    )
-
-    team_states = build_team_states(
-        history_ts, history_ps, as_of=as_of, strict=True,
-        config=team_state_config or TeamStateConfig(),
-        history_time_col=EVENT_CHRONOLOGY_COL,
-    )
-    player_states = build_player_states(
-        history_ps, history_ts, players, as_of=as_of,
-        roster=pregame_roster if pregame_roster.height > 0 else None,
-        injuries=pregame_injuries if pregame_injuries.height > 0 else None,
-        strict=True, config=player_state_config or PlayerStateConfig(),
-        history_time_col=EVENT_CHRONOLOGY_COL,
+    inputs = build_model_inputs(
+        model_profile=model_profile,
+        evidence_mode=EVIDENCE_MODE,
+        games=games, player_stats=player_stats, team_stats=team_stats, players=players,
+        roster=roster, injuries=injuries, game_odds=game_odds,
+        as_of=as_of, target_slate=chronology.slate_of(game_id), target_game_id=game_id,
+        player_state_config=player_state_config, team_state_config=team_state_config,
     )
 
     prepared = simulate_game_for_prediction(
-        game=schedule_identity(game_row), team_states=team_states,
-        player_states=player_states,
-        game_odds=pregame_odds, as_of=as_of, model_version=model_version,
+        game=schedule_identity(game_row), team_states=inputs.team_states,
+        player_states=inputs.player_states,
+        game_odds=inputs.game_odds, as_of=as_of, model_version=model_version,
         market_mode="live", simulation_config=simulation_config, n_draws=n_draws,
     )
     if prepared is None:
@@ -332,6 +333,7 @@ def replay_games(
     settlement_rules: SettlementRuleSet | None = None,
     on_progress: object | None = None,
     tables: WarehouseTables | None = None,
+    model_profile: ModelProfile = ModelProfile.STRUCTURAL_CORE,
 ) -> ReplayBatchResult:
     """Replay every row of `game_rows` (as returned by `list_final_games`).
     Honest bookkeeping: every game becomes exactly one `LabeledGame` or one
@@ -356,6 +358,7 @@ def replay_games(
             team_state_config=team_state_config,
             settlement_rules=rules,
             tables=loaded,
+            model_profile=model_profile,
         )
         if isinstance(result, LabeledGame):
             labeled.append(result)

@@ -47,6 +47,13 @@ def game_market_consensus(
     *,
     as_of: datetime,
 ) -> GameMarketConsensus:
+    """Median spread/total across books' latest rows at `as_of`. No rows at
+    all -- including a frame with no columns, i.e. no market input (the
+    STRUCTURAL_CORE profile) -- is the explicit no-market result: both
+    values None, zero books; never a fabricated 0.0 line. A non-empty frame
+    missing its required columns still fails."""
+    if frame.is_empty():
+        return GameMarketConsensus(game_id, None, None, 0, 0)
     rows = _latest_vendor_rows(frame, as_of).filter(
         pl.col("canonical_game_id") == game_id
     )

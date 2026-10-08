@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "orchestration"))
 
 from _fixtures import TARGET_GAME_ID, build_pit_fixture_warehouse
 
+from nflprops.domain.model_profile import ModelProfile
 from nflprops.market.closing import select_closing_prop_quotes
 from nflprops.market.consensus import latest_prop_quotes
 from nflprops.market.timing import (
@@ -233,6 +234,7 @@ def _simulator_input(warehouse, monkeypatch: pytest.MonkeyPatch, market_mode: st
         pregame.compute_game_prediction(
             warehouse, season=2025, week=2, game_id=TARGET_GAME_ID, as_of=AS_OF,
             n_draws=200, market_mode=market_mode,
+            model_profile=ModelProfile.LIVE_ENHANCED,
         )
     return captured["input"]
 

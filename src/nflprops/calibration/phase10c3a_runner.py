@@ -76,6 +76,7 @@ from nflprops.calibration.diagnostics import (
 from nflprops.calibration.entropy_tilting import softmax_weights
 from nflprops.calibration.historical_runner import (
     EVIDENCE_MODE,
+    MODEL_PROFILE,
     compute_data_root_manifest_sha256,
     compute_training_manifest_sha256,
     list_final_games,
@@ -88,7 +89,16 @@ from nflprops.calibration.joint_feature_contract import (
 )
 from nflprops.calibration.scoring import skill_score
 from nflprops.calibration.weighted_pmf import build_weighted_first_td_simplex
+from nflprops.data.evidence_policy import (
+    classify_model_evidence,
+    promotion_evidence_allowed,
+)
 from nflprops.data.warehouse import Warehouse
+from nflprops.domain.model_profile import (
+    ModelProfile,
+    ModelProfileError,
+    parse_model_profile,
+)
 
 #: The only draw count this module will accept for a `--mode production`
 #: run -- the certified live-prediction default
@@ -154,8 +164,22 @@ class RunnerConfig:
     regularization_lambda: float
     max_fit_iterations: int
     expect_data_manifest_sha256: str | None
+    #: Historical replay can only certify STRUCTURAL_CORE (Gate 1): the
+    #: 2022-2025 pregame observations LIVE_ENHANCED needs have no certified
+    #: historical availability. Anything else is refused before replay.
+    model_profile: str = ModelProfile.STRUCTURAL_CORE.value
 
     def __post_init__(self) -> None:
+        try:
+            profile = parse_model_profile(self.model_profile)
+        except ModelProfileError as exc:
+            raise ConfigurationError(str(exc)) from None
+        if profile is not MODEL_PROFILE:
+            raise ConfigurationError(
+                f"--model-profile {profile.value} cannot run under {EVIDENCE_MODE.value}: "
+                "historical game odds, injuries and roster depth have no certified "
+                f"availability; Phase 10C3A validates {MODEL_PROFILE.value} only"
+            )
         if self.mode not in ("production", "smoke"):
             raise ConfigurationError(f"--mode must be 'production' or 'smoke', got {self.mode!r}")
         if self.mode == "production" and self.n_draws != PRODUCTION_N_DRAWS:
@@ -192,6 +216,11 @@ def parse_args(argv: list[str] | None = None) -> RunnerConfig:
              "smoke: any draw count, always reports INSUFFICIENT_EVIDENCE.",
     )
     parser.add_argument("--model-version", default="phase10c3a-real-run-v1")
+    parser.add_argument(
+        "--model-profile", choices=[p.value for p in ModelProfile],
+        default=ModelProfile.STRUCTURAL_CORE.value,
+        help="Only STRUCTURAL_CORE is accepted (historical walk-forward).",
+    )
     parser.add_argument("--regularization-lambda", type=float, default=0.01)
     parser.add_argument("--max-fit-iterations", type=int, default=200)
     parser.add_argument(
@@ -212,7 +241,17 @@ def parse_args(argv: list[str] | None = None) -> RunnerConfig:
         regularization_lambda=ns.regularization_lambda,
         max_fit_iterations=ns.max_fit_iterations,
         expect_data_manifest_sha256=ns.expect_data_manifest_sha256,
+        model_profile=ns.model_profile,
     )
+
+
+def _profile_input_faithful(game: LabeledGame) -> bool:
+    """Whether every input the certified profile consumes was PIT-faithful
+    for `game`. STRUCTURAL_CORE consumes no injury input, so a missing
+    injury feed (`injury_data_available=False`, every 2022-2025 game)
+    degrades nothing it uses -- historically or live. A profile that
+    consumed injuries would need the feed."""
+    return MODEL_PROFILE is ModelProfile.STRUCTURAL_CORE or game.injury_data_available
 
 
 def _log(output_dir: Path, msg: str) -> None:
@@ -452,8 +491,13 @@ def run(config: RunnerConfig) -> dict[str, Any]:
 
     warehouse = Warehouse(config.data_root)
     tables = load_warehouse_tables(warehouse)
+    evidence_class, evidence_rows = classify_model_evidence(
+        tables.as_table_mapping(), evidence_mode=EVIDENCE_MODE, model_profile=MODEL_PROFILE
+    )
     games = list_final_games(warehouse, season_min=config.season_min, season_max=config.season_max)
-    log(f"total final games: {games.height}")
+    log(f"total final games: {games.height}; model_profile={MODEL_PROFILE.value} "
+        f"evidence_mode={EVIDENCE_MODE.value} evidence_class={evidence_class.value} "
+        f"estimated_rows={evidence_rows}")
 
     def progress(i: int, total: int, _gid: str) -> None:
         if i % 200 == 0 or i == total:
@@ -498,8 +542,8 @@ def run(config: RunnerConfig) -> dict[str, Any]:
 
         weight_health = verify_weight_health_and_positivity(fr.fold_id, score_games, theta)
 
-        faithful = tuple(g for g in score_games if g.injury_data_available)
-        degraded = tuple(g for g in score_games if not g.injury_data_available)
+        faithful = tuple(g for g in score_games if _profile_input_faithful(g))
+        degraded = tuple(g for g in score_games if not _profile_input_faithful(g))
         faithful_challenger = _aggregate_scores(faithful, theta) if faithful else {}
         faithful_baseline = _aggregate_scores(faithful, np.zeros(len(FEATURE_NAMES))) if faithful else {}
         degraded_challenger = _aggregate_scores(degraded, theta) if degraded else {}
@@ -518,6 +562,9 @@ def run(config: RunnerConfig) -> dict[str, Any]:
                 "scoring_game_count": len(score_games),
                 "pit_faithful_scoring_game_count": len(faithful),
                 "pit_degraded_scoring_game_count": len(degraded),
+                "injury_feed_available_scoring_game_count": sum(
+                    1 for g in score_games if g.injury_data_available
+                ),
                 "theta": list(fr.fit.theta),
                 "theta_norm": parameter_magnitude(theta),
                 "converged": fr.fit.converged,
@@ -570,7 +617,9 @@ def run(config: RunnerConfig) -> dict[str, Any]:
     overall_promo = evaluate_promotion_gate(list(fold_results), games_by_fold)
     faithful_evidence_exists = any(fr["pit_faithful_scoring_game_count"] > 0 for fr in fold_reports)
 
-    if config.mode == "smoke":
+    if config.mode == "smoke" or not promotion_evidence_allowed(
+        evidence_class, evidence_mode=EVIDENCE_MODE
+    ):
         promotion_decision = "INSUFFICIENT_EVIDENCE"
     elif not faithful_evidence_exists:
         promotion_decision = "INSUFFICIENT_EVIDENCE"  # INSUFFICIENT_PIT_FAITHFUL_EVIDENCE
@@ -623,6 +672,9 @@ def run(config: RunnerConfig) -> dict[str, Any]:
         support_preservation_passed=True,
         first_td_simplex_passed=coherence["passed"],
         promotion_gate_passed=(promotion_decision == "ELIGIBLE_FOR_PROMOTION"),
+        model_profile=MODEL_PROFILE.value,
+        evidence_mode=EVIDENCE_MODE.value,
+        evidence_class=evidence_class.value,
     )
     log(f"registered challenger artifact: {registration.register_result.artifact.calibration_artifact_id}")
 
@@ -630,6 +682,13 @@ def run(config: RunnerConfig) -> dict[str, Any]:
         "phase": "10C3A",
         "mode": config.mode,
         "evidence_mode": EVIDENCE_MODE.value,
+        "model_profile": MODEL_PROFILE.value,
+        "evidence_class": evidence_class.value,
+        "evidence_estimated_rows": evidence_rows,
+        "pit_faithful_definition": (
+            "profile-input-faithful: every input the model profile consumes is "
+            "certified at the cutoff (STRUCTURAL_CORE consumes no injury feed)"
+        ),
         "n_draws": config.n_draws,
         "model_version": config.model_version,
         "data_root": str(config.data_root),

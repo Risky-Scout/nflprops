@@ -9,6 +9,7 @@ import numpy as np
 import polars as pl
 
 from nflprops.features.asof import filter_pit
+from nflprops.features.historical_evidence import PERFORMANCE_EVENT_COL
 
 
 @dataclass(frozen=True)
@@ -278,17 +279,29 @@ def build_player_states(
     strict: bool = True,
     config: PlayerStateConfig | None = None,
     history_time_col: str = "available_at",
+    recency_time_col: str | None = None,
 ) -> dict[str, PlayerState]:
-    """`history_time_col` is the clock of the game-stat history (see
-    `build_team_states`). Roster and injury snapshots are pregame
-    observations and always use genuine `available_at`."""
+    """`history_time_col` / `recency_time_col` are the eligibility and
+    recency clocks of the game-stat history (see `build_team_states`).
+    Roster and injury snapshots are pregame observations and always use
+    genuine `available_at`.
+
+    A player's current team is the team of his chronologically latest
+    eligible game: ordered by source-game kickoff (`PERFORMANCE_EVENT_COL`;
+    a game without one sorts first), then `history_time_col`, then game id
+    -- never by storage/join order."""
     if config is None:
         config = PlayerStateConfig()
+    weight_col = recency_time_col or history_time_col
 
     ps = filter_pit(player_stats, as_of, strict=strict, time_col=history_time_col)
     ts = filter_pit(team_stats, as_of, strict=strict, time_col=history_time_col)
     if ps.is_empty():
         return {}
+    # Canonical chronological row order (see `build_team_states`).
+    ps = ps.sort([weight_col, "canonical_game_id", "canonical_team_id", "canonical_player_id"])
+    if not ts.is_empty():
+        ts = ts.sort([weight_col, "canonical_game_id", "canonical_team_id"])
 
     ps = _with_qb_reconciliation(ps, ts)
     priors = _position_priors(ps, players)
@@ -369,17 +382,23 @@ def build_player_states(
             "rush": float(sub["_rush_share_game"].mean() or 0.01),
         }
 
+    team_order = [
+        *([PERFORMANCE_EVENT_COL] if PERFORMANCE_EVENT_COL in joined.columns else []),
+        history_time_col,
+        "canonical_game_id",
+    ]
+
     out: dict[str, PlayerState] = {}
-    for pid in joined["canonical_player_id"].unique().to_list():
+    for pid in sorted(joined["canonical_player_id"].unique().to_list()):
         sub = joined.filter(pl.col("canonical_player_id") == pid)
-        team_id = str(sub["canonical_team_id"][-1])
+        team_id = str(sub.sort(team_order, nulls_last=False)["canonical_team_id"][-1])
         pos = player_pos.get(str(pid), "OTHER")
         pp = priors.get(pos, priors.get("OTHER", {}))
         sp = pos_share.get(pos, {"target": 0.02, "rush": 0.01})
 
-        sub = sub.sort(history_time_col)
+        sub = sub.sort([weight_col, "canonical_game_id"])
         weight_sets = _role_weight_sets(
-            sub[history_time_col].to_list(),
+            sub[weight_col].to_list(),
             as_of,
             config,
         )

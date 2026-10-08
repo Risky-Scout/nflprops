@@ -41,6 +41,13 @@ from nflprops.calibration.registry import (
     record_validation,
     register_calibration_artifact,
 )
+from nflprops.data.evidence_policy import EvidenceClass
+from nflprops.domain.model_profile import (
+    ModelProfile,
+    ModelProfileError,
+    parse_model_profile,
+)
+from nflprops.features.historical_evidence import EvidenceMode
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -107,13 +114,37 @@ def register_challenger(
     support_preservation_passed: bool,
     first_td_simplex_passed: bool,
     promotion_gate_passed: bool,
+    model_profile: str,
+    evidence_mode: str,
+    evidence_class: str,
 ) -> ChallengerRegistration:
     """Build the payload, store its bytes, register the immutable
     artifact, and append one validation row. `promotion_gate_passed` is
     the caller's own honest evaluation (e.g. from
     `nflprops.calibration.challenger.evaluate_promotion_gate`) -- this
     function records it but never acts on it: no approval, no promotion.
+
+    The artifact is bound to `model_profile` (identity + compatibility);
+    the validation row's metrics record `model_profile`, `evidence_mode` and
+    `evidence_class`. A historical walk-forward calibrator can only be a
+    STRUCTURAL_CORE calibrator.
     """
+    profile = parse_model_profile(model_profile)
+    mode = EvidenceMode(evidence_mode)
+    evidence = EvidenceClass(evidence_class)
+    if mode is EvidenceMode.HISTORICAL_WALK_FORWARD and profile is not ModelProfile.STRUCTURAL_CORE:
+        raise ModelProfileError(
+            f"a HISTORICAL_WALK_FORWARD calibrator must be STRUCTURAL_CORE, got {profile.value}"
+        )
+    provenance = {
+        "model_profile": profile.value,
+        "evidence_mode": mode.value,
+        "evidence_class": evidence.value,
+    }
+    clashing = sorted(k for k in provenance if k in metrics and metrics[k] != provenance[k])
+    if clashing:
+        raise ModelProfileError(f"metrics contradict registration provenance: {clashing}")
+    metrics = {**metrics, **provenance}
     payload = build_challenger_payload(
         fit,
         optimizer=optimizer,
@@ -129,6 +160,7 @@ def register_challenger(
         algorithm_version=ALGORITHM_VERSION,
         scope_type=JOINT_GAME_SCOPE,
         checkpoint_scope=checkpoint_scope,
+        model_profile=profile.value,
         base_model_version=base_model_version,
         simulation_config_version=simulation_config_version,
         feature_contract_version=FEATURE_CONTRACT_VERSION,

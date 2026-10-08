@@ -722,7 +722,7 @@ def test_dispatcher_end_to_end_persists_threshold_artifact_for_due_checkpoints(
     warehouse = _build_warehouse(tmp_path)
     results = checkpoint_dispatch_flow(
         warehouse=warehouse,
-        config=Config(data={}),
+        config=Config(data={"model": {"profile": "LIVE_ENHANCED"}}),
         season=SEASON,
         week=WEEK,
         now=AS_OF,

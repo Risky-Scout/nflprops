@@ -12,6 +12,11 @@ log_level = "INFO"
 
 [model]
 version = "2026.1.0"
+# Fundamental-model input profile (nflprops.domain.model_profile). Part of
+# config_sha256, so it is part of every run identity. LIVE_ENHANCED keeps the
+# existing live behavior (game odds + injuries + roster depth); STRUCTURAL_CORE
+# is the historically certified model (no market, injury or depth inputs).
+profile = "LIVE_ENHANCED"
 
 # --- empirical Bayes --------------------------------------------------------
 # k and lambda are FITTED per metric (SPEC §25). These are only the grid bounds and

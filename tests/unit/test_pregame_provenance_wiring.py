@@ -310,7 +310,9 @@ def test_state_history_guard_precedes_state_build_and_simulation() -> None:
     """
     inputs_source = inspect.getsource(_prepare_prediction_inputs)
     history_guard = inputs_source.index("_assert_state_history_safe_for_games(")
-    state_build = inputs_source.index("build_team_states(")
+    # Gate 1: states are built via the shared, profile-aware
+    # `build_model_inputs(` (nflprops.pipelines.model_inputs).
+    state_build = inputs_source.index("build_model_inputs(")
     assert history_guard < state_build
 
     week_source = inspect.getsource(predict_week)

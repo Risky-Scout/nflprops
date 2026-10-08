@@ -460,7 +460,7 @@ tables:
         migrations/versions/0008_calibration_artifact_registry.py.
       columns: [calibration_artifact_id, calibration_schema_version,
         algorithm_family, algorithm_version, scope_type, checkpoint_scope,
-        base_model_version, simulation_config_version,
+        model_profile, base_model_version, simulation_config_version,
         feature_contract_version, prop_contract_version,
         calibration_contract_version, training_cutoff, training_start,
         training_end, training_manifest_sha256, code_sha, payload_format,

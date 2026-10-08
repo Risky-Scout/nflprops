@@ -51,7 +51,12 @@ import polars as pl
 #: Column carrying a row's certified evidence class.
 EVIDENCE_CLASS_COL = "evidence_class"
 #: Column carrying a Class-A row's source-slate boundary (see module doc).
+#: An ELIGIBILITY time: when the row may first be known historically.
 EVENT_CHRONOLOGY_COL = "event_chronology_at"
+#: Column carrying a Class-A row's source-game kickoff: the PERFORMANCE event
+#: time, i.e. how old the football performance is. Recency weights and team
+#: assignment use it in both evidence modes, never an ingest/receipt time.
+PERFORMANCE_EVENT_COL = "performance_event_at"
 
 #: `outcome_available_at` for a label whose slate has no successor slate in
 #: the schedule: no later target exists, so it can be scored out-of-fold but
@@ -116,6 +121,7 @@ class SlateChronology:
     slate_by_game: Mapping[str, tuple[int, int, int]]
     final_game_ids: frozenset[str]
     boundary_by_slate: Mapping[tuple[int, int, int], datetime]
+    kickoff_by_game: Mapping[str, datetime]
 
     def slate_of(self, game_id: str) -> tuple[int, int, int]:
         try:
@@ -168,6 +174,7 @@ def build_slate_chronology(games: pl.DataFrame) -> SlateChronology:
         raise HistoricalChronologyError("games missing season/postseason/week")
 
     slate_by_game: dict[str, tuple[int, int, int]] = {}
+    kickoff_by_game: dict[str, datetime] = {}
     final_ids: set[str] = set()
     first_kick: dict[tuple[int, int, int], datetime] = {}
     last_kick: dict[tuple[int, int, int], datetime] = {}
@@ -176,6 +183,7 @@ def build_slate_chronology(games: pl.DataFrame) -> SlateChronology:
         kickoff = _aware(row["date"])
         game_id = str(row["canonical_game_id"])
         slate_by_game[game_id] = slate
+        kickoff_by_game[game_id] = kickoff
         if row["_is_final"]:
             final_ids.add(game_id)
         first_kick[slate] = min(first_kick.get(slate, kickoff), kickoff)
@@ -193,6 +201,95 @@ def build_slate_chronology(games: pl.DataFrame) -> SlateChronology:
         slate_by_game=slate_by_game,
         final_game_ids=frozenset(final_ids),
         boundary_by_slate=boundaries,
+        kickoff_by_game=kickoff_by_game,
+    )
+
+
+def slate_key(game_row: Mapping[str, object]) -> tuple[int, int, int]:
+    """`(season, postseason, week)` of one game row."""
+    try:
+        season, week = game_row["season"], game_row["week"]
+    except KeyError as exc:
+        raise HistoricalChronologyError(f"game row missing {exc.args[0]!r}") from None
+    if season is None or week is None:
+        raise HistoricalChronologyError("game row missing season/week")
+    return (int(str(season)), int(bool(game_row.get("postseason") or False)), int(str(week)))
+
+
+def _kickoff_lookup(chronology: SlateChronology, game_ids: set[str]) -> pl.DataFrame:
+    return pl.DataFrame(
+        [
+            {"canonical_game_id": g, PERFORMANCE_EVENT_COL: chronology.kickoff_by_game[g]}
+            for g in sorted(game_ids)
+        ],
+        schema={"canonical_game_id": pl.String, PERFORMANCE_EVENT_COL: pl.Datetime("us", "UTC")},
+    )
+
+
+def _chronological_order(frame: pl.DataFrame, first: str) -> list[str]:
+    return [first] + [
+        c for c in ("canonical_game_id", "canonical_team_id", "canonical_player_id")
+        if c in frame.columns
+    ]
+
+
+def restrict_to_prior_slates(
+    frame: pl.DataFrame,
+    chronology: SlateChronology,
+    *,
+    target_slate: tuple[int, int, int],
+) -> pl.DataFrame:
+    """LIVE_PIT side of STRUCTURAL_CORE history: rows of final games from a
+    slate strictly before `target_slate`, with `PERFORMANCE_EVENT_COL`. It
+    only ever REMOVES rows -- each row's genuine `available_at` still has to
+    pass the LIVE_PIT gate afterwards. This makes live history the same
+    population historical replay can certify (never a same-slate game)."""
+    if "canonical_game_id" not in frame.columns:
+        if frame.is_empty():
+            return frame
+        raise HistoricalChronologyError("event-derived frame is missing canonical_game_id")
+    eligible = {
+        g for g, slate in chronology.slate_by_game.items()
+        if g in chronology.final_game_ids and slate < target_slate
+    }
+    out = frame.with_columns(pl.col("canonical_game_id").cast(pl.String)).join(
+        _kickoff_lookup(chronology, eligible), on="canonical_game_id", how="inner"
+    )
+    return out.sort(_chronological_order(out, PERFORMANCE_EVENT_COL), maintain_order=True)
+
+
+def attach_performance_event_time(frame: pl.DataFrame, games: pl.DataFrame) -> pl.DataFrame:
+    """Every row of `frame` plus its source-game kickoff (null when unknown)
+    -- removes nothing and validates no schedule. LIVE_ENHANCED uses it only
+    to order a player's games when assigning his current team."""
+    if (
+        "canonical_game_id" not in frame.columns
+        or games.is_empty()
+        or not {"canonical_game_id", "date"} <= set(games.columns)
+    ):
+        return frame
+    final_first = (
+        pl.col("status_state") == "final" if "status_state" in games.columns else pl.lit(False)
+    )
+    kickoffs = (
+        games.filter(pl.col("date").is_not_null())
+        .with_columns(pl.col("canonical_game_id").cast(pl.String), final_first.alias("_final"))
+        .sort(["canonical_game_id", "_final", "date"])
+        .group_by("canonical_game_id", maintain_order=True)
+        .agg(pl.col("date").last().alias(PERFORMANCE_EVENT_COL))
+    )
+    dtype = kickoffs.schema[PERFORMANCE_EVENT_COL]
+    if isinstance(dtype, pl.Datetime):
+        kickoff = pl.col(PERFORMANCE_EVENT_COL)
+        kickoffs = kickoffs.with_columns(
+            (
+                kickoff.dt.replace_time_zone("UTC")
+                if dtype.time_zone is None
+                else kickoff.dt.convert_time_zone("UTC")
+            ).dt.cast_time_unit("us")
+        )
+    return frame.with_columns(pl.col("canonical_game_id").cast(pl.String)).join(
+        kickoffs, on="canonical_game_id", how="left"
     )
 
 
@@ -207,18 +304,24 @@ def certify_event_derived(
     final, its slate boundary at or before `as_of` (so its slate precedes
     the target's), and never the target game. Adds `EVENT_CHRONOLOGY_COL`
     and `EVIDENCE_CLASS_COL`; `available_at` is carried through untouched
-    and never consulted. Rows of unknown, unfinished or last-slate games are
-    excluded. Output order is a pure function of event chronology."""
+    and never consulted. Adds `PERFORMANCE_EVENT_COL` (source kickoff) for
+    recency. Rows of unknown, unfinished or last-slate games are excluded.
+    Output order is a pure function of event chronology."""
     if frame.is_empty():
         return frame.with_columns(
             pl.lit(None, dtype=pl.Datetime("us", "UTC")).alias(EVENT_CHRONOLOGY_COL),
+            pl.lit(None, dtype=pl.Datetime("us", "UTC")).alias(PERFORMANCE_EVENT_COL),
             pl.lit(None, dtype=pl.String).alias(EVIDENCE_CLASS_COL),
         )
     if "canonical_game_id" not in frame.columns:
         raise HistoricalChronologyError("event-derived frame is missing canonical_game_id")
     as_of = _aware(as_of)
     boundary_rows = [
-        {"canonical_game_id": game_id, EVENT_CHRONOLOGY_COL: chronology.boundary_by_slate[slate]}
+        {
+            "canonical_game_id": game_id,
+            EVENT_CHRONOLOGY_COL: chronology.boundary_by_slate[slate],
+            PERFORMANCE_EVENT_COL: chronology.kickoff_by_game[game_id],
+        }
         for game_id, slate in chronology.slate_by_game.items()
         if game_id in chronology.final_game_ids
         and game_id != target_game_id
@@ -227,15 +330,16 @@ def certify_event_derived(
     ]
     lookup = pl.DataFrame(
         boundary_rows,
-        schema={"canonical_game_id": pl.String, EVENT_CHRONOLOGY_COL: pl.Datetime("us", "UTC")},
+        schema={
+            "canonical_game_id": pl.String,
+            EVENT_CHRONOLOGY_COL: pl.Datetime("us", "UTC"),
+            PERFORMANCE_EVENT_COL: pl.Datetime("us", "UTC"),
+        },
     )
     certified = frame.with_columns(pl.col("canonical_game_id").cast(pl.String)).join(
         lookup, on="canonical_game_id", how="inner"
     )
-    order = [EVENT_CHRONOLOGY_COL] + [
-        c for c in ("canonical_game_id", "canonical_team_id", "canonical_player_id")
-        if c in certified.columns
-    ]
+    order = [EVENT_CHRONOLOGY_COL, *_chronological_order(certified, PERFORMANCE_EVENT_COL)]
     return certified.with_columns(
         pl.lit(ChronologyEvidence.CERTIFIED_HISTORICAL_EVENT_CHRONOLOGY.value).alias(
             EVIDENCE_CLASS_COL
@@ -366,7 +470,7 @@ HISTORICAL_REPLAY_INPUT_SURFACE: Mapping[str, InputAudit] = {
         False,
         "no genuine 2022-2025 observation exists; genuine-receipt rule excludes every "
         "historical row (estimated backfills included)",
-        "NONE: excluded; a genuine observation <= cutoff would be admitted",
+        "NONE: STRUCTURAL_CORE (the only profile replay runs) never reads it",
     ),
     "injury_snapshots": InputAudit(
         "injury_snapshots",
@@ -376,7 +480,7 @@ HISTORICAL_REPLAY_INPUT_SURFACE: Mapping[str, InputAudit] = {
         False,
         "no genuine 2022-2025 observation exists; genuine-receipt rule excludes every "
         "historical row (estimated backfills included)",
-        "NONE: excluded; a genuine observation <= cutoff would be admitted",
+        "NONE: STRUCTURAL_CORE (the only profile replay runs) never reads it",
     ),
     "collector_resource_runs": InputAudit(
         "collector_resource_runs",
@@ -396,6 +500,6 @@ HISTORICAL_REPLAY_INPUT_SURFACE: Mapping[str, InputAudit] = {
         False,
         "no genuine 2022-2025 receipt exists; provider opened_at is not an approved "
         "availability time (STEP 2D)",
-        "NONE: excluded, so historical replay runs market-free (implied_points=None)",
+        "NONE: STRUCTURAL_CORE never reads it; market input is None",
     ),
 }

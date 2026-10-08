@@ -119,7 +119,9 @@ def test_migration_head_is_now_0008_extending_not_replacing_0007() -> None:
         [sys.executable, "-m", "alembic", "heads"],
         cwd=str(repo_root), capture_output=True, text=True, timeout=30,
     )
-    assert "0008_calibration_registry" in heads.stdout, heads.stdout + heads.stderr
+    # Gate 1 extends 0008 with 0010_cal_model_profile (profile-bound
+    # calibration artifacts); 0008 stays in the linear history below.
+    assert "0010_cal_model_profile" in heads.stdout, heads.stdout + heads.stderr
 
     history = subprocess.run(
         [sys.executable, "-m", "alembic", "history"],
@@ -129,5 +131,6 @@ def test_migration_head_is_now_0008_extending_not_replacing_0007() -> None:
         "0006_player_prop_pricing",
         "0007_player_prop_distributions",
         "0008_calibration_registry",
+        "0010_cal_model_profile",
     ):
         assert revision in history.stdout, history.stdout + history.stderr
