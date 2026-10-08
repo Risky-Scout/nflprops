@@ -65,6 +65,7 @@ from nflprops.platform.immutable_bundle import (
 )
 from nflprops.platform.remote_checkpoint import (
     MODEL_FAILURE_RUN_CODES,
+    REFUSAL_INSUFFICIENT_STATE_UNIVERSE,
     REFUSAL_MISSING_REQUIRED_GAME_METADATA,
     RESULT_FILE,
     RESULT_SCHEMA_VERSION,
@@ -314,7 +315,10 @@ REFUSAL_EVIDENCE_SCHEMA = "nflprops.platform.checkpoint_refusal_evidence/v1"
 MAX_REFUSAL_EVIDENCE_BYTES = 256 * 1024
 
 #: Refusal codes that are only ever recorded WITH complete evidence.
-_EVIDENCE_REQUIRED_CODES = frozenset({REFUSAL_MISSING_REQUIRED_GAME_METADATA})
+_EVIDENCE_REQUIRED_CODES = frozenset({
+    REFUSAL_MISSING_REQUIRED_GAME_METADATA,
+    REFUSAL_INSUFFICIENT_STATE_UNIVERSE,
+})
 
 
 def _canonical_json(payload: Any) -> bytes:
@@ -349,6 +353,37 @@ def validate_refusal_evidence(refusal_code: str, evidence: dict[str, Any] | None
         assert isinstance(missing, list) and isinstance(incomplete, list)
         if not missing and not incomplete:
             raise ResultIngestError("MISSING_REQUIRED_GAME_METADATA evidence names no game")
+    if refusal_code == REFUSAL_INSUFFICIENT_STATE_UNIVERSE:
+        _validate_state_universe_evidence(evidence)
+
+
+def _validate_state_universe_evidence(evidence: dict[str, Any]) -> None:
+    """INSUFFICIENT_STATE_UNIVERSE evidence must prove ZERO generatable
+    outputs with known reasons, and record that no market table was read."""
+    from nflprops.platform.science_readiness import STATE_UNIVERSE_REASONS
+
+    if evidence.get("ready") is not False or evidence.get("generatable_output_count") != 0:
+        raise ResultIngestError(
+            "INSUFFICIENT_STATE_UNIVERSE evidence must show zero generatable outputs"
+        )
+    reasons = evidence.get("reasons")
+    if (
+        not isinstance(reasons, list)
+        or not reasons
+        or reasons != sorted(set(reasons))
+        or not set(reasons) <= STATE_UNIVERSE_REASONS
+    ):
+        raise ResultIngestError(
+            f"INSUFFICIENT_STATE_UNIVERSE evidence reasons must be a sorted, non-empty "
+            f"subset of {sorted(STATE_UNIVERSE_REASONS)}"
+        )
+    if evidence.get("market_tables_read") != []:
+        raise ResultIngestError(
+            "INSUFFICIENT_STATE_UNIVERSE evidence must show no market table was read"
+        )
+    teams = evidence.get("teams")
+    if not isinstance(teams, list) or not all(isinstance(t, dict) for t in teams):
+        raise ResultIngestError("INSUFFICIENT_STATE_UNIVERSE evidence teams must be a list")
 
 
 def _append_refusal_evidence(

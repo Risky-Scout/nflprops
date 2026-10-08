@@ -14,7 +14,7 @@ down-sampled artifact subset.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 
 import numpy as np
 import polars as pl
@@ -125,10 +125,10 @@ def _game_team_ids(simulation: GameSimulationResult) -> set[str]:
 
 
 def _selected_qb_k_ids(
-    simulation: GameSimulationResult, player_states: Mapping[str, PlayerState]
+    team_ids: Collection[str], player_states: Mapping[str, PlayerState]
 ) -> set[str]:
     """Real ``player_id``s the simulator's deterministic selector picks as
-    the starting QB / K for either team in this game.
+    the starting QB / K for either of the game's teams.
 
     Uses the same shared `selected_starter_id` the simulator now calls, on
     the same canonically ordered (sorted by ``player_id``) active roster
@@ -136,7 +136,6 @@ def _selected_qb_k_ids(
     ``__OTHER__`` / ``__QB__`` fillers are never QB/K starter candidates
     here, so a team with no active real QB simply yields no selected QB.
     """
-    team_ids = _game_team_ids(simulation)
     roster_by_team: dict[str, list[PlayerState]] = {}
     for state in player_states.values():
         if state.team_id in team_ids and not state.player_id.startswith("__"):
@@ -157,6 +156,62 @@ def _selected_qb_k_ids(
     return selected
 
 
+#: Why a `PlayerState` is NOT an eligible projection player (Phase 7A), in
+#: rule order. `None` from `player_ineligibility_reason` means eligible.
+INELIGIBLE_NOT_GAME_TEAM = "NOT_GAME_TEAM"
+INELIGIBLE_SYNTHETIC = "SYNTHETIC"
+INELIGIBLE_INACTIVE = "INACTIVE"
+INELIGIBLE_NO_MODELED_OPPORTUNITY = "NO_MODELED_OPPORTUNITY"
+
+
+def player_ineligibility_reason(
+    state: PlayerState, *, team_ids: Collection[str], selected_qb_k: Collection[str]
+) -> str | None:
+    """The ONE Phase-7A eligibility rule, per player: `None` when eligible,
+    otherwise the first rule it fails."""
+    if state.team_id not in team_ids:
+        return INELIGIBLE_NOT_GAME_TEAM
+    if state.player_id.startswith("__"):
+        return INELIGIBLE_SYNTHETIC
+    if not state.active:
+        return INELIGIBLE_INACTIVE
+    if not (
+        state.target_share > 0
+        or state.rush_share > 0
+        or state.player_id in selected_qb_k
+    ):
+        return INELIGIBLE_NO_MODELED_OPPORTUNITY
+    return None
+
+
+def player_eligibility(
+    team_ids: Collection[str], player_states: Mapping[str, PlayerState]
+) -> list[tuple[PlayerState, str | None]]:
+    """Every state with its Phase-7A ineligibility reason (`None` =
+    eligible), sorted by ``player_id``, decided BEFORE any simulation from
+    the game's two team ids (exactly the `team_id`s a
+    `GameSimulationResult` for the game carries). The projection build and
+    the pre-simulation science readiness gate both go through this one
+    function, so they can never disagree."""
+    selected = _selected_qb_k_ids(team_ids, player_states)
+    return sorted(
+        (
+            (state, player_ineligibility_reason(state, team_ids=team_ids, selected_qb_k=selected))
+            for state in player_states.values()
+        ),
+        key=lambda pair: pair[0].player_id,
+    )
+
+
+def eligible_player_states_for_teams(
+    team_ids: Collection[str], player_states: Mapping[str, PlayerState]
+) -> list[PlayerState]:
+    """`eligible_player_states` decided before any simulation."""
+    return [
+        state for state, reason in player_eligibility(team_ids, player_states) if reason is None
+    ]
+
+
 def eligible_player_states(
     simulation: GameSimulationResult, player_states: Mapping[str, PlayerState]
 ) -> list[PlayerState]:
@@ -169,25 +224,10 @@ def eligible_player_states(
     values, ``PlayerState.opportunities`` (dead), quotes, vendors,
     popularity, or any position heuristic beyond the existing QB/K
     allocation. Synthetic ``__OTHER__`` / ``__QB__`` rows are excluded.
-    Returned sorted by ``player_id``.
+    Returned sorted by ``player_id``. The simulation contributes only the
+    game's team ids (`eligible_player_states_for_teams`).
     """
-    team_ids = _game_team_ids(simulation)
-    selected = _selected_qb_k_ids(simulation, player_states)
-
-    eligible: list[PlayerState] = []
-    for state in player_states.values():
-        if state.team_id not in team_ids or state.player_id.startswith("__"):
-            continue
-        if not state.active:
-            continue
-        if (
-            state.target_share > 0
-            or state.rush_share > 0
-            or state.player_id in selected
-        ):
-            eligible.append(state)
-    eligible.sort(key=lambda state: state.player_id)
-    return eligible
+    return eligible_player_states_for_teams(_game_team_ids(simulation), player_states)
 
 
 def build_player_game_projections(

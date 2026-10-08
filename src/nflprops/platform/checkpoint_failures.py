@@ -55,13 +55,16 @@ WORKFLOW_FAILURE_CODES: frozenset[str] = frozenset({
 #: PR #21: model code failed unexpectedly inside the flow (executor exit 5).
 #: Logged here, never COMPLETED and never NOT_EXECUTABLE: the request stays
 #: pending, but -- unlike an operational failure -- a blind retry of the
-#: same code cannot be expected to succeed (class MODEL_FAILURE).
+#: same code cannot be expected to succeed (class MODEL_FAILURE). The record
+#: carries the executor's `science_sha`, which quarantines the request for
+#: that exact science/code identity (`model_failure_quarantine`).
 MODEL_FAILURE_CODES: frozenset[str] = frozenset({MODEL_EXECUTION_FAILED})
 OPERATIONAL_FAILURE_CODES: frozenset[str] = (
     OPERATIONAL_REFUSAL_CODES | WORKFLOW_FAILURE_CODES | MODEL_FAILURE_CODES
 )
 
 _RUN_ID = re.compile(r"[0-9a-f]{64}")
+_SCIENCE_SHA = re.compile(r"[0-9a-f]{40}")
 _WORKFLOW_RUN = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/actions/runs/\d+")
 
 
@@ -80,9 +83,14 @@ def record_operational_failure(
     run_id: str,
     workflow_run: str,
     failure_code: str,
+    science_sha: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Append one operational failure. Never changes any request or run."""
+    """Append one operational failure. Never changes any request or run.
+
+    `science_sha` (the executor's 40-hex git commit) is MANDATORY for
+    MODEL_EXECUTION_FAILED -- it is the identity the request is quarantined
+    under -- and recorded when given for any other code."""
     if not _RUN_ID.fullmatch(run_id):
         raise OperationalFailureError("run_id must be 64 hex")
     if not _WORKFLOW_RUN.fullmatch(workflow_run):
@@ -91,6 +99,13 @@ def record_operational_failure(
         raise OperationalFailureError(
             f"{failure_code!r} is not an operational failure code "
             f"({sorted(OPERATIONAL_FAILURE_CODES)})"
+        )
+    if science_sha is not None and not _SCIENCE_SHA.fullmatch(science_sha):
+        raise OperationalFailureError("science_sha must be a 40-hex git commit SHA")
+    if failure_code in MODEL_FAILURE_CODES and science_sha is None:
+        raise OperationalFailureError(
+            f"{failure_code} must be recorded with the executor's science_sha "
+            "(the identity the request is quarantined under)"
         )
     requests = _read_requests(warehouse)
     rows = requests.filter(requests["run_id"] == run_id) if requests.height else requests
@@ -103,6 +118,7 @@ def record_operational_failure(
             MODEL_FAILURE_CLASS if failure_code in MODEL_FAILURE_CODES else "OPERATIONAL"
         ),
         "failure_code": failure_code,
+        "science_sha": science_sha,
         "request_state": rows["state"][0] if rows.height else None,
     }
     path = operational_failures_path(layout)

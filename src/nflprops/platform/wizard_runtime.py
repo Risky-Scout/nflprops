@@ -634,10 +634,14 @@ def checkpoint_executable() -> None:
     execution gate, oldest cutoff first, each with the identity GitHub
     must verify and -- if a result bundle for it is already published
     (an earlier executor died before ingest) -- that bundle's manifest
-    SHA-256, so the executor resumes ingest instead of re-executing."""
+    SHA-256, so the executor resumes ingest instead of re-executing. Each
+    row also lists its active MODEL_EXECUTION_FAILED quarantines
+    (`model_failure_quarantine`: science SHA + failing workflow run); the
+    GitHub selector never picks a request quarantined for its own SHA."""
     import json
 
     from nflprops.platform.immutable_bundle import read_manifest
+    from nflprops.platform.model_failure_quarantine import active_quarantines
     from nflprops.platform.result_ingest import result_bundle_id
 
     layout = _layout()
@@ -648,6 +652,7 @@ def checkpoint_executable() -> None:
     from nflprops.platform.checkpoint_prepare import executable_requests
 
     rows = []
+    quarantines = active_quarantines(layout)
     frame = executable_requests(Warehouse(layout.warehouse_root))
     for row in frame.sort("scheduled_as_of").iter_rows(named=True):
         published = layout.publications / result_bundle_id(row["run_id"])
@@ -664,7 +669,12 @@ def checkpoint_executable() -> None:
                 "scheduled_as_of", "kickoff_at", "request_bundle_sha256",
                 "snapshot_id", "snapshot_manifest_sha256", "data_manifest_sha256",
             )
-        } | {"published_result_manifest_sha256": published_sha})
+        } | {
+            "published_result_manifest_sha256": published_sha,
+            "model_failure_quarantine": [
+                q.as_dict() for q in quarantines.get(row["run_id"], [])
+            ],
+        })
     typer.echo(json.dumps(rows, indent=2, sort_keys=True, default=str))
 
 
@@ -733,10 +743,14 @@ def checkpoint_operational_failure(
     run_id: str = typer.Option(..., help="The request's run_id (64 hex)."),
     workflow_run: str = typer.Option(..., help="URL of the GitHub run that failed."),
     failure_code: str = typer.Option(..., help="Operational failure code (checkpoint_failures)."),
+    science_sha: str = typer.Option(
+        "", help="The executor's 40-hex science SHA (mandatory for MODEL_EXECUTION_FAILED)."
+    ),
 ) -> None:
     """WIZARD SIDE: append one OPERATIONAL execution failure to the
     operational failure log. Never changes the request or its run: the
-    request stays scientifically pending."""
+    request stays scientifically pending. A MODEL_EXECUTION_FAILED record
+    (with its science SHA) quarantines the request for that SHA."""
     import json
 
     from nflprops.data.warehouse import Warehouse
@@ -750,11 +764,53 @@ def checkpoint_operational_failure(
         record = record_operational_failure(
             layout, Warehouse(layout.warehouse_root),
             run_id=run_id, workflow_run=workflow_run, failure_code=failure_code,
+            science_sha=science_sha or None,
         )
     except OperationalFailureError as exc:
         typer.echo(f"FAILED: {exc}", err=True)
         raise typer.Exit(1) from exc
     typer.echo(json.dumps(record, sort_keys=True))
+
+
+@checkpoint_app.command("release-model-failure")
+def checkpoint_release_model_failure(
+    run_id: str = typer.Option(..., help="The quarantined pending request's run_id (64 hex)."),
+    science_sha: str = typer.Option(..., help="The science SHA it is quarantined under."),
+    failure_workflow_run: str = typer.Option(
+        ..., help="URL of the GitHub run whose MODEL_EXECUTION_FAILED is released."
+    ),
+    incident_id: str = typer.Option(..., help="Incident id authorising the release (INC-...)."),
+) -> None:
+    """WIZARD SIDE: audited manual release of ONE MODEL_EXECUTION_FAILED
+    quarantine (`model_failure_quarantine`). Appends a release record; the
+    failure history is kept; the request stays PENDING_REMOTE_EXECUTION and
+    nothing is recorded as science -- a new execution must still succeed
+    and be ingested before the request can ever be COMPLETED."""
+    import json
+    from datetime import UTC, datetime
+
+    from nflprops.data.warehouse import Warehouse
+    from nflprops.platform.model_failure_quarantine import (
+        QuarantineError,
+        release_model_failure_quarantine,
+    )
+    from nflprops.platform.runtime_layout import running_release_sha
+
+    layout = _layout()
+    try:
+        record = release_model_failure_quarantine(
+            layout, Warehouse(layout.warehouse_root),
+            run_id=run_id, science_sha=science_sha,
+            failure_workflow_run=failure_workflow_run, incident_id=incident_id,
+            released_by_release_sha=running_release_sha(), now=datetime.now(UTC),
+        )
+    except QuarantineError as exc:
+        typer.echo(f"FAILED: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(
+        "QUARANTINE_RELEASED (not a result; request stays PENDING_REMOTE_EXECUTION): "
+        + json.dumps(record, sort_keys=True)
+    )
 
 
 @checkpoint_app.command("repair-false-refusal")
@@ -948,12 +1004,14 @@ def execute_checkpoint_cmd(
 
     Exit 3 = a SCIENTIFIC, deterministic verification refusal (the only
     case the workflow may record NOT_EXECUTABLE) -- including the
-    pre-simulation science readiness gate (MISSING_REQUIRED_GAME_METADATA);
+    pre-simulation science readiness gates (MISSING_REQUIRED_GAME_METADATA,
+    INSUFFICIENT_STATE_UNIVERSE);
     exit 4 = an OPERATIONAL verification refusal (executor/environment/
     config-runtime mismatch: the request stays pending); exit 5 = model code
-    failed unexpectedly inside the flow (MODEL_EXECUTION_FAILED: no result
-    files, never COMPLETED, the request stays pending for a reviewed
-    re-execution); exit 1 = any other (possibly transient) failure. Exits
+    failed unexpectedly -- inside the flow or while the readiness gate built
+    the PIT model state (MODEL_EXECUTION_FAILED: no result files, never
+    COMPLETED, the request stays pending, quarantined for this science
+    SHA); exit 1 = any other (possibly transient) failure. Exits
     3, 4 and 5 write `--refusal-file` (class, code, message[, evidence])."""
     import json
     import os

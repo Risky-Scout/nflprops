@@ -471,12 +471,23 @@ def test_execute_cli_exits_5_and_the_request_stays_pending(
         refuse_request(ready["warehouse"], ready["prepared"].run_id,
                        refusal_code=refusal["refusal_code"], detail="x",
                        lock_path=ready["layout"].writer_lock)
-    # ... it is logged with its own class and the request stays pending.
+    # ... it is logged with its own class, under the executor's science
+    # SHA (mandatory: it is the quarantine identity), and the request stays
+    # pending.
+    from nflprops.platform.checkpoint_failures import OperationalFailureError
+
+    with pytest.raises(OperationalFailureError, match="science_sha"):
+        record_operational_failure(
+            ready["layout"], ready["warehouse"], run_id=ready["prepared"].run_id,
+            workflow_run=WORKFLOW_URL, failure_code="MODEL_EXECUTION_FAILED",
+        )
     record = record_operational_failure(
         ready["layout"], ready["warehouse"], run_id=ready["prepared"].run_id,
         workflow_run=WORKFLOW_URL, failure_code="MODEL_EXECUTION_FAILED",
+        science_sha="b" * 40,
     )
     assert record["failure_class"] == "MODEL_FAILURE"
+    assert record["science_sha"] == "b" * 40
     assert read_operational_failures(ready["layout"])[-1]["failure_code"] == (
         "MODEL_EXECUTION_FAILED"
     )

@@ -43,10 +43,19 @@
 #                          EVIDENCE_B64 (mandatory for
 #                          MISSING_REQUIRED_GAME_METADATA) is appended in full
 #                          to state/checkpoint_refusal_evidence.jsonl.
-#   checkpoint-operational-failure RUN_ID WORKFLOW_RUN_URL FAILURE_CODE
+#   checkpoint-operational-failure RUN_ID WORKFLOW_RUN_URL FAILURE_CODE [SCIENCE_SHA]
 #                          BLOCK 4: append one OPERATIONAL execution failure
 #                          to state/checkpoint_execute_operational_failures.jsonl;
-#                          never changes the request (stays pending)
+#                          never changes the request (stays pending). PR #21:
+#                          SCIENCE_SHA (40 hex; mandatory for
+#                          MODEL_EXECUTION_FAILED) quarantines the request
+#                          for that science SHA
+#   checkpoint-release-model-failure RUN_ID SCIENCE_SHA FAILURE_WORKFLOW_RUN_URL INCIDENT_ID
+#                          PR #21: audited manual release of ONE
+#                          MODEL_EXECUTION_FAILED quarantine (appends to
+#                          state/checkpoint_model_failure_releases.jsonl;
+#                          failure history kept; request stays pending;
+#                          never a result)
 #   checkpoint-repair-false-refusal RUN_ID INCIDENT_ID
 #                          BLOCK 4: audited remediation of ONE pinned false
 #                          NOT_EXECUTABLE refusal (refusal_repair); refuses
@@ -555,12 +564,25 @@ main() {
         || die "checkpoint refuse failed"
       ;;
     checkpoint-operational-failure)
-      [ "$#" -eq 3 ] || die "checkpoint-operational-failure needs RUN_ID WORKFLOW_RUN_URL FAILURE_CODE"
+      { [ "$#" -eq 3 ] || [ "$#" -eq 4 ]; } || die "checkpoint-operational-failure needs RUN_ID WORKFLOW_RUN_URL FAILURE_CODE [SCIENCE_SHA]"
       [[ "$1" =~ ^[0-9a-f]{64}$ ]] || die "run_id format"
       [[ "$2" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+$ ]] || die "workflow run url format"
       [[ "$3" =~ ^[A-Z][A-Z_]{2,63}$ ]] || die "failure code format"
+      science_sha="${4:-}"
+      [ -z "$science_sha" ] || [[ "$science_sha" =~ ^[0-9a-f]{40}$ ]] || die "science sha format"
       runtime_python -m nflprops.platform.wizard_runtime checkpoint operational-failure \
-        --run-id "$1" --workflow-run "$2" --failure-code "$3" || die "operational failure record failed"
+        --run-id "$1" --workflow-run "$2" --failure-code "$3" --science-sha "$science_sha" \
+        || die "operational failure record failed"
+      ;;
+    checkpoint-release-model-failure)
+      [ "$#" -eq 4 ] || die "checkpoint-release-model-failure needs RUN_ID SCIENCE_SHA FAILURE_WORKFLOW_RUN_URL INCIDENT_ID"
+      [[ "$1" =~ ^[0-9a-f]{64}$ ]] || die "run_id format"
+      [[ "$2" =~ ^([0-9a-f]{40}|UNKNOWN)$ ]] || die "science sha format"
+      [[ "$3" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+$ ]] || die "workflow run url format"
+      [[ "$4" =~ ^INC-[A-Za-z0-9-]{1,80}$ ]] || die "incident id format"
+      runtime_python -m nflprops.platform.wizard_runtime checkpoint release-model-failure \
+        --run-id "$1" --science-sha "$2" --failure-workflow-run "$3" --incident-id "$4" \
+        || die "model-failure quarantine release failed"
       ;;
     checkpoint-repair-false-refusal)
       [ "$#" -eq 2 ] || die "checkpoint-repair-false-refusal needs RUN_ID INCIDENT_ID"

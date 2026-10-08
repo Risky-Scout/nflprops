@@ -13,6 +13,20 @@ simulation, from exactly the PIT universe the state build will see
 `build_state_provenance_context`), and it is a SCIENTIFIC refusal
 (`MISSING_REQUIRED_GAME_METADATA`) carrying every missing id as evidence.
 
+PR #21 (second gate): a snapshot can carry complete metadata for an EMPTY
+state universe (no PIT stats at all) and pass the first gate vacuously,
+only to end GAME_NOT_MODELED after a full execution. `check_state_universe`
+builds the exact PIT football state the model simulates from
+(`pipelines.pregame.build_pit_model_state` -- never a market table) and
+applies the model's own pre-simulation rules: the game is modeled only when
+it is PIT-visible and both teams have learned structural state
+(`pipelines.pregame.missing_game_team_states`), and each eligible player
+(`projections.eligible_player_states_for_teams`, Phase 7A) yields one output
+per supported registry stat. Zero generatable outputs is a SCIENTIFIC
+refusal (`INSUFFICIENT_STATE_UNIVERSE`) -- no league-wide minimum of games,
+rows or players is invented here, and sportsbook lines/prices never decide
+it.
+
 Read-only: nothing here writes to any warehouse.
 """
 
@@ -22,7 +36,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import polars as pl
 
@@ -32,7 +46,34 @@ from nflprops.backtest.provenance import (
 )
 from nflprops.data.warehouse import Warehouse
 
+if TYPE_CHECKING:
+    from nflprops.state.player import PlayerStateConfig
+    from nflprops.state.team import TeamStateConfig
+
 READINESS_SCHEMA_VERSION = "nflprops.platform.science_readiness/v1"
+STATE_UNIVERSE_SCHEMA_VERSION = "nflprops.platform.science_readiness.state_universe/v1"
+
+#: The scientific refusal when the immutable snapshot's PIT state lets the
+#: model generate zero supported player-prop outputs for the game.
+INSUFFICIENT_STATE_UNIVERSE = "INSUFFICIENT_STATE_UNIVERSE"
+
+#: Why zero outputs are generatable (sorted into the evidence). Each is a
+#: pre-simulation skip condition the prediction path itself applies.
+REASON_TARGET_GAME_NOT_PIT_VISIBLE = "TARGET_GAME_NOT_PIT_VISIBLE"  # GAME_NOT_FOUND
+REASON_TEAM_STATE_MISSING = "TEAM_STATE_MISSING"  # GAME_NOT_MODELED
+REASON_NO_ELIGIBLE_PLAYERS = "NO_ELIGIBLE_PLAYERS"  # zero Phase-7A players
+STATE_UNIVERSE_REASONS: frozenset[str] = frozenset({
+    REASON_TARGET_GAME_NOT_PIT_VISIBLE,
+    REASON_TEAM_STATE_MISSING,
+    REASON_NO_ELIGIBLE_PLAYERS,
+})
+
+#: The PIT tables `build_pit_model_state` reads -- football state only. No
+#: game-odds or player-prop quote table is ever read by this gate.
+STATE_UNIVERSE_TABLES = (
+    "games", "player_game_stats", "team_game_stats", "players",
+    "roster_snapshots", "injury_snapshots", "collector_resource_runs",
+)
 
 #: The only tables the gate reads: the state-game universe is defined by
 #: PIT player/team stat rows and proven by PIT `games` rows.
@@ -122,4 +163,199 @@ def check_science_readiness(
         # build_state_provenance_context refuses ANY PIT game whose latest
         # row lacks season/week (state game or not), so every one counts.
         incomplete_game_ids=universe.incomplete_game_ids,
+    )
+
+
+@dataclass(frozen=True)
+class TeamEligibilityCensus:
+    """One game team's pre-simulation eligibility, from the model's rules."""
+
+    team_id: str
+    team_state_present: bool
+    player_state_count: int
+    #: Phase-7A ineligibility reason -> player count (sorted by reason).
+    ineligible_counts: tuple[tuple[str, int], ...]
+    eligible_player_ids: tuple[str, ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "team_id": self.team_id,
+            "team_state_present": self.team_state_present,
+            "player_state_count": self.player_state_count,
+            "ineligible_counts": dict(self.ineligible_counts),
+            "eligible_player_count": len(self.eligible_player_ids),
+            "eligible_player_ids": list(self.eligible_player_ids),
+        }
+
+
+@dataclass(frozen=True)
+class StateUniverseReadiness:
+    """Whether the model can generate at least one supported player-prop
+    output for `game_id` from the PIT football state at `state_as_of`."""
+
+    game_id: str
+    state_as_of: datetime
+    target_game_pit_visible: bool
+    home_team_id: str | None
+    away_team_id: str | None
+    team_state_count: int
+    player_state_count: int
+    teams: tuple[TeamEligibilityCensus, ...]
+    supported_stat_count: int
+
+    @property
+    def missing_team_state_ids(self) -> tuple[str, ...]:
+        return tuple(t.team_id for t in self.teams if not t.team_state_present)
+
+    @property
+    def eligible_player_count(self) -> int:
+        return sum(len(t.eligible_player_ids) for t in self.teams)
+
+    @property
+    def game_modeled(self) -> bool:
+        return self.target_game_pit_visible and not self.missing_team_state_ids
+
+    @property
+    def generatable_output_count(self) -> int:
+        """Eligible players x supported registry stats, when the game is
+        modeled at all (otherwise the model simulates nothing)."""
+        if not self.game_modeled:
+            return 0
+        return self.eligible_player_count * self.supported_stat_count
+
+    @property
+    def reasons(self) -> tuple[str, ...]:
+        if not self.target_game_pit_visible:
+            return (REASON_TARGET_GAME_NOT_PIT_VISIBLE,)
+        found = set()
+        if self.missing_team_state_ids:
+            found.add(REASON_TEAM_STATE_MISSING)
+        if self.eligible_player_count == 0:
+            found.add(REASON_NO_ELIGIBLE_PLAYERS)
+        return tuple(sorted(found))
+
+    @property
+    def ready(self) -> bool:
+        return self.generatable_output_count > 0
+
+    @property
+    def refusal_code(self) -> str | None:
+        return None if self.ready else INSUFFICIENT_STATE_UNIVERSE
+
+    def message(self) -> str:
+        if self.ready:
+            return (
+                f"science-ready: {self.eligible_player_count} eligible players x "
+                f"{self.supported_stat_count} supported stats for game {self.game_id} at "
+                f"{self.state_as_of.isoformat()}"
+            )
+        return (
+            f"insufficient PIT state universe for game {self.game_id} at "
+            f"{self.state_as_of.isoformat()}: zero supported player-prop outputs are "
+            f"generatable ({', '.join(self.reasons)}; {self.team_state_count} team states, "
+            f"{self.player_state_count} player states, {self.eligible_player_count} eligible "
+            "players); simulation never started"
+        )
+
+    def evidence(self) -> dict[str, Any]:
+        """Complete, machine-readable, deterministically ordered evidence."""
+        return {
+            "schema_version": STATE_UNIVERSE_SCHEMA_VERSION,
+            "ready": self.ready,
+            "refusal_code": self.refusal_code,
+            "game_id": self.game_id,
+            "state_as_of": self.state_as_of.astimezone(UTC).isoformat(),
+            "eligibility_rule": (
+                "game PIT-visible AND both teams have learned state "
+                "(pipelines.pregame.missing_game_team_states); outputs = Phase-7A eligible "
+                "players (projections.eligible_player_states_for_teams) x supported "
+                "registry stats (projections.REGISTRY)"
+            ),
+            "market_tables_read": [],
+            "state_tables_read": list(STATE_UNIVERSE_TABLES),
+            "target_game_pit_visible": self.target_game_pit_visible,
+            "home_team_id": self.home_team_id,
+            "away_team_id": self.away_team_id,
+            "team_state_count": self.team_state_count,
+            "player_state_count": self.player_state_count,
+            "missing_team_state_ids": list(self.missing_team_state_ids),
+            "teams": [t.as_dict() for t in self.teams],
+            "eligible_player_count": self.eligible_player_count,
+            "supported_stat_count": self.supported_stat_count,
+            "generatable_output_count": self.generatable_output_count,
+            "reasons": list(self.reasons),
+        }
+
+
+def check_state_universe(
+    warehouse: Warehouse,
+    *,
+    season: int,
+    week: int,
+    game_id: str,
+    scheduled_as_of: datetime,
+    model_version: str,
+    player_state_config: PlayerStateConfig | None,
+    team_state_config: TeamStateConfig | None,
+) -> StateUniverseReadiness:
+    """Evaluate the second gate exactly as `compute_game_prediction` would
+    build state for this checkpoint -- same tables, same PIT cutoff, same
+    configs, same skip rules -- WITHOUT simulating and without reading any
+    market table. Exceptions from the state build propagate (the caller
+    treats them as model-code failures, as the flow would)."""
+    from nflprops.pipelines.pregame import (
+        build_pit_model_state,
+        game_team_ids,
+        missing_game_team_states,
+    )
+    from nflprops.projections import REGISTRY_SIZE
+    from nflprops.projections.summarize import player_eligibility
+
+    state = build_pit_model_state(
+        warehouse,
+        season=season,
+        week=week,
+        as_of=scheduled_as_of,
+        model_version=model_version,
+        player_state_config=player_state_config,
+        team_state_config=team_state_config,
+        game_ids={game_id},
+    )
+    matches = (
+        state.current_games.filter(pl.col("canonical_game_id") == game_id)
+        if state is not None
+        else None
+    )
+    if state is None or matches is None or matches.is_empty():
+        return StateUniverseReadiness(
+            game_id=game_id, state_as_of=scheduled_as_of, target_game_pit_visible=False,
+            home_team_id=None, away_team_id=None, team_state_count=0, player_state_count=0,
+            teams=(), supported_stat_count=REGISTRY_SIZE,
+        )
+    game = matches.row(0, named=True)
+    team_ids = game_team_ids(game)
+    missing = set(missing_game_team_states(game, state.team_states))
+    by_team: dict[str, list[tuple[str, str | None]]] = {team: [] for team in team_ids}
+    for player, reason in player_eligibility(team_ids, state.player_states):
+        if player.team_id in by_team:
+            by_team[player.team_id].append((player.player_id, reason))
+    teams = []
+    for team_id in team_ids:
+        ineligible: dict[str, int] = {}
+        for _player_id, reason in by_team[team_id]:
+            if reason is not None:
+                ineligible[reason] = ineligible.get(reason, 0) + 1
+        teams.append(TeamEligibilityCensus(
+            team_id=team_id,
+            team_state_present=team_id not in missing,
+            player_state_count=len(by_team[team_id]),
+            ineligible_counts=tuple(sorted(ineligible.items())),
+            eligible_player_ids=tuple(p for p, reason in by_team[team_id] if reason is None),
+        ))
+    return StateUniverseReadiness(
+        game_id=game_id, state_as_of=scheduled_as_of, target_game_pit_visible=True,
+        home_team_id=team_ids[0], away_team_id=team_ids[1],
+        team_state_count=len(state.team_states),
+        player_state_count=len(state.player_states),
+        teams=tuple(teams), supported_stat_count=REGISTRY_SIZE,
     )

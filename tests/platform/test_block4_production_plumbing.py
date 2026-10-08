@@ -25,6 +25,7 @@ from nflprops.platform.stats_backfill import fetch_season_outcomes
 
 REPO = Path(__file__).resolve().parents[2]
 NOW = datetime(2026, 10, 4, 12, 0, tzinfo=UTC)
+SCIENCE_SHA = "9" * 40
 
 
 def _row(run: str, *, kickoff: datetime, cutoff: datetime, published: str | None = None) -> dict:
@@ -34,27 +35,32 @@ def _row(run: str, *, kickoff: datetime, cutoff: datetime, published: str | None
         "request_bundle_sha256": "b" * 64, "snapshot_id": "20261004T113000Z-0123456789ab",
         "snapshot_manifest_sha256": "c" * 64, "data_manifest_sha256": "d" * 64,
         "published_result_manifest_sha256": published,
+        "model_failure_quarantine": [],
     }
 
 
 # ------------------------------------------------------------ selection
 
 
+def _select(rows: list[dict], run_id: str | None = None) -> dict | None:
+    return select_request(rows, run_id=run_id, now=NOW, science_sha=SCIENCE_SHA)
+
+
 def test_upcoming_kickoffs_first_then_the_oldest_backlog() -> None:
     stale = _row("a", kickoff=NOW - timedelta(days=9), cutoff=NOW - timedelta(days=9, minutes=30))
     later = _row("b", kickoff=NOW + timedelta(hours=8), cutoff=NOW - timedelta(hours=1))
     soon = _row("c", kickoff=NOW + timedelta(minutes=40), cutoff=NOW + timedelta(minutes=10))
-    assert select_request([stale, later, soon], run_id=None, now=NOW)["run_id"] == "c" * 64
-    assert select_request([stale, later], run_id=None, now=NOW)["run_id"] == "b" * 64
-    assert select_request([stale], run_id=None, now=NOW)["run_id"] == "a" * 64
-    assert select_request([], run_id=None, now=NOW) is None
+    assert _select([stale, later, soon])["run_id"] == "c" * 64
+    assert _select([stale, later])["run_id"] == "b" * 64
+    assert _select([stale])["run_id"] == "a" * 64
+    assert _select([]) is None
 
 
 def test_explicit_run_must_be_executable() -> None:
     row = _row("a", kickoff=NOW, cutoff=NOW)
-    assert select_request([row], run_id="a" * 64, now=NOW)["run_id"] == "a" * 64
+    assert _select([row], run_id="a" * 64)["run_id"] == "a" * 64
     with pytest.raises(SelectionError, match="not an executable"):
-        select_request([row], run_id="f" * 64, now=NOW)
+        _select([row], run_id="f" * 64)
 
 
 @pytest.mark.parametrize(
@@ -65,7 +71,7 @@ def test_explicit_run_must_be_executable() -> None:
 def test_malformed_host_values_never_reach_a_shell(field: str, bad: str) -> None:
     row = {**_row("a", kickoff=NOW, cutoff=NOW), field: bad}
     with pytest.raises(SelectionError):
-        select_request([row], run_id=None, now=NOW)
+        _select([row])
 
 
 def test_outputs_resume_a_published_bundle(tmp_path: Path) -> None:
@@ -77,7 +83,8 @@ def test_outputs_resume_a_published_bundle(tmp_path: Path) -> None:
     listing = tmp_path / "executable.json"
     listing.write_text(json.dumps([row]))
     gh = tmp_path / "gh_output"
-    assert main(["--executable-json", str(listing), "--github-output", str(gh)]) == 0
+    assert main(["--executable-json", str(listing), "--github-output", str(gh),
+                 "--science-sha", SCIENCE_SHA]) == 0
     assert "found=true" in gh.read_text()
     assert f"published_sha256={'e' * 64}" in gh.read_text()
 

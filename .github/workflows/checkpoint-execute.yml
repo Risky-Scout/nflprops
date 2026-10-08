@@ -25,9 +25,12 @@ name: Checkpoint Execute (BLOCK 4)
 #   exit 3  SCIENTIFIC verification refusal (pre-cutoff evidence gate,
 #           RESEARCH_ONLY evidence, corrupt immutable request/snapshot
 #           identity, non-production draws, and -- PR #21 -- the
-#           pre-simulation science readiness gate:
+#           pre-simulation science readiness gates:
 #           MISSING_REQUIRED_GAME_METADATA, with every missing game id as
-#           evidence) -> recorded NOT_EXECUTABLE with its refusal code and
+#           evidence, then INSUFFICIENT_STATE_UNIVERSE -- zero supported
+#           player-prop outputs generatable from the PIT football state,
+#           with the eligibility census as evidence; never decided from
+#           sportsbook data) -> recorded NOT_EXECUTABLE with its refusal code and
 #           complete evidence, so it never blocks the queue;
 #   exit 4  OPERATIONAL verification refusal (executor/environment or
 #           config-runtime mismatch, unsupported schema/hash version, PIT
@@ -36,9 +39,13 @@ name: Checkpoint Execute (BLOCK 4)
 #           ingest) -> recorded as an operational failure ONLY; the request
 #           stays PENDING_REMOTE_EXECUTION and the job fails visibly.
 #   exit 5  MODEL_EXECUTION_FAILED (PR #21): model code failed unexpectedly
-#           inside the flow. No result bundle is built, published or
-#           ingested (never COMPLETED); logged with class MODEL_FAILURE; the
-#           request stays pending for a reviewed re-execution after a fix.
+#           inside the flow (or while the readiness gate built its PIT model
+#           state). No result bundle is built, published or ingested (never
+#           COMPLETED); logged with class MODEL_FAILURE and this run's
+#           science SHA ($GITHUB_SHA). The request stays pending but is
+#           QUARANTINED for that SHA: selection skips it until the science
+#           SHA changes or `ops.sh checkpoint-release-model-failure`
+#           releases it (audited; failure history kept).
 # NOT_EXECUTABLE is never a generic failure state.
 #
 # Triggers: workflow_dispatch (optionally an explicit run_id), and a
@@ -124,6 +131,7 @@ jobs:
           python -m nflprops.platform.checkpoint_select \
             --executable-json "$RUNNER_TEMP/executable.json" \
             --run-id "$RUN_ID" \
+            --science-sha "$GITHUB_SHA" \
             --github-output "$GITHUB_OUTPUT"
 
       - name: Download + verify the immutable request bundle and snapshot
@@ -315,7 +323,7 @@ jobs:
           # shellcheck disable=SC2086
           ssh $SSH_OPTS "$REMOTE" bash -s -- checkpoint-operational-failure "$RUNTIME_ROOT" \
             "$RUN_ID" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            "$code" < deploy/wizard/ops.sh
+            "$code" "$GITHUB_SHA" < deploy/wizard/ops.sh
 
       - name: Report
         if: always()
