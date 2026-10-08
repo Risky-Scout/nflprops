@@ -12,23 +12,27 @@ This module never:
 * runs a second, simplified, or approximate simulation -- one
   `GameSimulationResult` per game, from the certified pregame path;
 * introduces realized-outcome information into simulation inputs -- state
-  is built only from data with `available_at <= as_of` (the game's own
-  kickoff), via the same `filter_pit` gate the live pipeline uses;
+  is built under `EvidenceMode.HISTORICAL_WALK_FORWARD`
+  (`nflprops.features.historical_evidence`): completed-game stats enter
+  only when their slate precedes the target's slate (event chronology,
+  never NFLProps' 2026 import date and never a `kickoff + lag` estimate),
+  and pregame observations (rosters, injuries, game odds) only with a
+  genuine availability time at or before `as_of` -- the LIVE_PIT rule;
 * fabricates a label for an unlabeled (PBP-gated) PropType -- only
   `nflprops.calibration.artifact.DIRECTLY_LABELED_PROP_TYPES` are ever
   scored, via the SAME settlement rules
   (`nflprops.market.rules`/`nflprops.pipelines.settle`) production
   settlement uses;
 * fabricates PIT faithfulness -- `LabeledGame.injury_data_available`
-  comes from the real `nflprops.backtest.provenance.
-  build_state_provenance_context` / `injury_feed_available_at` mechanism,
-  never hardcoded.
+  comes from the real `nflprops.data.injury_availability.
+  injury_feed_available_at` mechanism (the one
+  `build_state_provenance_context` uses), never hardcoded.
 
 `as_of` is each game's own kickoff time (`games.date`), matching the T30M
-production checkpoint's spirit (the latest possible pregame cutoff) while
-remaining strictly PIT-safe: a game's OWN `player_game_stats` row is never
-visible at its own kickoff (its `available_at` is always later -- the
-stats are ingested after the game finishes).
+production checkpoint's spirit (the latest possible pregame cutoff). A
+game's OWN stats are never visible to it (same slate, and excluded by id);
+they are its labels, and enter history for later slates at its slate
+boundary (`LabeledGame.outcome_available_at`).
 """
 
 from __future__ import annotations
@@ -42,10 +46,18 @@ from typing import TYPE_CHECKING
 
 import polars as pl
 
-from nflprops.backtest.provenance import build_state_provenance_context
 from nflprops.calibration.artifact import DIRECTLY_LABELED_PROP_TYPES
 from nflprops.calibration.challenger import LabeledGame, PropLabel
+from nflprops.data.injury_availability import injury_feed_available_at
 from nflprops.domain.enums import PropType
+from nflprops.features.historical_evidence import (
+    EVENT_CHRONOLOGY_COL,
+    EvidenceMode,
+    build_slate_chronology,
+    certify_event_derived,
+    certify_pregame_observations,
+    schedule_identity,
+)
 from nflprops.market.rules import (
     SettlementRuleError,
     SettlementRuleSet,
@@ -59,6 +71,9 @@ from nflprops.state.team import TeamStateConfig, build_team_states
 
 if TYPE_CHECKING:
     from nflprops.data.storage.base import StorageBackend
+
+#: Historical replay's only evidence mode; recorded in the 10C3A report.
+EVIDENCE_MODE = EvidenceMode.HISTORICAL_WALK_FORWARD
 
 _REQUIRED_WAREHOUSE_TABLES: tuple[str, ...] = (
     "games",
@@ -218,30 +233,47 @@ def build_labeled_game(
     injury_runs = loaded.injury_runs
     game_odds = loaded.game_odds
 
+    # HISTORICAL_WALK_FORWARD: completed-game history by slate order (Class
+    # A); pregame observations by genuine availability only (Class B).
+    chronology = build_slate_chronology(games)
+    history_ps = certify_event_derived(
+        player_stats, chronology, target_game_id=game_id, as_of=as_of
+    )
+    history_ts = certify_event_derived(
+        team_stats, chronology, target_game_id=game_id, as_of=as_of
+    )
+    pregame_roster = certify_pregame_observations(roster, as_of=as_of)
+    pregame_injuries = certify_pregame_observations(injuries, as_of=as_of)
+    pregame_odds = certify_pregame_observations(
+        game_odds, as_of=as_of, time_col="collector_received_at"
+    )
+
     team_states = build_team_states(
-        team_stats, player_stats, as_of=as_of, strict=False,
+        history_ts, history_ps, as_of=as_of, strict=True,
         config=team_state_config or TeamStateConfig(),
+        history_time_col=EVENT_CHRONOLOGY_COL,
     )
     player_states = build_player_states(
-        player_stats, team_stats, players, as_of=as_of,
-        roster=roster if roster.height > 0 else None,
-        injuries=injuries if injuries.height > 0 else None,
-        strict=False, config=player_state_config or PlayerStateConfig(),
+        history_ps, history_ts, players, as_of=as_of,
+        roster=pregame_roster if pregame_roster.height > 0 else None,
+        injuries=pregame_injuries if pregame_injuries.height > 0 else None,
+        strict=True, config=player_state_config or PlayerStateConfig(),
+        history_time_col=EVENT_CHRONOLOGY_COL,
     )
 
     prepared = simulate_game_for_prediction(
-        game=game_row, team_states=team_states, player_states=player_states,
-        game_odds=game_odds, as_of=as_of, model_version=model_version,
+        game=schedule_identity(game_row), team_states=team_states,
+        player_states=player_states,
+        game_odds=pregame_odds, as_of=as_of, model_version=model_version,
         market_mode="live", simulation_config=simulation_config, n_draws=n_draws,
     )
     if prepared is None:
         return GameReplaySkip(game_id=game_id, reason="UNTRUSTWORTHY_TEAM_STRUCTURAL_STATE")
 
-    state_context = build_state_provenance_context(
-        games=games, player_stats=player_stats, team_stats=team_stats, players=players,
-        roster=roster, injuries=injuries, injury_runs=injury_runs,
-        as_of=as_of, model_version=model_version,
-    )
+    # Not `build_state_provenance_context`: it re-derives the state universe
+    # on the LIVE_PIT clock (`available_at`), which historical replay does
+    # not use. Only its injury-feed flag is needed, from the same mechanism.
+    injury_data_available = injury_feed_available_at(injury_runs, as_of=as_of)
 
     # Not every player with a real box-score line is part of the coherent
     # simulated player universe (e.g. a rarely-used player the eligibility
@@ -262,16 +294,14 @@ def build_labeled_game(
     if not labels:
         return GameReplaySkip(game_id=game_id, reason="NO_SCOREABLE_EVIDENCE")
 
-    outcome_available_at = this_game_stats["available_at"].max()
-    if outcome_available_at is None:
-        return GameReplaySkip(game_id=game_id, reason="NO_OUTCOME_AVAILABLE_AT")
-
+    # The label enters history for later targets at its slate boundary --
+    # event chronology, not the stats' (2026 or estimated) `available_at`.
     return LabeledGame(
         game_id=game_id,
         simulation=prepared.result,
         as_of=as_of,
-        outcome_available_at=_aware(outcome_available_at, field="outcome_available_at"),
-        injury_data_available=state_context.injury_data_available,
+        outcome_available_at=chronology.label_available_at(game_id),
+        injury_data_available=injury_data_available,
         labels=labels,
     )
 

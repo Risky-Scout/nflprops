@@ -75,6 +75,7 @@ from nflprops.calibration.diagnostics import (
 )
 from nflprops.calibration.entropy_tilting import softmax_weights
 from nflprops.calibration.historical_runner import (
+    EVIDENCE_MODE,
     compute_data_root_manifest_sha256,
     compute_training_manifest_sha256,
     list_final_games,
@@ -628,6 +629,7 @@ def run(config: RunnerConfig) -> dict[str, Any]:
     report: dict[str, Any] = {
         "phase": "10C3A",
         "mode": config.mode,
+        "evidence_mode": EVIDENCE_MODE.value,
         "n_draws": config.n_draws,
         "model_version": config.model_version,
         "data_root": str(config.data_root),

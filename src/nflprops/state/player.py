@@ -277,12 +277,16 @@ def build_player_states(
     injuries: pl.DataFrame | None = None,
     strict: bool = True,
     config: PlayerStateConfig | None = None,
+    history_time_col: str = "available_at",
 ) -> dict[str, PlayerState]:
+    """`history_time_col` is the clock of the game-stat history (see
+    `build_team_states`). Roster and injury snapshots are pregame
+    observations and always use genuine `available_at`."""
     if config is None:
         config = PlayerStateConfig()
 
-    ps = filter_pit(player_stats, as_of, strict=strict)
-    ts = filter_pit(team_stats, as_of, strict=strict)
+    ps = filter_pit(player_stats, as_of, strict=strict, time_col=history_time_col)
+    ts = filter_pit(team_stats, as_of, strict=strict, time_col=history_time_col)
     if ps.is_empty():
         return {}
 
@@ -373,9 +377,9 @@ def build_player_states(
         pp = priors.get(pos, priors.get("OTHER", {}))
         sp = pos_share.get(pos, {"target": 0.02, "rush": 0.01})
 
-        sub = sub.sort("available_at")
+        sub = sub.sort(history_time_col)
         weight_sets = _role_weight_sets(
-            sub["available_at"].to_list(),
+            sub[history_time_col].to_list(),
             as_of,
             config,
         )
