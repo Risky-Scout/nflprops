@@ -25,14 +25,19 @@ resumed by re-running the same ingest): artifact rows (natural keys,
 `remote_checkpoint_results` row carrying the PUBLIC_READY decision.
 
 Re-ingesting an already-installed bundle is a no-op; a DIFFERENT bundle
-for an already-completed run is refused. A crash at any point before the
+for an already-completed run is refused. A NEW bundle whose run FAILED
+with an unexpected model-code failure (`MODEL_FAILURE_RUN_CODES`) is
+refused: no science ran, so it is never installed as COMPLETED (results
+installed before PR #21 stay as audit history). A crash at any point before the
 final results row is resumed by re-running the same ingest, including
 after the request was already marked COMPLETED.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -59,6 +64,9 @@ from nflprops.platform.immutable_bundle import (
     verify_directory_against_manifest,
 )
 from nflprops.platform.remote_checkpoint import (
+    MODEL_FAILURE_RUN_CODES,
+    REFUSAL_INSUFFICIENT_STATE_UNIVERSE,
+    REFUSAL_MISSING_REQUIRED_GAME_METADATA,
     RESULT_FILE,
     RESULT_SCHEMA_VERSION,
     RESULT_TABLES,
@@ -224,6 +232,15 @@ def ingest_result_bundle(
         raise ResultIngestError(
             f"run {run_id} already has installed result {existing['bundle_manifest_sha256']}"
         )
+    if (
+        bundle_run["status"] == PredictionRunStatus.FAILED.value
+        and bundle_run.get("failure_code") in MODEL_FAILURE_RUN_CODES
+    ):
+        raise ResultIngestError(
+            f"bundle run FAILED with model failure {bundle_run.get('failure_code')!r}: no "
+            "science ran; refusing to install it as a COMPLETED result (the request stays "
+            "pending)"
+        )
     request = _check_live_request(warehouse, result, bundle_run)
 
     with WriterLock(lock_path, timeout_seconds=lock_timeout_seconds):
@@ -290,6 +307,109 @@ def _summary(result: dict[str, Any], bundle_id: str, manifest_sha: str) -> dict[
     }
 
 
+#: Append-only log (under the runtime `state/` dir) of the complete
+#: machine-readable evidence behind each SCIENTIFIC refusal; the run's
+#: `failure_detail` names the record by `evidence_sha256`.
+REFUSAL_EVIDENCE_FILE = "checkpoint_refusal_evidence.jsonl"
+REFUSAL_EVIDENCE_SCHEMA = "nflprops.platform.checkpoint_refusal_evidence/v1"
+MAX_REFUSAL_EVIDENCE_BYTES = 256 * 1024
+
+#: Refusal codes that are only ever recorded WITH complete evidence.
+_EVIDENCE_REQUIRED_CODES = frozenset({
+    REFUSAL_MISSING_REQUIRED_GAME_METADATA,
+    REFUSAL_INSUFFICIENT_STATE_UNIVERSE,
+})
+
+
+def _canonical_json(payload: Any) -> bytes:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def validate_refusal_evidence(refusal_code: str, evidence: dict[str, Any] | None) -> None:
+    """Fail closed on evidence that does not belong to `refusal_code`."""
+    if evidence is None:
+        if refusal_code in _EVIDENCE_REQUIRED_CODES:
+            raise ResultIngestError(f"{refusal_code} refusals must carry their evidence")
+        return
+    if not isinstance(evidence, dict):
+        raise ResultIngestError("refusal evidence must be a JSON object")
+    if len(_canonical_json(evidence)) > MAX_REFUSAL_EVIDENCE_BYTES:
+        raise ResultIngestError("refusal evidence is too large")
+    if evidence.get("refusal_code") != refusal_code:
+        raise ResultIngestError(
+            f"evidence refusal_code {evidence.get('refusal_code')!r} != {refusal_code!r}"
+        )
+    if refusal_code == REFUSAL_MISSING_REQUIRED_GAME_METADATA:
+        missing = evidence.get("missing_game_ids")
+        incomplete = evidence.get("incomplete_game_ids")
+        for name, ids, count in (
+            ("missing", missing, evidence.get("missing_game_count")),
+            ("incomplete", incomplete, evidence.get("incomplete_game_count")),
+        ):
+            if not isinstance(ids, list) or not all(isinstance(i, str) and i for i in ids):
+                raise ResultIngestError(f"evidence {name}_game_ids must be a list of ids")
+            if ids != sorted(set(ids)) or count != len(ids):
+                raise ResultIngestError(f"evidence {name}_game_ids are not exact/sorted/counted")
+        assert isinstance(missing, list) and isinstance(incomplete, list)
+        if not missing and not incomplete:
+            raise ResultIngestError("MISSING_REQUIRED_GAME_METADATA evidence names no game")
+    if refusal_code == REFUSAL_INSUFFICIENT_STATE_UNIVERSE:
+        _validate_state_universe_evidence(evidence)
+
+
+def _validate_state_universe_evidence(evidence: dict[str, Any]) -> None:
+    """INSUFFICIENT_STATE_UNIVERSE evidence must prove ZERO generatable
+    outputs with known reasons, and record that no market table was read."""
+    from nflprops.platform.science_readiness import STATE_UNIVERSE_REASONS
+
+    if evidence.get("ready") is not False or evidence.get("generatable_output_count") != 0:
+        raise ResultIngestError(
+            "INSUFFICIENT_STATE_UNIVERSE evidence must show zero generatable outputs"
+        )
+    reasons = evidence.get("reasons")
+    if (
+        not isinstance(reasons, list)
+        or not reasons
+        or reasons != sorted(set(reasons))
+        or not set(reasons) <= STATE_UNIVERSE_REASONS
+    ):
+        raise ResultIngestError(
+            f"INSUFFICIENT_STATE_UNIVERSE evidence reasons must be a sorted, non-empty "
+            f"subset of {sorted(STATE_UNIVERSE_REASONS)}"
+        )
+    if evidence.get("market_tables_read") != []:
+        raise ResultIngestError(
+            "INSUFFICIENT_STATE_UNIVERSE evidence must show no market table was read"
+        )
+    teams = evidence.get("teams")
+    if not isinstance(teams, list) or not all(isinstance(t, dict) for t in teams):
+        raise ResultIngestError("INSUFFICIENT_STATE_UNIVERSE evidence teams must be a list")
+
+
+def _append_refusal_evidence(
+    path: Path, *, run_id: str, refusal_code: str, detail: str, evidence: dict[str, Any],
+    now: datetime,
+) -> str:
+    evidence_sha = hashlib.sha256(_canonical_json(evidence)).hexdigest()
+    record = {
+        "schema_version": REFUSAL_EVIDENCE_SCHEMA,
+        "recorded_at": now.astimezone(UTC).isoformat(),
+        "run_id": run_id,
+        "refusal_code": refusal_code,
+        "detail": detail,
+        "evidence_sha256": evidence_sha,
+        "evidence": evidence,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, _canonical_json(record) + b"\n")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return evidence_sha
+
+
 def refuse_request(
     warehouse: Warehouse,
     run_id: str,
@@ -298,6 +418,9 @@ def refuse_request(
     detail: str,
     lock_path: Path,
     lock_timeout_seconds: float = 60.0,
+    evidence: dict[str, Any] | None = None,
+    evidence_log: Path | None = None,
+    now: datetime | None = None,
 ) -> str:
     """Record that the GitHub executor's verification SCIENTIFICALLY refused
     `run_id`: request PENDING_REMOTE_EXECUTION -> NOT_EXECUTABLE, run
@@ -306,12 +429,20 @@ def refuse_request(
     execution gate makes. Any `refusal_code` outside
     `SCIENTIFIC_REFUSAL_CODES` is refused before anything is read or
     written: NOT_EXECUTABLE is never a generic failure state. Idempotent; a
-    completed request is never touched."""
+    completed request is never touched.
+
+    `evidence` (validated by `validate_refusal_evidence`; mandatory for
+    MISSING_REQUIRED_GAME_METADATA) is appended in full to `evidence_log`
+    BEFORE the state change, and `failure_detail` gains
+    "; evidence_sha256=<sha>" naming that record."""
     if refusal_code not in SCIENTIFIC_REFUSAL_CODES:
         raise ResultIngestError(
             f"refusal code {refusal_code!r} is not a scientific refusal "
             f"({sorted(SCIENTIFIC_REFUSAL_CODES)}); the request stays pending"
         )
+    validate_refusal_evidence(refusal_code, evidence)
+    if evidence is not None and evidence_log is None:
+        raise ResultIngestError("refusal evidence given without an evidence log")
     with WriterLock(lock_path, timeout_seconds=lock_timeout_seconds):
         requests = _read_requests(warehouse).filter(pl.col("run_id") == run_id)
         if requests.height != 1:
@@ -321,6 +452,14 @@ def refuse_request(
             return "ALREADY_NOT_EXECUTABLE"
         if request["state"] != STATE_PENDING_REMOTE_EXECUTION:
             raise ResultIngestError(f"live request is {request['state']}; refusing to change it")
+        full_detail = f"{refusal_code}: {detail}"
+        if evidence is not None:
+            assert evidence_log is not None
+            evidence_sha = _append_refusal_evidence(
+                evidence_log, run_id=run_id, refusal_code=refusal_code, detail=detail,
+                evidence=evidence, now=now or datetime.now(UTC),
+            )
+            full_detail += f"; evidence_sha256={evidence_sha}"
         backend = as_run_store_backend(warehouse)
         run = get_run(backend, run_id)
         if run is not None and run.status is PredictionRunStatus.SCHEDULED:
@@ -329,7 +468,7 @@ def refuse_request(
                 run_id,
                 status=PredictionRunStatus.FAILED,
                 failure_code=FAILURE_REMOTE_EXECUTION_REFUSED,
-                failure_detail=f"{refusal_code}: {detail}",
+                failure_detail=full_detail,
             )
         _upsert_request(warehouse, {**request, "state": STATE_NOT_EXECUTABLE})
     return "NOT_EXECUTABLE"

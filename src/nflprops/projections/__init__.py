@@ -26,6 +26,7 @@ from nflprops.projections.stats import (
 from nflprops.projections.summarize import (
     build_player_game_projections,
     eligible_player_states,
+    eligible_player_states_for_teams,
     empirical_quantile,
     summarize_vector,
     validate_distribution_vector,
@@ -42,6 +43,7 @@ __all__ = [
     "StatSpec",
     "build_player_game_projections",
     "eligible_player_states",
+    "eligible_player_states_for_teams",
     "empirical_quantile",
     "summarize_vector",
     "validate_distribution_vector",

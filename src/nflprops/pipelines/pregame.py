@@ -12,7 +12,7 @@ orchestrates the two layers; its external behavior is unchanged.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime
 
 import polars as pl
@@ -184,6 +184,21 @@ def _assert_state_history_safe_for_games(
         )
 
 
+def game_team_ids(game: Mapping[str, object]) -> tuple[str, str]:
+    """(home, away) canonical team ids of one PIT-visible `games` row --
+    exactly the two `team_id`s its `GameSimulationResult` carries."""
+    return str(game["home_canonical_team_id"]), str(game["visitor_canonical_team_id"])
+
+
+def missing_game_team_states(
+    game: Mapping[str, object], team_states: Mapping[str, TeamState]
+) -> tuple[str, ...]:
+    """The game's team ids (home first) with no learned structural state.
+    Non-empty means the game is not modeled (`simulate_game_for_prediction`
+    returns None); shared with the pre-simulation science readiness gate."""
+    return tuple(team for team in game_team_ids(game) if team not in team_states)
+
+
 @dataclasses.dataclass(frozen=True)
 class PreparedGameSimulation:
     """One coherent `GameSimulationResult` bundled with the minimal
@@ -236,9 +251,8 @@ def simulate_game_for_prediction(
     always has (skip the game, produce no rows for it).
     """
     game_id = str(game["canonical_game_id"])
-    home_id = str(game["home_canonical_team_id"])
-    away_id = str(game["visitor_canonical_team_id"])
-    if home_id not in team_states or away_id not in team_states:
+    home_id, away_id = game_team_ids(game)
+    if missing_game_team_states(game, team_states):
         # Expansion/new-provider edge case: no team history means the structural
         # state is not yet trustworthy enough to publish a prop forecast.
         return None
@@ -315,39 +329,35 @@ def simulate_game_for_prediction(
 
 
 @dataclasses.dataclass(frozen=True)
-class _PreparedPredictionInputs:
-    """Every point-in-time input `predict_week`'s per-game loop consumes,
-    read from the warehouse exactly once. Extracted verbatim from
-    `predict_week`'s prologue so the official Phase-7D checkpoint path can
-    build the identical inputs for one game without duplicating the logic
-    or running a second pipeline."""
+class PitModelState:
+    """The PIT football state a prediction is built from: the PIT-visible
+    target games, the learned team/player states and the state-provenance
+    context. Built WITHOUT reading any market table (no game odds, no
+    player-prop quote), so the pre-simulation science readiness gate can
+    evaluate exactly the state the model will simulate from."""
 
     current_games: pl.DataFrame
     team_states: dict[str, TeamState]
     player_states: dict[str, PlayerState]
     state_context: StateProvenanceContext
-    latest_quotes: pl.DataFrame
-    game_odds: pl.DataFrame
     roster: pl.DataFrame
     injuries: pl.DataFrame
 
 
-def _prepare_prediction_inputs(
+def build_pit_model_state(
     warehouse: Warehouse,
     *,
     season: int,
     week: int,
     as_of: datetime,
     model_version: str,
-    market_mode: str,
     player_state_config: PlayerStateConfig | None,
     team_state_config: TeamStateConfig | None,
     game_ids: set[str] | None,
-    state_context_callback: Callable[[StateProvenanceContext], None] | None,
-) -> _PreparedPredictionInputs | None:
-    """Read the warehouse once and build the PIT-visible target games, the
-    learned team/player states, the state-provenance context, and the
-    latest prop quotes.
+    state_context_callback: Callable[[StateProvenanceContext], None] | None = None,
+) -> PitModelState | None:
+    """Read the PIT football tables once and build the target games, the
+    state-provenance context, and the learned team/player states.
 
     Returns ``None`` -- with no state built and `state_context_callback`
     never fired -- when no PIT-visible scheduled game matches, exactly the
@@ -362,10 +372,6 @@ def _prepare_prediction_inputs(
     # PHASE 4: collector_resource_runs is the authoritative injury-feed
     # availability source; injury_snapshot_runs is legacy after this phase.
     injury_runs = warehouse.read("collector_resource_runs")
-    game_odds, prop_quotes = _market_frames_for_mode(
-        warehouse,
-        market_mode=market_mode,
-    )
 
     current_games = _latest_games_asof(games, as_of=as_of, season=season, week=week)
     current_games = _restrict_games(current_games, game_ids)
@@ -414,17 +420,83 @@ def _prepare_prediction_inputs(
         config=player_state_config or PlayerStateConfig(),
     )
 
-    latest_quotes = latest_prop_quotes(prop_quotes, as_of=as_of)
-
-    return _PreparedPredictionInputs(
+    return PitModelState(
         current_games=current_games,
         team_states=team_states,
         player_states=player_states,
         state_context=state_context,
-        latest_quotes=latest_quotes,
-        game_odds=game_odds,
         roster=roster,
         injuries=injuries,
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class _PreparedPredictionInputs:
+    """Every point-in-time input `predict_week`'s per-game loop consumes,
+    read from the warehouse exactly once. Extracted verbatim from
+    `predict_week`'s prologue so the official Phase-7D checkpoint path can
+    build the identical inputs for one game without duplicating the logic
+    or running a second pipeline."""
+
+    current_games: pl.DataFrame
+    team_states: dict[str, TeamState]
+    player_states: dict[str, PlayerState]
+    state_context: StateProvenanceContext
+    latest_quotes: pl.DataFrame
+    game_odds: pl.DataFrame
+    roster: pl.DataFrame
+    injuries: pl.DataFrame
+
+
+def _prepare_prediction_inputs(
+    warehouse: Warehouse,
+    *,
+    season: int,
+    week: int,
+    as_of: datetime,
+    model_version: str,
+    market_mode: str,
+    player_state_config: PlayerStateConfig | None,
+    team_state_config: TeamStateConfig | None,
+    game_ids: set[str] | None,
+    state_context_callback: Callable[[StateProvenanceContext], None] | None,
+) -> _PreparedPredictionInputs | None:
+    """The PIT football state (`build_pit_model_state`) plus the market
+    frames pricing and the game-level consensus need.
+
+    Returns ``None`` -- with no state built and `state_context_callback`
+    never fired -- when no PIT-visible scheduled game matches, exactly the
+    early-out `predict_week` has always had.
+    """
+    game_odds, prop_quotes = _market_frames_for_mode(
+        warehouse,
+        market_mode=market_mode,
+    )
+    state = build_pit_model_state(
+        warehouse,
+        season=season,
+        week=week,
+        as_of=as_of,
+        model_version=model_version,
+        player_state_config=player_state_config,
+        team_state_config=team_state_config,
+        game_ids=game_ids,
+        state_context_callback=state_context_callback,
+    )
+    if state is None:
+        return None
+
+    latest_quotes = latest_prop_quotes(prop_quotes, as_of=as_of)
+
+    return _PreparedPredictionInputs(
+        current_games=state.current_games,
+        team_states=state.team_states,
+        player_states=state.player_states,
+        state_context=state.state_context,
+        latest_quotes=latest_quotes,
+        game_odds=game_odds,
+        roster=state.roster,
+        injuries=state.injuries,
     )
 
 

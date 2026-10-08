@@ -22,6 +22,14 @@ Fail-closed sequence:
    requests; for legacy v1 requests the claimed full-config SHA reproduced
    exactly via a pinned claimant operational profile);
 5. official checkpoints re-pass the pre-cutoff evidence gate;
+5b. the science readiness gate (`science_readiness`): every game the PIT
+   state universe references carries PIT `games` metadata -- otherwise a
+   SCIENTIFIC `MISSING_REQUIRED_GAME_METADATA` refusal with every missing
+   id as evidence -- and then the model's own pre-simulation rules can
+   generate at least one supported player-prop output from that PIT
+   football state (never from sportsbook data) -- otherwise a SCIENTIFIC
+   `INSUFFICIENT_STATE_UNIVERSE` refusal with the eligibility census as
+   evidence. Either way the simulation never starts;
 6. the certified `game_checkpoint_flow` runs once (one coherent 20k
    simulation -> projections -> threshold probabilities -> exact PMFs ->
    push-aware prices/EV), writing only to the scratch warehouse;
@@ -30,7 +38,10 @@ Fail-closed sequence:
 
 Every refusal is classified SCIENTIFIC (deterministic: may be recorded
 NOT_EXECUTABLE) or OPERATIONAL (the request stays pending) -- see
-`RemoteExecutionError`.
+`RemoteExecutionError`. A model-code failure INSIDE the flow (the run ends
+FAILED with an unexpected exception: `MODEL_FAILURE_RUN_CODES`) is neither:
+`ModelExecutionError` is raised, no result files are written, and nothing
+is ever installed as COMPLETED science.
 
 Nothing here promotes a calibrator, relaxes a gate, or writes to Wizard;
 installing the bundle is `nflprops.platform.result_ingest` on the Wizard
@@ -81,6 +92,11 @@ from nflprops.platform.immutable_bundle import (
     verify_directory_against_manifest,
 )
 from nflprops.platform.remote_training import PRODUCTION_N_DRAWS
+from nflprops.platform.science_readiness import (
+    INSUFFICIENT_STATE_UNIVERSE,
+    check_science_readiness,
+    check_state_universe,
+)
 
 RESULT_SCHEMA_VERSION = "nflprops.platform.checkpoint_result/v1"
 
@@ -142,12 +158,25 @@ REFUSAL_RESEARCH_ONLY_EVIDENCE = "RESEARCH_ONLY_EVIDENCE"
 REFUSAL_SNAPSHOT_IDENTITY_CORRUPT = "SNAPSHOT_IDENTITY_CORRUPT"
 REFUSAL_RUN_IDENTITY_CORRUPT = "RUN_IDENTITY_CORRUPT"
 REFUSAL_NON_PRODUCTION_DRAWS = "NON_PRODUCTION_DRAWS"
+#: The PIT state universe references games with no PIT `games` metadata, so
+#: state chronology cannot be proven (`science_readiness`). The immutable
+#: snapshot can never acquire those rows: a later `games` backfill helps
+#: only checkpoints prepared from a NEW snapshot.
+REFUSAL_MISSING_REQUIRED_GAME_METADATA = "MISSING_REQUIRED_GAME_METADATA"
+#: The PIT football state lets the model generate zero supported
+#: player-prop outputs for the game (`science_readiness.check_state_universe`:
+#: target game not PIT-visible, a team without learned state, or no
+#: Phase-7A eligible player). Decided before simulation, never from
+#: sportsbook data; would otherwise end GAME_NOT_FOUND / GAME_NOT_MODELED.
+REFUSAL_INSUFFICIENT_STATE_UNIVERSE = INSUFFICIENT_STATE_UNIVERSE
 SCIENTIFIC_REFUSAL_CODES: frozenset[str] = frozenset({
     REFUSAL_INSUFFICIENT_PRE_CUTOFF_PIT_DATA,
     REFUSAL_RESEARCH_ONLY_EVIDENCE,
     REFUSAL_SNAPSHOT_IDENTITY_CORRUPT,
     REFUSAL_RUN_IDENTITY_CORRUPT,
     REFUSAL_NON_PRODUCTION_DRAWS,
+    REFUSAL_MISSING_REQUIRED_GAME_METADATA,
+    REFUSAL_INSUFFICIENT_STATE_UNIVERSE,
 })
 
 #: Operational refusal codes: executor/environment/runtime incompatibility
@@ -177,8 +206,15 @@ class RemoteExecutionError(NflpropsError):
     (OPERATIONAL -- the request stays pending). The default is OPERATIONAL:
     nothing becomes NOT_EXECUTABLE unless explicitly classified so."""
 
-    def __init__(self, message: str, *, refusal_code: str = REFUSAL_MALFORMED_REQUEST) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        refusal_code: str = REFUSAL_MALFORMED_REQUEST,
+        evidence: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
+        self.evidence = evidence
         if refusal_code in SCIENTIFIC_REFUSAL_CODES:
             self.refusal_class = REFUSAL_SCIENTIFIC
         elif refusal_code in OPERATIONAL_REFUSAL_CODES:
@@ -191,11 +227,64 @@ class RemoteExecutionError(NflpropsError):
     def scientific(self) -> bool:
         return self.refusal_class == REFUSAL_SCIENTIFIC
 
-    def as_dict(self) -> dict[str, str]:
-        return {
+    def as_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
             "refusal_class": self.refusal_class,
             "refusal_code": self.refusal_code,
             "message": str(self),
+        }
+        if self.evidence is not None:
+            out["evidence"] = self.evidence
+        return out
+
+
+#: Run failure codes the certified flow records when an UNEXPECTED
+#: exception escaped model code (`flows.checkpoints._classify_exception`).
+#: Such a run produced no science; it must never be exported, published or
+#: installed as a COMPLETED result.
+MODEL_FAILURE_RUN_CODES: frozenset[str] = frozenset({
+    "PREDICTION_ERROR",
+    "INVARIANT_VIOLATION",
+    "LEAKAGE_VIOLATION",
+})
+MODEL_FAILURE_CLASS = "MODEL_FAILURE"
+MODEL_EXECUTION_FAILED = "MODEL_EXECUTION_FAILED"
+
+
+class ModelExecutionError(NflpropsError):
+    """Model code failed unexpectedly: inside the flow (the scratch run is
+    FAILED with a `MODEL_FAILURE_RUN_CODES` code) or while the readiness
+    gate built the same PIT model state the flow would. No result files
+    exist; the request is neither COMPLETED nor NOT_EXECUTABLE -- it stays
+    pending, quarantined for the failing science SHA
+    (`model_failure_quarantine`)."""
+
+    def __init__(
+        self, *, run_id: str, run_failure_code: str | None, run_failure_detail: str | None
+    ) -> None:
+        super().__init__(
+            f"model execution failed for run {run_id}: "
+            f"{run_failure_code}: {run_failure_detail}"
+        )
+        self.run_id = run_id
+        self.run_failure_code = run_failure_code
+        self.run_failure_detail = run_failure_detail
+
+    @classmethod
+    def from_run(cls, run: PredictionRunRecord) -> ModelExecutionError:
+        return cls(
+            run_id=run.run_id,
+            run_failure_code=run.failure_code,
+            run_failure_detail=run.failure_detail,
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "refusal_class": MODEL_FAILURE_CLASS,
+            "refusal_code": MODEL_EXECUTION_FAILED,
+            "message": str(self),
+            "run_failure_code": self.run_failure_code,
+            "run_failure_detail": self.run_failure_detail,
         }
 
 
@@ -307,7 +396,12 @@ def verify_request_against_snapshot(
       snapshot the request names is not the one it claims, the run is
       absent / not SCHEDULED / differs from the request inside that
       snapshot, a non-production draw count, the pre-cutoff evidence gate,
-      RESEARCH_ONLY evidence."""
+      RESEARCH_ONLY evidence, missing required game metadata, an
+      insufficient PIT state universe (the science readiness gates --
+      checked last, so a cheaper refusal wins).
+
+    A model-code exception while the readiness gate builds the PIT model
+    state raises `ModelExecutionError`, exactly as it would inside the flow."""
     if request["snapshot_id"] != snapshot_id:
         raise RemoteExecutionError(
             f"request names snapshot {request['snapshot_id']!r}, restored {snapshot_id!r}",
@@ -381,7 +475,57 @@ def verify_request_against_snapshot(
         raise RemoteExecutionError(
             str(exc), refusal_code=REFUSAL_RESEARCH_ONLY_EVIDENCE
         ) from exc
+    require_science_ready(warehouse, run, config)
     return run
+
+
+def require_science_ready(warehouse: Warehouse, run: PredictionRunRecord, config: Config) -> None:
+    """The pre-simulation readiness gates, in order, each a SCIENTIFIC
+    refusal with complete evidence:
+
+    1. MISSING_REQUIRED_GAME_METADATA -- state chronology cannot be proven
+       (every missing id as evidence; decided first, unchanged);
+    2. INSUFFICIENT_STATE_UNIVERSE -- the model's own pre-simulation rules
+       generate zero supported player-prop outputs from the PIT football
+       state (no market table is read).
+
+    An exception while building the PIT model state is model code failing
+    exactly as it would inside the flow: `ModelExecutionError`."""
+    readiness = check_science_readiness(warehouse, scheduled_as_of=run.scheduled_as_of)
+    if not readiness.ready:
+        raise RemoteExecutionError(
+            readiness.message(),
+            refusal_code=REFUSAL_MISSING_REQUIRED_GAME_METADATA,
+            evidence=readiness.evidence(),
+        )
+    from nflprops.orchestration.flows.checkpoints import _classify_exception
+    from nflprops.pipelines.pregame import state_configs_from_app_config
+
+    player_state_cfg, team_state_cfg = state_configs_from_app_config(config)
+    try:
+        universe = check_state_universe(
+            warehouse,
+            season=run.season,
+            week=run.week,
+            game_id=run.game_id,
+            scheduled_as_of=run.scheduled_as_of,
+            model_version=run.model_version,
+            player_state_config=player_state_cfg,
+            team_state_config=team_state_cfg,
+        )
+    except Exception as exc:
+        code, detail = _classify_exception(exc)
+        raise ModelExecutionError(
+            run_id=run.run_id,
+            run_failure_code=code,
+            run_failure_detail=f"pre-simulation state build: {detail}",
+        ) from exc
+    if not universe.ready:
+        raise RemoteExecutionError(
+            universe.message(),
+            refusal_code=REFUSAL_INSUFFICIENT_STATE_UNIVERSE,
+            evidence=universe.evidence(),
+        )
 
 
 def evaluate_calibration_gate(warehouse: Warehouse, run: PredictionRunRecord) -> dict[str, Any]:
@@ -478,7 +622,12 @@ def execute_checkpoint(
     market_mode: str = "live",
 ) -> ExecutionResult:
     """Steps 6-8: run the certified flow once on the scratch warehouse,
-    gate, decide, and export the run's canonical rows to `out_dir`."""
+    gate, decide, and export the run's canonical rows to `out_dir`.
+
+    Re-checks the science readiness gates first (raises a SCIENTIFIC
+    `RemoteExecutionError` before any simulation), and raises
+    `ModelExecutionError` -- writing nothing to `out_dir` -- when model code
+    failed unexpectedly inside the flow."""
     from nflprops.orchestration.flows.checkpoints import (
         CheckpointRunContext,
         game_checkpoint_flow,
@@ -488,6 +637,7 @@ def execute_checkpoint(
         state_configs_from_app_config,
     )
 
+    require_science_ready(warehouse, run, config)
     player_state_cfg, team_state_cfg = state_configs_from_app_config(config)
     ctx = CheckpointRunContext(
         warehouse=warehouse,
@@ -511,6 +661,11 @@ def execute_checkpoint(
     started = datetime.now(UTC)
     final = game_checkpoint_flow(ctx, now=datetime.now(UTC))
     completed = datetime.now(UTC)
+    if (
+        final.status is PredictionRunStatus.FAILED
+        and final.failure_code in MODEL_FAILURE_RUN_CODES
+    ):
+        raise ModelExecutionError.from_run(final)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     tables_dir = out_dir / "tables"

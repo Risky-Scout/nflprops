@@ -24,14 +24,28 @@ name: Checkpoint Execute (BLOCK 4)
 # Refusal classes (nflprops.platform.remote_checkpoint):
 #   exit 3  SCIENTIFIC verification refusal (pre-cutoff evidence gate,
 #           RESEARCH_ONLY evidence, corrupt immutable request/snapshot
-#           identity, non-production draws) -> recorded NOT_EXECUTABLE with
-#           its refusal code, so it never blocks the queue;
+#           identity, non-production draws, and -- PR #21 -- the
+#           pre-simulation science readiness gates:
+#           MISSING_REQUIRED_GAME_METADATA, with every missing game id as
+#           evidence, then INSUFFICIENT_STATE_UNIVERSE -- zero supported
+#           player-prop outputs generatable from the PIT football state,
+#           with the eligibility census as evidence; never decided from
+#           sportsbook data) -> recorded NOT_EXECUTABLE with its refusal code and
+#           complete evidence, so it never blocks the queue;
 #   exit 4  OPERATIONAL verification refusal (executor/environment or
 #           config-runtime mismatch, unsupported schema/hash version, PIT
 #           manifest not reproduced, wrong snapshot restored) and every other
 #           failure (download, executor crash, timeout/cancel, publish,
 #           ingest) -> recorded as an operational failure ONLY; the request
 #           stays PENDING_REMOTE_EXECUTION and the job fails visibly.
+#   exit 5  MODEL_EXECUTION_FAILED (PR #21): model code failed unexpectedly
+#           inside the flow (or while the readiness gate built its PIT model
+#           state). No result bundle is built, published or ingested (never
+#           COMPLETED); logged with class MODEL_FAILURE and this run's
+#           science SHA ($GITHUB_SHA). The request stays pending but is
+#           QUARANTINED for that SHA: selection skips it until the science
+#           SHA changes or `ops.sh checkpoint-release-model-failure`
+#           releases it (audited; failure history kept).
 # NOT_EXECUTABLE is never a generic failure state.
 #
 # Triggers: workflow_dispatch (optionally an explicit run_id), and a
@@ -117,6 +131,7 @@ jobs:
           python -m nflprops.platform.checkpoint_select \
             --executable-json "$RUNNER_TEMP/executable.json" \
             --run-id "$RUN_ID" \
+            --science-sha "$GITHUB_SHA" \
             --github-output "$GITHUB_OUTPUT"
 
       - name: Download + verify the immutable request bundle and snapshot
@@ -165,12 +180,16 @@ jobs:
           code=$?
           set -e
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
-          if [ "$code" -eq 3 ] || [ "$code" -eq 4 ]; then
+          if [ "$code" -eq 3 ] || [ "$code" -eq 4 ] || [ "$code" -eq 5 ]; then
             refusal_class="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["refusal_class"])' "$RUNNER_TEMP/refusal.json")"
             refusal_code="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["refusal_code"])' "$RUNNER_TEMP/refusal.json")"
             [[ "$refusal_code" =~ ^[A-Z][A-Z_]{2,63}$ ]] || { echo "::error::bad refusal code"; exit 1; }
             echo "refusal_class=$refusal_class" >> "$GITHUB_OUTPUT"
             echo "refusal_code=$refusal_code" >> "$GITHUB_OUTPUT"
+            # Complete evidence (e.g. every missing game id), compact + base64.
+            evidence_b64="$(python -c 'import base64,json,sys; e=json.load(open(sys.argv[1])).get("evidence"); print(base64.b64encode(json.dumps(e,sort_keys=True,separators=(",",":")).encode()).decode() if e is not None else "")' "$RUNNER_TEMP/refusal.json")"
+            echo "evidence_b64=$evidence_b64" >> "$GITHUB_OUTPUT"
+            python -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])), indent=2, sort_keys=True))' "$RUNNER_TEMP/refusal.json"
           fi
           if [ "$code" -eq 3 ]; then
             echo "::warning::SCIENTIFIC verification refusal ($refusal_code); recording it NOT_EXECUTABLE"
@@ -179,7 +198,19 @@ jobs:
           if [ "$code" -eq 4 ]; then
             echo "::error::OPERATIONAL verification refusal ($refusal_code); the request stays pending"
           fi
+          if [ "$code" -eq 5 ]; then
+            echo "::error::MODEL_EXECUTION_FAILED: model code failed inside the flow; nothing is published or ingested and the request stays pending"
+          fi
           exit "$code"
+
+      - name: Keep the refusal / model-failure evidence as a workflow artifact
+        if: always() && (steps.execute.outputs.exit_code == '3' || steps.execute.outputs.exit_code == '4' || steps.execute.outputs.exit_code == '5')
+        uses: actions/upload-artifact@v4
+        with:
+          name: refusal-${{ steps.select.outputs.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/refusal.json
+          retention-days: 90
+          if-no-files-found: error
 
       - name: Record a SCIENTIFIC verification refusal (NOT_EXECUTABLE)
         if: steps.execute.outputs.exit_code == '3' && steps.execute.outputs.refusal_class == 'SCIENTIFIC'
@@ -188,13 +219,15 @@ jobs:
           REMOTE: ${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}
           RUN_ID: ${{ steps.select.outputs.run_id }}
           REFUSAL_CODE: ${{ steps.execute.outputs.refusal_code }}
+          EVIDENCE_B64: ${{ steps.execute.outputs.evidence_b64 }}
         run: |
-          # The Wizard side re-checks REFUSAL_CODE is scientific and
-          # refuses anything else.
+          # The Wizard side re-checks REFUSAL_CODE is scientific, validates
+          # the evidence against it, and refuses anything else.
+          [ -z "$EVIDENCE_B64" ] || [[ "$EVIDENCE_B64" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || { echo "::error::bad evidence encoding"; exit 1; }
           # shellcheck disable=SC2086
           ssh $SSH_OPTS "$REMOTE" bash -s -- checkpoint-refuse "$RUNTIME_ROOT" \
             "$RUN_ID" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            "$REFUSAL_CODE" < deploy/wizard/ops.sh
+            "$REFUSAL_CODE" ${EVIDENCE_B64:+"$EVIDENCE_B64"} < deploy/wizard/ops.sh
 
       - name: Build the immutable result bundle (deterministic manifest)
         id: bundle
@@ -278,6 +311,7 @@ jobs:
         run: |
           if [ "$JOB_STATUS" = "cancelled" ]; then code=TIMEOUT_OR_CANCELLED
           elif [ "$EXIT_CODE" = "4" ]; then code="$REFUSAL_CODE"
+          elif [ "$EXIT_CODE" = "5" ]; then code=MODEL_EXECUTION_FAILED
           elif [ "$DOWNLOAD" = "failure" ]; then code=DOWNLOAD_OR_BUNDLE_VERIFY_FAILED
           elif [ "$EXECUTE" = "failure" ]; then code=EXECUTOR_FAILED
           elif [ "$PUBLISH" = "failure" ]; then code=PUBLISH_FAILED
@@ -289,7 +323,7 @@ jobs:
           # shellcheck disable=SC2086
           ssh $SSH_OPTS "$REMOTE" bash -s -- checkpoint-operational-failure "$RUNTIME_ROOT" \
             "$RUN_ID" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            "$code" < deploy/wizard/ops.sh
+            "$code" "$GITHUB_SHA" < deploy/wizard/ops.sh
 
       - name: Report
         if: always()

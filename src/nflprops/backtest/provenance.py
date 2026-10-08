@@ -193,6 +193,157 @@ class PredictionProvenance:
         }
 
 
+#: Machine-readable code for a state universe whose chronology cannot be
+#: proven because referenced games lack `games`-table metadata. It is a
+#: deterministic property of the PIT inputs (an immutable snapshot can
+#: never acquire the rows), never a transient failure.
+MISSING_REQUIRED_GAME_METADATA = "MISSING_REQUIRED_GAME_METADATA"
+
+
+class MissingStateGameMetadataError(ValueError):
+    """State-input rows reference games that have no PIT-visible
+    `games` metadata, so state chronology cannot be proven.
+
+    Carries the COMPLETE sorted list of missing canonical game ids (the
+    message only previews the first ten)."""
+
+    code = MISSING_REQUIRED_GAME_METADATA
+
+    def __init__(
+        self,
+        missing_game_ids: tuple[str, ...],
+        *,
+        state_as_of: datetime,
+    ) -> None:
+        self.missing_game_ids = tuple(sorted(missing_game_ids))
+        self.state_as_of = state_as_of
+        preview = ",".join(self.missing_game_ids[:10])
+        super().__init__(
+            "cannot prove state chronology because game metadata "
+            f"is missing for {len(self.missing_game_ids)} state games: "
+            f"{preview}"
+        )
+
+
+@dataclass(frozen=True)
+class StateGameUniverse:
+    """The games a PIT state slice references and what `games` proves
+    about them. Pure; shared by the state build and the pre-simulation
+    readiness gate so both always agree exactly."""
+
+    #: Sorted canonical ids referenced by PIT player/team stat rows.
+    state_game_ids: tuple[str, ...]
+    #: Latest PIT `games` metadata per game (all PIT games, not only state).
+    game_meta: dict[str, StateGameMeta]
+    #: State games with no PIT-visible `games` row at all (sorted).
+    missing_game_ids: tuple[str, ...]
+    #: PIT games whose latest row lacks season/week (sorted).
+    incomplete_game_ids: tuple[str, ...]
+
+
+def _state_game_universe(
+    *,
+    player_stats: pl.DataFrame,
+    team_stats: pl.DataFrame,
+    games: pl.DataFrame,
+) -> StateGameUniverse:
+    """Inputs must already be PIT-filtered to the same `as_of`."""
+    state_game_ids: set[str] = set()
+
+    for frame, label in (
+        (player_stats, "player_stats"),
+        (team_stats, "team_stats"),
+    ):
+        if frame.is_empty():
+            continue
+
+        if "canonical_game_id" not in frame.columns:
+            raise ValueError(
+                f"{label} missing canonical_game_id"
+            )
+
+        state_game_ids.update(
+            str(value)
+            for value in frame[
+                "canonical_game_id"
+            ].drop_nulls().unique().to_list()
+        )
+
+    required_game_columns = {
+        "canonical_game_id",
+        "season",
+        "week",
+        "available_at",
+    }
+
+    missing_game_columns = (
+        required_game_columns - set(games.columns)
+        if not games.is_empty()
+        else set()
+    )
+
+    if missing_game_columns:
+        raise ValueError(
+            "games missing provenance columns: "
+            + ", ".join(sorted(missing_game_columns))
+        )
+
+    latest_games = (
+        games.sort("available_at")
+        .group_by(
+            "canonical_game_id",
+            maintain_order=True,
+        )
+        .tail(1)
+        if not games.is_empty()
+        else games
+    )
+
+    game_meta: dict[str, StateGameMeta] = {}
+    incomplete: list[str] = []
+
+    for row in latest_games.iter_rows(named=True):
+        game_id = str(row["canonical_game_id"])
+        season = row.get("season")
+        week = row.get("week")
+
+        if season is None or week is None:
+            incomplete.append(game_id)
+            continue
+
+        game_meta[game_id] = StateGameMeta(
+            canonical_game_id=game_id,
+            season=int(season),
+            week=int(week),
+        )
+
+    return StateGameUniverse(
+        state_game_ids=tuple(sorted(state_game_ids)),
+        game_meta=game_meta,
+        missing_game_ids=tuple(
+            sorted(state_game_ids - set(game_meta) - set(incomplete))
+        ),
+        incomplete_game_ids=tuple(sorted(incomplete)),
+    )
+
+
+def state_game_universe_at(
+    *,
+    games: pl.DataFrame,
+    player_stats: pl.DataFrame,
+    team_stats: pl.DataFrame,
+    as_of: datetime,
+) -> StateGameUniverse:
+    """The state-game universe `build_state_provenance_context` would see at
+    `as_of`, with the identical PIT filters -- without building state."""
+    _require_aware(as_of, "as_of")
+    return _state_game_universe(
+        player_stats=as_known_at(player_stats, "player_game_stats", as_of),
+        team_stats=as_known_at(team_stats, "team_game_stats", as_of),
+        games=_pit(games, as_of),
+    )
+
+
 def build_state_provenance_context(
     *,
     games: pl.DataFrame,
@@ -223,90 +374,27 @@ def build_state_provenance_context(
     gg = _pit(games, as_of)
     injury_data_available = injury_feed_available_at(injury_runs, as_of=as_of)
 
-    state_game_ids: set[str] = set()
-
-    for frame, label in (
-        (ps, "player_stats"),
-        (ts, "team_stats"),
-    ):
-        if frame.is_empty():
-            continue
-
-        if "canonical_game_id" not in frame.columns:
-            raise ValueError(
-                f"{label} missing canonical_game_id"
-            )
-
-        state_game_ids.update(
-            str(value)
-            for value in frame[
-                "canonical_game_id"
-            ].drop_nulls().unique().to_list()
-        )
-
-    required_game_columns = {
-        "canonical_game_id",
-        "season",
-        "week",
-        "available_at",
-    }
-
-    missing_game_columns = (
-        required_game_columns - set(gg.columns)
-        if not gg.is_empty()
-        else set()
+    universe = _state_game_universe(
+        player_stats=ps,
+        team_stats=ts,
+        games=gg,
     )
 
-    if missing_game_columns:
+    if universe.incomplete_game_ids:
         raise ValueError(
-            "games missing provenance columns: "
-            + ", ".join(sorted(missing_game_columns))
+            f"game {universe.incomplete_game_ids[0]} lacks season/week provenance"
         )
 
-    latest_games = (
-        gg.sort("available_at")
-        .group_by(
-            "canonical_game_id",
-            maintain_order=True,
-        )
-        .tail(1)
-        if not gg.is_empty()
-        else gg
-    )
-
-    game_meta: dict[str, StateGameMeta] = {}
-
-    for row in latest_games.iter_rows(named=True):
-        game_id = str(row["canonical_game_id"])
-        season = row.get("season")
-        week = row.get("week")
-
-        if season is None or week is None:
-            raise ValueError(
-                f"game {game_id} lacks season/week provenance"
-            )
-
-        game_meta[game_id] = StateGameMeta(
-            canonical_game_id=game_id,
-            season=int(season),
-            week=int(week),
+    if universe.missing_game_ids:
+        raise MissingStateGameMetadataError(
+            universe.missing_game_ids,
+            state_as_of=as_of,
         )
 
-    missing_games = sorted(
-        state_game_ids - set(game_meta)
-    )
-
-    if missing_games:
-        preview = ",".join(missing_games[:10])
-        raise ValueError(
-            "cannot prove state chronology because game metadata "
-            f"is missing for {len(missing_games)} state games: "
-            f"{preview}"
-        )
-
+    game_meta = universe.game_meta
     state_games = tuple(
         game_meta[game_id]
-        for game_id in sorted(state_game_ids)
+        for game_id in universe.state_game_ids
     )
 
     player_stats_max = _max_available_at(ps)

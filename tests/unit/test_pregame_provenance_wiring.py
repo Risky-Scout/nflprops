@@ -17,6 +17,7 @@ from nflprops.pipelines.pregame import (
     _assert_state_history_safe_for_games,
     _persist_prediction_rows,
     _prepare_prediction_inputs,
+    build_pit_model_state,
     predict_week,
     simulate_game_for_prediction,
 )
@@ -296,15 +297,27 @@ def test_state_history_guard_precedes_state_build_and_simulation() -> None:
       `_prepare_prediction_inputs`, so the official checkpoint path can
       reuse the identical inputs without a second pipeline. Within
       `_prepare_prediction_inputs`, the guard still precedes state build.
+    * PR #21: the market-free part of that prologue (target games, state
+      context, history guard, team/player state build) moved into
+      `build_pit_model_state`, which `_prepare_prediction_inputs` calls and
+      the pre-simulation science readiness gate reuses. Within it, the
+      guard still precedes state build; `_prepare_prediction_inputs` builds
+      no state of its own.
     * Within `predict_week`, `_prepare_prediction_inputs(` precedes the
       call into `simulate_game_for_prediction(`.
     * Within `simulate_game_for_prediction` (PHASE 6), the coherent
       `simulate_game(` call is still present.
     """
     inputs_source = inspect.getsource(_prepare_prediction_inputs)
-    history_guard = inputs_source.index("_assert_state_history_safe_for_games(")
-    state_build = inputs_source.index("build_team_states(")
+    assert "build_pit_model_state(" in inputs_source
+    assert "build_team_states(" not in inputs_source
+    assert "build_player_states(" not in inputs_source
+
+    state_source = inspect.getsource(build_pit_model_state)
+    history_guard = state_source.index("_assert_state_history_safe_for_games(")
+    state_build = state_source.index("build_team_states(")
     assert history_guard < state_build
+    assert history_guard < state_source.index("build_player_states(")
 
     week_source = inspect.getsource(predict_week)
     prepare_inputs = week_source.index("_prepare_prediction_inputs(")
