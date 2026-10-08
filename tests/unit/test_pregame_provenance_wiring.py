@@ -73,6 +73,8 @@ def test_provenance_attachment_preserves_original_values() -> None:
         "canonical_player_id": "player-1",
         "prop_type": "receiving_yards",
         "available_at": quote_available_at,
+        # STEP 2D: opening quotes are knowable only from genuine receipt.
+        "collector_received_at": quote_available_at,
     }
 
     roster = pl.DataFrame(
@@ -153,6 +155,8 @@ def test_case_c_no_injury_collection_at_all_records_data_unavailable() -> None:
         "canonical_player_id": "player-1",
         "prop_type": "receiving_yards",
         "available_at": quote_available_at,
+        # STEP 2D: opening quotes are knowable only from genuine receipt.
+        "collector_received_at": quote_available_at,
     }
 
     enriched = _audit_and_attach_prediction_provenance(
@@ -201,6 +205,8 @@ def test_case_b_zero_relevant_rows_from_successful_collection_still_available() 
         "canonical_player_id": "player-1",
         "prop_type": "receiving_yards",
         "available_at": quote_available_at,
+        # STEP 2D: opening quotes are knowable only from genuine receipt.
+        "collector_received_at": quote_available_at,
     }
 
     enriched = _audit_and_attach_prediction_provenance(
@@ -243,6 +249,7 @@ def test_future_quote_fails_before_persistence() -> None:
         "canonical_player_id": "player-1",
         "prop_type": "receiving_yards",
         "available_at": AS_OF + timedelta(seconds=1),
+        "collector_received_at": AS_OF + timedelta(seconds=1),
     }
 
     with pytest.raises(LeakageError):

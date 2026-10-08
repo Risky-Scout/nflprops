@@ -20,10 +20,7 @@ import polars as pl
 
 from nflprops.config import Config
 from nflprops.config import load as load_config
-from nflprops.data.availability import (
-    reconstruct_game_result_availability,
-    use_event_time_as_available,
-)
+from nflprops.data.availability import reconstruct_game_result_availability
 from nflprops.data.quality import enforce, validate_core
 from nflprops.data.raw_store import RawStore, make_raw_hook
 from nflprops.data.warehouse import Warehouse, records_to_frame
@@ -385,9 +382,8 @@ class LeanIngestor:
                     )
                     opening = pl.DataFrame()
                 if not opening.is_empty():
-                    opening = use_event_time_as_available(
-                        opening, event_col="opened_at"
-                    )
+                    # STEP 2D: available_at stays the genuine receipt time;
+                    # provider `opened_at` is kept as metadata only.
                     self.warehouse.append(
                         "game_opening_odds",
                         opening,
@@ -410,11 +406,9 @@ class LeanIngestor:
                     )
                     continue
                 if prop_openings:
+                    # STEP 2D: available_at stays the genuine receipt time;
+                    # provider `opened_at` is kept as metadata only.
                     frame = records_to_frame(prop_openings)
-                    if "opened_at" in frame.columns:
-                        frame = use_event_time_as_available(
-                            frame, event_col="opened_at"
-                        )
                     self.warehouse.append(
                         "player_prop_openings",
                         frame,

@@ -119,13 +119,21 @@ def _market_frames_for_mode(
         game_odds = warehouse.read("game_opening_odds")
         prop_quotes = warehouse.read("player_prop_openings")
 
-        # Historical openings were collected during backfill, so their
-        # collector_received_at is not the historical knowledge timestamp.
-        # Their canonical available_at was explicitly reconstructed from opened_at.
-        if "collector_received_at" in game_odds.columns:
-            game_odds = game_odds.drop("collector_received_at")
-        if "collector_received_at" in prop_quotes.columns:
-            prop_quotes = prop_quotes.drop("collector_received_at")
+        # STEP 2D: an opening quote is knowable only from its genuine
+        # receipt (`collector_received_at`), exactly like a live one. Its
+        # provider `opened_at` -- and any `available_at` reconstructed from
+        # it -- can predate receipt and must never make it visible earlier.
+        # Fail closed rather than let the selectors fall back to
+        # `available_at`.
+        for name, frame in (
+            ("game_opening_odds", game_odds),
+            ("player_prop_openings", prop_quotes),
+        ):
+            if not frame.is_empty() and "collector_received_at" not in frame.columns:
+                raise ValueError(
+                    f"{name} has no collector_received_at; opening quotes are "
+                    "knowable only from genuine receipt time"
+                )
 
         return game_odds, prop_quotes
 

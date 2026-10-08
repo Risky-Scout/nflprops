@@ -438,8 +438,8 @@ class BDLProvider:
     ) -> Sequence[GameOdds]:
         if not game_ids and (season is None or week is None):
             raise ValueError("BDL odds require (season and week) or game_ids")
-        ctx = self._ctx()
-        rows = self.client.paginated_get(
+        # `paginated_get` is lazy: materialize every page BEFORE stamping.
+        rows = list(self.client.paginated_get(
             path,
             {
                 "season": season,
@@ -447,7 +447,11 @@ class BDLProvider:
                 "game_ids": [self._pid("game", x) for x in game_ids] if game_ids else None,
                 "season_type": season_type,
             },
-        )
+        ))
+        # STEP 2D: stamp receipt AFTER the response (every page) arrived --
+        # never before the request, which would predate genuine receipt by
+        # the request/retry latency.
+        ctx = self._ctx()
         cls = RawNFLOpeningBettingOdd if opening else RawNFLBettingOdd
         return [
             map_game_odds(cls.model_validate(x), ctx=ctx, opening=opening) for x in rows
@@ -495,7 +499,6 @@ class BDLProvider:
         vendors: Sequence[str] | None,
         opening: bool,
     ) -> Sequence[PlayerProp]:
-        ctx = self._ctx()
         response = self.client.get(
             path,
             {
@@ -505,6 +508,8 @@ class BDLProvider:
                 "vendors": vendors,
             },
         )
+        # STEP 2D: stamp receipt AFTER the response arrived (see _game_odds).
+        ctx = self._ctx()
         cls = RawNFLOpeningPlayerProp if opening else RawNFLPlayerProp
         return [
             map_player_prop(cls.model_validate(x), ctx=ctx, opening=opening)
