@@ -243,7 +243,6 @@ class BDLProvider:
         player_ids: Sequence[str] | None = None,
         season_type: int | None = None,
     ) -> Sequence[PlayerGameStat]:
-        ctx = self._ctx()
         params = {
             "seasons": seasons,
             "game_ids": [self._pid("game", x) for x in game_ids] if game_ids else None,
@@ -252,7 +251,10 @@ class BDLProvider:
             ),
             "season_type": season_type,
         }
-        rows = self.client.paginated_get(endpoints.STATS, params)
+        # `paginated_get` is lazy: receive every page, THEN stamp receipt
+        # (one conservative post-response time for the whole fetch).
+        rows = list(self.client.paginated_get(endpoints.STATS, params))
+        ctx = self._ctx()
         return [
             map_player_game_stat(RawNFLStats.model_validate(x), ctx=ctx) for x in rows
         ]
@@ -289,7 +291,6 @@ class BDLProvider:
         team_ids: Sequence[str] | None = None,
         season_type: int | None = None,
     ) -> Sequence[TeamGameStat]:
-        ctx = self._ctx()
         rows = self.client.paginated_get(
             endpoints.TEAM_STATS,
             {
@@ -299,8 +300,11 @@ class BDLProvider:
                 "season_type": season_type,
             },
         )
+        # Lazy pages: receive them all, THEN stamp receipt (see player_game_stats).
+        received = list(rows)
+        ctx = self._ctx()
         return [
-            map_team_game_stat(RawNFLTeamStat.model_validate(x), ctx=ctx) for x in rows
+            map_team_game_stat(RawNFLTeamStat.model_validate(x), ctx=ctx) for x in received
         ]
 
     def team_season_stats(
