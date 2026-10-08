@@ -53,7 +53,7 @@ dev = [
   "hypothesis>=6.100",
   "respx>=0.21",
   "ruff>=0.4",
-  "mypy==2.3.1",
+  "mypy==2.4.0",
   "types-PyYAML",
 ]
 # Production storage backend (PHASE 1: managed PostgreSQL + S3-compatible object
