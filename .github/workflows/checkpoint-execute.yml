@@ -217,7 +217,7 @@ jobs:
 
       - name: Keep the result bundle as a workflow artifact
         if: steps.execute.outputs.exit_code == '0' && inputs.verify_only != true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.select.outputs.bundle_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/bundle/${{ steps.select.outputs.bundle_id }}
