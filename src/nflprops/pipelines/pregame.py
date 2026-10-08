@@ -24,6 +24,10 @@ from nflprops.backtest.provenance import (
 )
 from nflprops.data.warehouse import Warehouse
 from nflprops.domain.hashing import hash_payload
+from nflprops.domain.market_identity import (
+    PLAYER_PROP_BOOK_KEY,
+    PLAYER_PROP_MARKET_IDENTITY,
+)
 from nflprops.market.consensus import game_market_consensus, latest_prop_quotes
 from nflprops.market.current_pricing import prediction_id, price_current_markets
 from nflprops.market.timing import latest_game_market_knowledge_time
@@ -451,7 +455,15 @@ def _prepare_prediction_inputs(
         config=player_state_config or PlayerStateConfig(),
     )
 
-    latest_quotes = latest_prop_quotes(prop_quotes, as_of=as_of)
+    latest_quotes = latest_prop_quotes(
+        prop_quotes,
+        as_of=as_of,
+        # Live: a poll replaces a book's whole offer. Opening: every market's
+        # first observation stands on its own.
+        group_by=(
+            PLAYER_PROP_MARKET_IDENTITY if market_mode == "opening" else PLAYER_PROP_BOOK_KEY
+        ),
+    )
 
     return _PreparedPredictionInputs(
         current_games=current_games,

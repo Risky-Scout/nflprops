@@ -13,8 +13,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+from collections.abc import Iterable
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 
@@ -24,6 +26,10 @@ from nflprops.data.availability import reconstruct_game_result_availability
 from nflprops.data.quality import enforce, validate_core
 from nflprops.data.raw_store import RawStore, make_raw_hook
 from nflprops.data.warehouse import Warehouse, records_to_frame
+from nflprops.domain.market_identity import (
+    PLAYER_PROP_MARKET_IDENTITY,
+    PLAYER_PROP_SNAPSHOT_KEY,
+)
 from nflprops.domain.protocols import FullProvider
 from nflprops.paths import runtime_data_root, runtime_resource
 from nflprops.providers import registry as provider_registry
@@ -153,6 +159,20 @@ provider_registry.register("balldontlie", build_bdl_provider)
 
 def _append_reference(warehouse: Warehouse, table: str, records, key: list[str]):
     warehouse.append_records(table, records, key=key, sort_by=key)
+
+
+def append_prop_openings(warehouse: Warehouse, records: Iterable[Any]) -> None:
+    """`player_prop_openings` holds ONE opening per logical market
+    (`PLAYER_PROP_MARKET_IDENTITY`): the first genuinely received
+    observation is immutable -- exact re-ingest is a no-op and a later
+    ingest can never replace it (warehouse_tables.yml)."""
+    warehouse.append(
+        "player_prop_openings",
+        records_to_frame(records),
+        key=list(PLAYER_PROP_MARKET_IDENTITY),
+        keep="first",
+        sort_by=["available_at", "canonical_game_id"],
+    )
 
 
 def _game_backfill_snapshots(games_frame: pl.DataFrame) -> pl.DataFrame:
@@ -408,18 +428,7 @@ class LeanIngestor:
                 if prop_openings:
                     # STEP 2D: available_at stays the genuine receipt time;
                     # provider `opened_at` is kept as metadata only.
-                    frame = records_to_frame(prop_openings)
-                    self.warehouse.append(
-                        "player_prop_openings",
-                        frame,
-                        key=[
-                            "canonical_game_id",
-                            "canonical_player_id",
-                            "prop_type",
-                            "vendor",
-                        ],
-                        sort_by=["available_at", "canonical_game_id"],
-                    )
+                    append_prop_openings(self.warehouse, prop_openings)
 
         if include_pbp:
             final_games = games.filter(pl.col("status_state") == "final")
@@ -533,13 +542,7 @@ class LeanIngestor:
                 self.warehouse.append_records(
                     "player_prop_snapshots",
                     props,
-                    key=[
-                        "canonical_game_id",
-                        "canonical_player_id",
-                        "prop_type",
-                        "vendor",
-                        "collector_received_at",
-                    ],
+                    key=list(PLAYER_PROP_SNAPSHOT_KEY),
                     sort_by=["collector_received_at"],
                 )
 

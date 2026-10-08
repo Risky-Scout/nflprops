@@ -152,12 +152,22 @@ tables:
       key: [canonical_game_id, vendor]
       pit: true
     player_prop_snapshots:
-      key: [canonical_game_id, canonical_player_id, prop_type, vendor, collector_received_at]
+      key: [canonical_game_id, canonical_player_id, prop_type, vendor, market_type, line_value, collector_received_at]
       pit: true
-      note: "BDL retains no live prop history — this table IS the history"
+      note: >-
+        BDL retains no live prop history — this table IS the history. One poll
+        carries several markets per player/prop/book (milestone ladders, alt
+        lines), so market_type + line_value are part of the market identity;
+        every receipt is its own version (append-only, nothing overwritten).
     player_prop_openings:
-      key: [canonical_game_id, canonical_player_id, prop_type, vendor]
+      key: [canonical_game_id, canonical_player_id, prop_type, vendor, market_type, line_value]
       pit: true
+      write: first_observation_wins
+      note: >-
+        One opening per logical market (same market identity as
+        player_prop_snapshots, no time dimension). The FIRST genuinely
+        received observation is immutable: re-ingest is a no-op and a later
+        ingest can never replace it.
 
   dfs:
     dfs_slates:

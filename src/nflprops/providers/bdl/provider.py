@@ -184,10 +184,11 @@ class BDLProvider:
 
     def roster(self, team_id: str, season: int) -> Sequence[RosterEntry]:
         pid = self._pid("team", team_id)
-        ctx = self._ctx()
         response = self.client.get(
             endpoints.ROSTER.format(id=pid), {"season": season}
         )
+        # Receipt (PIT availability) is stamped AFTER the response arrived.
+        ctx = self._ctx()
         return [
             map_roster_entry(
                 RawNFLRosterEntry.model_validate(x),
@@ -206,7 +207,6 @@ class BDLProvider:
         team_ids: Sequence[str] | None = None,
         season_types: Sequence[int] | None = None,
     ) -> Sequence[Game]:
-        ctx = self._ctx()
         params: dict = {
             "seasons": seasons,
             "weeks": weeks,
@@ -215,7 +215,10 @@ class BDLProvider:
             ),
             "season_type": season_types,
         }
-        rows = self.client.paginated_get(endpoints.GAMES, params)
+        # `paginated_get` is lazy: receive every page, THEN stamp receipt
+        # (one conservative post-response time for the whole fetch).
+        rows = list(self.client.paginated_get(endpoints.GAMES, params))
+        ctx = self._ctx()
         hint = season_types[0] if season_types and len(season_types) == 1 else None
         return [
             map_game(RawNFLGame.model_validate(x), ctx=ctx, season_type_hint=hint)
@@ -224,8 +227,8 @@ class BDLProvider:
 
     def game(self, game_id: str | int, season_type_hint: int | None = None) -> Game:
         pid = self._pid("game", game_id)
-        ctx = self._ctx()
         raw = self.client.get(endpoints.GAME.format(id=pid)).get("data")
+        ctx = self._ctx()  # after the response arrived
         return map_game(
             RawNFLGame.model_validate(raw),
             ctx=ctx,
@@ -411,7 +414,6 @@ class BDLProvider:
         team_ids: Sequence[str] | None = None,
         player_ids: Sequence[str] | None = None,
     ) -> Sequence[Injury]:
-        ctx = self._ctx()
         rows = self.client.paginated_get(
             endpoints.INJURIES,
             {
@@ -423,7 +425,12 @@ class BDLProvider:
                 ),
             },
         )
-        return [map_injury(RawNFLPlayerInjury.model_validate(x), ctx=ctx) for x in rows]
+        # Lazy pages: receive them all, THEN stamp receipt (see `games`).
+        received = list(rows)
+        ctx = self._ctx()
+        return [
+            map_injury(RawNFLPlayerInjury.model_validate(x), ctx=ctx) for x in received
+        ]
 
     # ----------------------------------------------------------------- markets
     def _game_odds(
