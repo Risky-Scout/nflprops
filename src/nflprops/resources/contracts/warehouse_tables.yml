@@ -42,6 +42,14 @@ tables:
     provider_game_ids:
       key: [provider, provider_game_id]
       pit: false
+    player_crosswalk_nflverse:
+      key: [canonical_player_id]
+      pit: false
+      note: "BDL player -> nflverse gsis_id by same team-week co-occurrence; MATCHED_EXACT/MATCHED_CORROBORATED/AMBIGUOUS/UNMATCHED; never by position or stats"
+    historical_player_positions:
+      key: [canonical_player_id, season, week, team]
+      pit: false
+      note: "nflverse weekly-roster position per roster week; resolved at or before the target week only, never backward"
 
   schedule:
     games:

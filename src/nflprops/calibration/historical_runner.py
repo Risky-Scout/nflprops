@@ -56,6 +56,7 @@ from nflprops.features.historical_evidence import (
     build_slate_chronology,
     schedule_identity,
 )
+from nflprops.features.historical_positions import HISTORICAL_POSITIONS_TABLE
 from nflprops.market.rules import (
     SettlementRuleError,
     SettlementRuleSet,
@@ -94,7 +95,7 @@ class HistoricalReplayError(ValueError):
 class WarehouseTables:
     """Every warehouse table `build_labeled_game` reads, loaded once.
 
-    `build_labeled_game` re-reads all eight tables from `backend` on
+    `build_labeled_game` re-reads all nine tables from `backend` on
     every call when `tables` is omitted -- correct, but O(n_games) redundant
     disk I/O over an unchanging historical warehouse (the dominant real-run
     cost, unrelated to `n_draws`). A caller replaying many games loads this
@@ -111,6 +112,9 @@ class WarehouseTables:
     injuries: pl.DataFrame
     injury_runs: pl.DataFrame
     game_odds: pl.DataFrame
+    #: Week-versioned historical positions (empty = none built; position
+    #: groups then come from the `players` dimension alone).
+    historical_positions: pl.DataFrame
 
     def as_table_mapping(self) -> dict[str, pl.DataFrame]:
         """These frames keyed by their warehouse table name."""
@@ -123,6 +127,7 @@ class WarehouseTables:
             "injury_snapshots": self.injuries,
             "collector_resource_runs": self.injury_runs,
             "game_odds_snapshots": self.game_odds,
+            HISTORICAL_POSITIONS_TABLE: self.historical_positions,
         }
 
 
@@ -137,6 +142,7 @@ def load_warehouse_tables(backend: StorageBackend) -> WarehouseTables:
         injuries=_empty_or(backend, "injury_snapshots"),
         injury_runs=_empty_or(backend, "collector_resource_runs"),
         game_odds=_empty_or(backend, "game_odds_snapshots"),
+        historical_positions=_empty_or(backend, HISTORICAL_POSITIONS_TABLE),
     )
 
 
@@ -247,6 +253,9 @@ def build_labeled_game(
     injuries = loaded.injuries
     injury_runs = loaded.injury_runs
     game_odds = loaded.game_odds
+    historical_positions = (
+        None if loaded.historical_positions.is_empty() else loaded.historical_positions
+    )
 
     # STRUCTURAL_CORE under HISTORICAL_WALK_FORWARD, through the SAME
     # assembly live execution uses (nflprops.pipelines.model_inputs): history
@@ -260,6 +269,7 @@ def build_labeled_game(
         roster=roster, injuries=injuries, game_odds=game_odds,
         as_of=as_of, target_slate=chronology.slate_of(game_id), target_game_id=game_id,
         player_state_config=player_state_config, team_state_config=team_state_config,
+        historical_positions=historical_positions,
     )
 
     prepared = simulate_game_for_prediction(

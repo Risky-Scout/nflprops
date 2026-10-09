@@ -99,6 +99,7 @@ from nflprops.domain.model_profile import (
     ModelProfileError,
     parse_model_profile,
 )
+from nflprops.features.historical_positions import HISTORICAL_POSITIONS_TABLE
 
 #: The only draw count this module will accept for a `--mode production`
 #: run -- the certified live-prediction default
@@ -490,6 +491,13 @@ def run(config: RunnerConfig) -> dict[str, Any]:
         )
 
     warehouse = Warehouse(config.data_root)
+    if not warehouse.exists(HISTORICAL_POSITIONS_TABLE):
+        # The 2026 players dimension marks departed players Unknown; without
+        # week-versioned historical positions replay would mis-group them.
+        raise ConfigurationError(
+            f"data root has no {HISTORICAL_POSITIONS_TABLE!r} table "
+            "(tools/build_historical_positions.py)"
+        )
     tables = load_warehouse_tables(warehouse)
     evidence_class, evidence_rows = classify_model_evidence(
         tables.as_table_mapping(), evidence_mode=EVIDENCE_MODE, model_profile=MODEL_PROFILE

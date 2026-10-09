@@ -460,7 +460,19 @@ HISTORICAL_REPLAY_INPUT_SURFACE: Mapping[str, InputAudit] = {
         True,
         "a player's position group is identity known before his games; the model reads "
         "no other players column",
-        "LOW: a later position reclassification is applied retroactively",
+        "LOW: a later position reclassification is applied retroactively; with "
+        "historical_player_positions present it is only the unresolved fallback",
+    ),
+    "historical_player_positions": InputAudit(
+        "historical_player_positions",
+        "position_group as of the target week (overrides `players` where observed)",
+        "nflverse weekly roster position per (season, week, team), keyed by a "
+        "team-week-co-occurrence crosswalk",
+        InputCertification.SAFE_HISTORICAL_PREGAME,
+        True,
+        "the target week's or an earlier week's roster position only; a later week is "
+        "never read (resolve_position_groups)",
+        "NONE: no later week, no stat magnitude and no target outcome decides position",
     ),
     "roster_snapshots": InputAudit(
         "roster_snapshots",

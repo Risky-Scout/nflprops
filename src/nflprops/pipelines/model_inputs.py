@@ -11,6 +11,10 @@ STRUCTURAL_CORE (either mode)
       * LIVE_PIT -- the row's genuine `available_at` (unchanged live gate),
         additionally restricted to prior-slate final games.
     No game odds (market = None), no injury rows, no roster rows.
+    Given `historical_positions`, a player's position group is his
+    weekly-roster position as of the target week
+    (`nflprops.features.historical_positions`) -- applied identically in
+    both modes, so equivalent evidence gives identical input.
 
 LIVE_ENHANCED (LIVE_PIT only)
     The existing live behaviour: history gated by `available_at` alone and
@@ -36,6 +40,7 @@ from nflprops.features.historical_evidence import (
     certify_event_derived,
     restrict_to_prior_slates,
 )
+from nflprops.features.historical_positions import resolve_position_groups
 from nflprops.state.player import PlayerState, PlayerStateConfig, build_player_states
 from nflprops.state.team import TeamState, TeamStateConfig, build_team_states
 
@@ -76,6 +81,7 @@ def build_model_inputs(
     target_game_id: str | None = None,
     player_state_config: PlayerStateConfig | None = None,
     team_state_config: TeamStateConfig | None = None,
+    historical_positions: pl.DataFrame | None = None,
 ) -> ModelInputs:
     profile = ModelProfile(model_profile)
     mode = EvidenceMode(evidence_mode)
@@ -83,6 +89,10 @@ def build_model_inputs(
     team_cfg = team_state_config or TeamStateConfig()
 
     if profile is ModelProfile.LIVE_ENHANCED:
+        if historical_positions is not None:
+            raise ModelProfileError(
+                "historical weekly-roster positions are a STRUCTURAL_CORE input only"
+            )
         if mode is not EvidenceMode.LIVE_PIT:
             raise ModelProfileError(
                 "LIVE_ENHANCED cannot run under HISTORICAL_WALK_FORWARD: historical "
@@ -128,6 +138,11 @@ def build_model_inputs(
         # Same live receipt gate as LIVE_ENHANCED; the slate restriction
         # above only removes rows.
         history_time_col, strict = "available_at", False
+
+    if historical_positions is not None:
+        players = resolve_position_groups(
+            players, historical_positions, target_slate=target_slate
+        )
 
     return ModelInputs(
         model_profile=profile,

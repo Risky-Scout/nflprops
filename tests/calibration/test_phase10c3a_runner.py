@@ -110,6 +110,18 @@ def _build_two_season_warehouse(root: Path) -> Warehouse:
             ]
         ),
     )
+    warehouse.write(
+        "historical_player_positions",
+        pl.DataFrame(
+            [
+                {"canonical_player_id": pid, "season": 2023, "week": 1, "team": team,
+                 "position_group": group, "conflict_status": "NONE"}
+                for pid, team, group in (
+                    (HOME_WR_ID, "HOME", "WR"), (HOME_RB_ID, "HOME", "RB"), (AWAY_WR_ID, "AWAY", "WR"),
+                )
+            ]
+        ),
+    )
     return warehouse
 
 

@@ -67,7 +67,9 @@ EVENT_DERIVED_TABLES: frozenset[str] = frozenset(
     {"games", "player_game_stats", "team_game_stats"}
 )
 #: Contemporaneous pregame observations: only a genuine availability time
-#: proves them. `players` is an un-timed identity dimension (position group).
+#: proves them. `players` is an un-timed identity dimension (position group);
+#: `historical_player_positions` is identity versioned by roster week, read
+#: only at or before the target week.
 PREGAME_OBSERVATION_TABLES: frozenset[str] = frozenset(
     {
         "roster_snapshots",
@@ -78,12 +80,18 @@ PREGAME_OBSERVATION_TABLES: frozenset[str] = frozenset(
         "player_prop_openings",
     }
 )
-IDENTITY_TABLES: frozenset[str] = frozenset({"players"})
+IDENTITY_TABLES: frozenset[str] = frozenset({"players", "historical_player_positions"})
 
 #: The warehouse tables each model profile's fundamental model consumes.
 PROFILE_INPUT_TABLES: Mapping[ModelProfile, frozenset[str]] = {
     ModelProfile.STRUCTURAL_CORE: frozenset(
-        {"games", "player_game_stats", "team_game_stats", "players"}
+        {
+            "games",
+            "player_game_stats",
+            "team_game_stats",
+            "players",
+            "historical_player_positions",
+        }
     ),
     ModelProfile.LIVE_ENHANCED: frozenset(
         {
