@@ -50,6 +50,10 @@ tables:
       key: [canonical_player_id, season, week, team]
       pit: false
       note: "nflverse weekly-roster position per roster week; resolved at or before the target week only, never backward"
+    historical_team_membership:
+      key: [canonical_player_id, season, week, team, roster_status]
+      pit: false
+      note: "nflverse weekly-roster status per roster week; QB candidates are members (ACT/INA/RES/DEV) of the target team at the target week exactly"
 
   schedule:
     games:

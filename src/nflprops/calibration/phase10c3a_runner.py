@@ -98,8 +98,10 @@ from nflprops.domain.model_profile import (
     ModelProfile,
     ModelProfileError,
     parse_model_profile,
+    profile_base_model_version,
 )
 from nflprops.features.historical_positions import HISTORICAL_POSITIONS_TABLE
+from nflprops.features.team_membership import HISTORICAL_TEAM_MEMBERSHIP_TABLE
 
 #: The only draw count this module will accept for a `--mode production`
 #: run -- the certified live-prediction default
@@ -498,6 +500,13 @@ def run(config: RunnerConfig) -> dict[str, Any]:
             f"data root has no {HISTORICAL_POSITIONS_TABLE!r} table "
             "(tools/build_historical_positions.py)"
         )
+    if not warehouse.exists(HISTORICAL_TEAM_MEMBERSHIP_TABLE):
+        # Without week-versioned roster membership no QB is a structural
+        # candidate; departed/retired QBs must never be inferred instead.
+        raise ConfigurationError(
+            f"data root has no {HISTORICAL_TEAM_MEMBERSHIP_TABLE!r} table "
+            "(tools/build_historical_positions.py)"
+        )
     tables = load_warehouse_tables(warehouse)
     evidence_class, evidence_rows = classify_model_evidence(
         tables.as_table_mapping(), evidence_mode=EVIDENCE_MODE, model_profile=MODEL_PROFILE
@@ -652,7 +661,7 @@ def run(config: RunnerConfig) -> dict[str, Any]:
         optimizer="L-BFGS-B",
         tolerance=1e-8,
         calibration_schema_version="2026.1.0",
-        base_model_version=config.model_version,
+        base_model_version=profile_base_model_version(config.model_version, MODEL_PROFILE),
         simulation_config_version="sim-v1",
         prop_contract_version="2026.1.0",
         calibration_contract_version="2026.1.0",

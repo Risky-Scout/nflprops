@@ -474,6 +474,19 @@ HISTORICAL_REPLAY_INPUT_SURFACE: Mapping[str, InputAudit] = {
         "never read (resolve_position_groups)",
         "NONE: no later week, no stat magnitude and no target outcome decides position",
     ),
+    "historical_team_membership": InputAudit(
+        "historical_team_membership",
+        "QB candidate membership: which team, if any, a QB belongs to at the target week",
+        "nflverse weekly roster status per (season, week, team), keyed by the same "
+        "team-week-co-occurrence crosswalk",
+        InputCertification.SAFE_HISTORICAL_PREGAME,
+        True,
+        "the target week's roster status only; never an earlier week carried forward, "
+        "never a later week (historical_team_membership_at); active, inactive, reserve "
+        "and practice-squad statuses are one class, so no injury distinction is read",
+        "NONE: no later week, no depth, no injury designation and no outcome decides "
+        "membership",
+    ),
     "roster_snapshots": InputAudit(
         "roster_snapshots",
         "depth + roster-only (no stat row) players; active defaults True without it",

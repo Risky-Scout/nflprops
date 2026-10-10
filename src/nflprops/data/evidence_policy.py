@@ -80,7 +80,9 @@ PREGAME_OBSERVATION_TABLES: frozenset[str] = frozenset(
         "player_prop_openings",
     }
 )
-IDENTITY_TABLES: frozenset[str] = frozenset({"players", "historical_player_positions"})
+IDENTITY_TABLES: frozenset[str] = frozenset(
+    {"players", "historical_player_positions", "historical_team_membership"}
+)
 
 #: The warehouse tables each model profile's fundamental model consumes.
 PROFILE_INPUT_TABLES: Mapping[ModelProfile, frozenset[str]] = {
@@ -91,6 +93,7 @@ PROFILE_INPUT_TABLES: Mapping[ModelProfile, frozenset[str]] = {
             "team_game_stats",
             "players",
             "historical_player_positions",
+            "historical_team_membership",
         }
     ),
     ModelProfile.LIVE_ENHANCED: frozenset(
@@ -105,6 +108,22 @@ PROFILE_INPUT_TABLES: Mapping[ModelProfile, frozenset[str]] = {
         }
     ),
 }
+
+
+def profile_input_tables(
+    model_profile: ModelProfile, evidence_mode: EvidenceMode
+) -> frozenset[str]:
+    """The tables a profile consumes under a mode. STRUCTURAL_CORE reads live
+    roster snapshots under LIVE_PIT for team membership only (its QB
+    candidates); under HISTORICAL_WALK_FORWARD membership is the weekly
+    roster identity table instead and roster snapshots are never read."""
+    tables = PROFILE_INPUT_TABLES[ModelProfile(model_profile)]
+    if (
+        ModelProfile(model_profile) is ModelProfile.STRUCTURAL_CORE
+        and EvidenceMode(evidence_mode) is EvidenceMode.LIVE_PIT
+    ):
+        return tables | {"roster_snapshots"}
+    return tables
 
 
 class EvidenceClass(StrEnum):
@@ -208,11 +227,11 @@ def classify_model_evidence(
     certified by event chronology; one estimated row in a consumed
     pregame-observation table makes the run RESEARCH_ONLY; a consumed table
     of no known semantic type fails closed."""
+    mode = EvidenceMode(evidence_mode)
     consumed = {
         name: frame for name, frame in tables.items()
-        if name in PROFILE_INPUT_TABLES[ModelProfile(model_profile)]
+        if name in profile_input_tables(model_profile, mode)
     }
-    mode = EvidenceMode(evidence_mode)
     if mode is EvidenceMode.LIVE_PIT:
         return classify_tables(consumed)
     unknown = sorted(

@@ -302,16 +302,35 @@ def _positions(rows: list[tuple[str, int, str]]) -> pl.DataFrame:
 
 HOME_RB_QB = _positions([(HOME_RB, 1, "QB")])
 
+G1_AS_OF = datetime(2024, 9, 22, 16, 30, tzinfo=UTC)
+#: HOME_RB is on HOME's roster at the target week (week 3): the weekly
+#: roster membership row (historical) and a live roster batch row (live).
+HOME_RB_MEMBER = pl.DataFrame(
+    [{"canonical_player_id": HOME_RB, "season": 2024, "week": 3, "team": "HOM",
+      "canonical_team_id": HOME, "roster_status": "ACT", "is_member": True}],
+    schema_overrides={"season": pl.Int64, "week": pl.Int64},
+)
+HOME_RB_ROSTER = pl.DataFrame([
+    {"canonical_player_id": HOME_RB, "canonical_team_id": HOME, "depth": 3,
+     "available_at": G1_AS_OF - timedelta(hours=3), "available_at_is_estimated": False},
+])
+
 
 def _inputs(world, mode, *, players=UNKNOWN_DIM, positions=HOME_RB_QB,
-            profile=ModelProfile.STRUCTURAL_CORE):
+            profile=ModelProfile.STRUCTURAL_CORE, membership=HOME_RB_MEMBER,
+            member_roster=HOME_RB_ROSTER):
+    hwf = mode is EvidenceMode.HISTORICAL_WALK_FORWARD
+    roster = world["roster"]
+    if not hwf and member_roster is not None:
+        roster = pl.concat([roster, member_roster], how="diagonal_relaxed")
     return build_model_inputs(
         model_profile=profile, evidence_mode=mode, games=world["games"],
         player_stats=world["player_stats"], team_stats=world["team_stats"], players=players,
-        roster=world["roster"], injuries=world["injuries"], game_odds=world["game_odds"],
-        as_of=datetime(2024, 9, 22, 16, 30, tzinfo=UTC), target_slate=TARGET_SLATE,
-        target_game_id="g1:game:target" if mode is EvidenceMode.HISTORICAL_WALK_FORWARD else None,
+        roster=roster, injuries=world["injuries"], game_odds=world["game_odds"],
+        as_of=G1_AS_OF, target_slate=TARGET_SLATE,
+        target_game_id="g1:game:target" if hwf else None,
         historical_positions=positions,
+        historical_team_membership=membership if hwf else None,
     )
 
 
@@ -367,6 +386,7 @@ def test_pos15_historical_and_live_identical_with_equivalent_positions(monkeypat
 def test_live_enhanced_never_takes_historical_positions() -> None:
     with pytest.raises(ModelProfileError):
         _inputs(live_world(), EvidenceMode.LIVE_PIT, profile=ModelProfile.LIVE_ENHANCED)
+
 
 
 def test_positions_table_is_certified_identity_evidence() -> None:

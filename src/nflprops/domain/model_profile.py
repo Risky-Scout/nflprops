@@ -11,6 +11,11 @@
 
 The profile is a configuration leaf (`model.profile`), so it is part of
 `config_sha256` and therefore of every run identity derived from it.
+
+`PROFILE_SCIENCE_VERSIONS` versions each profile's effective science
+contract. A calibrator binds to it through `profile_base_model_version`
+(its `base_model_version`, part of the compatibility digest), so an
+artifact fitted on an earlier contract never resolves for a later one.
 """
 
 from __future__ import annotations
@@ -28,6 +33,19 @@ class ModelProfile(StrEnum):
 
 class ModelProfileError(ValueError):
     """A model profile is missing, unknown, or mismatched."""
+
+
+#: v2: QB candidates are the target team's structural roster members and
+#: `qb_attempt_share` is team-relative (nflprops.features.team_membership).
+PROFILE_SCIENCE_VERSIONS: dict[ModelProfile, str] = {
+    ModelProfile.STRUCTURAL_CORE: "structural-core.v2-qb-roster-membership",
+    ModelProfile.LIVE_ENHANCED: "live-enhanced.v2-qb-roster-membership",
+}
+
+
+def profile_base_model_version(model_version: str, profile: object) -> str:
+    """`model_version` qualified by the profile's science contract."""
+    return f"{model_version}+{PROFILE_SCIENCE_VERSIONS[parse_model_profile(profile)]}"
 
 
 class _ConfigLike(Protocol):

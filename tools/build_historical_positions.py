@@ -1,10 +1,13 @@
-"""Build the BDL <-> nflverse player crosswalk and the week-versioned
-historical position table from the pinned nflverse weekly roster files.
+"""Build the BDL <-> nflverse player crosswalk, the week-versioned
+historical position table and the week-versioned team-membership table
+from the pinned nflverse weekly roster files.
 
 Reads (never writes) the raw nflverse files and the canonical `games`,
-`player_game_stats`, `teams` and `players` tables; writes only the two
-derived tables `player_crosswalk_nflverse` and `historical_player_positions`
-into the data root. See `nflprops.features.historical_positions`.
+`player_game_stats`, `teams` and `players` tables; writes only the three
+derived tables `player_crosswalk_nflverse`, `historical_player_positions`
+and `historical_team_membership` into the data root. See
+`nflprops.features.historical_positions` and
+`nflprops.features.team_membership`.
 """
 
 from __future__ import annotations
@@ -23,6 +26,11 @@ from nflprops.features.historical_positions import (
     build_historical_positions,
     build_player_crosswalk,
     load_nflverse_weekly_rosters,
+)
+from nflprops.features.team_membership import (
+    HISTORICAL_TEAM_MEMBERSHIP_TABLE,
+    build_historical_team_membership,
+    load_nflverse_roster_status,
 )
 
 
@@ -45,8 +53,14 @@ def main(argv: list[str] | None = None) -> int:
         players=warehouse.read("players"),
     )
     positions = build_historical_positions(rosters, crosswalk)
+    membership = build_historical_team_membership(
+        load_nflverse_roster_status(args.nflverse_dir, tuple(args.seasons)),
+        crosswalk,
+        warehouse.read("teams"),
+    )
     warehouse.write(PLAYER_CROSSWALK_TABLE, crosswalk)
     warehouse.write(HISTORICAL_POSITIONS_TABLE, positions)
+    warehouse.write(HISTORICAL_TEAM_MEMBERSHIP_TABLE, membership)
     summary = {
         "seasons": args.seasons,
         "roster_rows": rosters.height,
@@ -56,6 +70,8 @@ def main(argv: list[str] | None = None) -> int:
         "position_rows": positions.height,
         "position_players": positions["canonical_player_id"].n_unique(),
         "conflict_rows": positions.filter(pl.col("conflict_status") == "CONFLICT").height,
+        "membership_rows": membership.height,
+        "membership_member_rows": membership.filter(pl.col("is_member")).height,
     }
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
