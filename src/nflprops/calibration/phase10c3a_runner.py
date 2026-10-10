@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
+import polars as pl
 
 from nflprops.backtest.protocol import WalkForwardFold
 from nflprops.calibration.artifact import (
@@ -75,11 +76,12 @@ from nflprops.calibration.diagnostics import (
 )
 from nflprops.calibration.entropy_tilting import softmax_weights
 from nflprops.calibration.historical_runner import (
+    EVIDENCE_MODE,
+    MODEL_PROFILE,
     compute_data_root_manifest_sha256,
     compute_training_manifest_sha256,
     list_final_games,
     load_warehouse_tables,
-    official_tables,
     replay_games,
 )
 from nflprops.calibration.joint_feature_contract import (
@@ -88,9 +90,28 @@ from nflprops.calibration.joint_feature_contract import (
 )
 from nflprops.calibration.scoring import skill_score
 from nflprops.calibration.weighted_pmf import build_weighted_first_td_simplex
-from nflprops.data.evidence_policy import EvidenceClass, classify_tables, official_view
+from nflprops.data.evidence_policy import (
+    EvidenceClass,
+    classify_model_evidence,
+    promotion_evidence_allowed,
+)
 from nflprops.data.warehouse import Warehouse
 from nflprops.domain.enums import PropType
+from nflprops.domain.model_profile import (
+    ModelProfile,
+    ModelProfileError,
+    parse_model_profile,
+    profile_base_model_version,
+)
+from nflprops.features.historical_positions import (
+    HISTORICAL_POSITIONS_TABLE,
+    NFLVERSE_WEEKLY_ROSTER_SOURCES,
+    RESOLUTION_VERSION,
+)
+from nflprops.features.team_membership import (
+    HISTORICAL_TEAM_MEMBERSHIP_TABLE,
+    MEMBERSHIP_VERSION,
+)
 
 if TYPE_CHECKING:
     from nflprops.data.storage.base import StorageBackend
@@ -159,13 +180,28 @@ class RunnerConfig:
     regularization_lambda: float
     max_fit_iterations: int
     expect_data_manifest_sha256: str | None
-    #: "official" (default): RESEARCH_ONLY estimated-availability rows are
-    #: dropped before replay, so only genuinely PIT-known data is used.
-    #: "research": every row is used, and the run can NEVER be promotion,
+    #: "official" (default): the run's evidence class is the Gate 1
+    #: semantic classification of what STRUCTURAL_CORE consumes under
+    #: HISTORICAL_WALK_FORWARD (`classify_model_evidence`).
+    #: "research": the run is RESEARCH_ONLY and can NEVER be promotion,
     #: recalibration-approval or certification evidence.
     evidence: str = "official"
+    #: Historical replay can only certify STRUCTURAL_CORE (Gate 1): the
+    #: 2022-2025 pregame observations LIVE_ENHANCED needs have no certified
+    #: historical availability. Anything else is refused before replay.
+    model_profile: str = ModelProfile.STRUCTURAL_CORE.value
 
     def __post_init__(self) -> None:
+        try:
+            profile = parse_model_profile(self.model_profile)
+        except ModelProfileError as exc:
+            raise ConfigurationError(str(exc)) from None
+        if profile is not MODEL_PROFILE:
+            raise ConfigurationError(
+                f"--model-profile {profile.value} cannot run under {EVIDENCE_MODE.value}: "
+                "historical game odds, injuries and roster depth have no certified "
+                f"availability; Phase 10C3A validates {MODEL_PROFILE.value} only"
+            )
         if self.mode not in ("production", "smoke"):
             raise ConfigurationError(f"--mode must be 'production' or 'smoke', got {self.mode!r}")
         if self.evidence not in ("official", "research"):
@@ -211,6 +247,11 @@ def parse_args(argv: list[str] | None = None) -> RunnerConfig:
              "rows are excluded). research: all rows; never promotion evidence.",
     )
     parser.add_argument("--model-version", default="phase10c3a-real-run-v1")
+    parser.add_argument(
+        "--model-profile", choices=[p.value for p in ModelProfile],
+        default=ModelProfile.STRUCTURAL_CORE.value,
+        help="Only STRUCTURAL_CORE is accepted (historical walk-forward).",
+    )
     parser.add_argument("--regularization-lambda", type=float, default=0.01)
     parser.add_argument("--max-fit-iterations", type=int, default=200)
     parser.add_argument(
@@ -232,7 +273,66 @@ def parse_args(argv: list[str] | None = None) -> RunnerConfig:
         max_fit_iterations=ns.max_fit_iterations,
         expect_data_manifest_sha256=ns.expect_data_manifest_sha256,
         evidence=ns.evidence,
+        model_profile=ns.model_profile,
     )
+
+
+#: Columns replay reads from each week-versioned identity table, and the
+#: build-version column/value `tools/build_historical_positions.py` stamps.
+_IDENTITY_TABLE_CONTRACTS: dict[str, tuple[tuple[str, ...], str, str]] = {
+    HISTORICAL_POSITIONS_TABLE: (
+        ("canonical_player_id", "season", "week", "team", "position_group", "conflict_status"),
+        "resolution_version",
+        RESOLUTION_VERSION,
+    ),
+    HISTORICAL_TEAM_MEMBERSHIP_TABLE: (
+        ("canonical_player_id", "season", "week", "team", "canonical_team_id", "is_member"),
+        "membership_version",
+        MEMBERSHIP_VERSION,
+    ),
+}
+
+
+def _require_compatible_identity_tables(
+    tables: dict[str, pl.DataFrame], *, production: bool
+) -> None:
+    """Fail closed on an empty or schema-incompatible identity table. A
+    production run also requires this build version and every row sourced
+    from a pinned nflverse weekly-roster file."""
+    pinned = {str(src["sha256"]) for src in NFLVERSE_WEEKLY_ROSTER_SOURCES.values()}
+    for table, (columns, version_col, version) in _IDENTITY_TABLE_CONTRACTS.items():
+        frame = tables[table]
+        missing = sorted(set(columns) - set(frame.columns))
+        if frame.is_empty() or missing:
+            raise ConfigurationError(
+                f"{table!r} is empty or incompatible (missing columns {missing}); "
+                "rebuild it with tools/build_historical_positions.py"
+            )
+        if not production:
+            continue
+        versions = (
+            set(frame[version_col].unique().to_list()) if version_col in frame.columns else {None}
+        )
+        sources = (
+            set(frame["source_sha256"].unique().to_list())
+            if "source_sha256" in frame.columns else {None}
+        )
+        if versions != {version} or not sources <= pinned:
+            raise ConfigurationError(
+                f"{table!r} was not built by this science from the pinned nflverse "
+                f"weekly rosters (versions {sorted(map(str, versions))}, "
+                f"unpinned sources {sorted(map(str, sources - pinned))}); "
+                "rebuild it with tools/build_historical_positions.py"
+            )
+
+
+def _profile_input_faithful(game: LabeledGame) -> bool:
+    """Whether every input the certified profile consumes was PIT-faithful
+    for `game`. STRUCTURAL_CORE consumes no injury input, so a missing
+    injury feed (`injury_data_available=False`, every 2022-2025 game)
+    degrades nothing it uses -- historically or live. A profile that
+    consumed injuries would need the feed."""
+    return MODEL_PROFILE is ModelProfile.STRUCTURAL_CORE or game.injury_data_available
 
 
 def _log(output_dir: Path, msg: str) -> None:
@@ -479,23 +579,40 @@ def run(config: RunnerConfig) -> dict[str, Any]:
         )
 
     warehouse = Warehouse(config.data_root)
+    if not warehouse.exists(HISTORICAL_POSITIONS_TABLE):
+        # The 2026 players dimension marks departed players Unknown; without
+        # week-versioned historical positions replay would mis-group them.
+        raise ConfigurationError(
+            f"data root has no {HISTORICAL_POSITIONS_TABLE!r} table "
+            "(tools/build_historical_positions.py)"
+        )
+    if not warehouse.exists(HISTORICAL_TEAM_MEMBERSHIP_TABLE):
+        # Without week-versioned roster membership no QB is a structural
+        # candidate; departed/retired QBs must never be inferred instead.
+        raise ConfigurationError(
+            f"data root has no {HISTORICAL_TEAM_MEMBERSHIP_TABLE!r} table "
+            "(tools/build_historical_positions.py)"
+        )
     tables = load_warehouse_tables(cast("StorageBackend", warehouse))
+    _require_compatible_identity_tables(
+        tables.as_table_mapping(), production=config.mode == "production"
+    )
+    source_class, evidence_rows = classify_model_evidence(
+        tables.as_table_mapping(), evidence_mode=EVIDENCE_MODE, model_profile=MODEL_PROFILE
+    )
+    # "research" can only ever demote: such a run is never promotion evidence.
+    evidence_class = (
+        source_class if config.evidence == "official" else EvidenceClass.RESEARCH_ONLY
+    )
     games = list_final_games(
         cast("StorageBackend", warehouse),
         season_min=config.season_min,
         season_max=config.season_max,
     )
-    source_class, estimated_rows = classify_tables(tables.as_mapping())
-    if config.evidence == "official":
-        # Official evidence: only what was genuinely known at each cutoff.
-        tables = official_tables(tables)
-        games = official_view(games)
-        evidence_class = EvidenceClass.OFFICIAL_PIT_FAITHFUL
-    else:
-        evidence_class = EvidenceClass.RESEARCH_ONLY
-    log(f"evidence={config.evidence} class={evidence_class} source={source_class} "
-        f"estimated_rows={estimated_rows}")
-    log(f"total final games: {games.height}")
+    log(f"total final games: {games.height}; model_profile={MODEL_PROFILE.value} "
+        f"evidence_mode={EVIDENCE_MODE.value} evidence={config.evidence} "
+        f"evidence_class={evidence_class.value} source_class={source_class.value} "
+        f"estimated_rows={evidence_rows}")
 
     def progress(i: int, total: int, _gid: str) -> None:
         if i % 200 == 0 or i == total:
@@ -540,8 +657,8 @@ def run(config: RunnerConfig) -> dict[str, Any]:
 
         weight_health = verify_weight_health_and_positivity(fr.fold_id, score_games, theta)
 
-        faithful = tuple(g for g in score_games if g.injury_data_available)
-        degraded = tuple(g for g in score_games if not g.injury_data_available)
+        faithful = tuple(g for g in score_games if _profile_input_faithful(g))
+        degraded = tuple(g for g in score_games if not _profile_input_faithful(g))
         faithful_challenger = _aggregate_scores(faithful, theta) if faithful else {}
         faithful_baseline = _aggregate_scores(faithful, np.zeros(len(FEATURE_NAMES))) if faithful else {}
         degraded_challenger = _aggregate_scores(degraded, theta) if degraded else {}
@@ -560,6 +677,9 @@ def run(config: RunnerConfig) -> dict[str, Any]:
                 "scoring_game_count": len(score_games),
                 "pit_faithful_scoring_game_count": len(faithful),
                 "pit_degraded_scoring_game_count": len(degraded),
+                "injury_feed_available_scoring_game_count": sum(
+                    1 for g in score_games if g.injury_data_available
+                ),
                 "theta": list(fr.fit.theta),
                 "theta_norm": parameter_magnitude(theta),
                 "converged": fr.fit.converged,
@@ -612,7 +732,9 @@ def run(config: RunnerConfig) -> dict[str, Any]:
     overall_promo = evaluate_promotion_gate(list(fold_results), games_by_fold)
     faithful_evidence_exists = any(fr["pit_faithful_scoring_game_count"] > 0 for fr in fold_reports)
 
-    if config.mode == "smoke" or evidence_class is not EvidenceClass.OFFICIAL_PIT_FAITHFUL:
+    if config.mode == "smoke" or not promotion_evidence_allowed(
+        evidence_class, evidence_mode=EVIDENCE_MODE
+    ):
         promotion_decision = "INSUFFICIENT_EVIDENCE"  # never promotable
     elif not faithful_evidence_exists:
         promotion_decision = "INSUFFICIENT_EVIDENCE"  # INSUFFICIENT_PIT_FAITHFUL_EVIDENCE
@@ -637,7 +759,7 @@ def run(config: RunnerConfig) -> dict[str, Any]:
         optimizer="L-BFGS-B",
         tolerance=1e-8,
         calibration_schema_version="2026.1.0",
-        base_model_version=config.model_version,
+        base_model_version=profile_base_model_version(config.model_version, MODEL_PROFILE),
         simulation_config_version="sim-v1",
         prop_contract_version="2026.1.0",
         calibration_contract_version="2026.1.0",
@@ -665,22 +787,31 @@ def run(config: RunnerConfig) -> dict[str, Any]:
         support_preservation_passed=True,
         first_td_simplex_passed=coherence["passed"],
         promotion_gate_passed=(promotion_decision == "ELIGIBLE_FOR_PROMOTION"),
+        model_profile=MODEL_PROFILE.value,
+        evidence_mode=EVIDENCE_MODE.value,
+        evidence_class=evidence_class.value,
     )
     log(f"registered challenger artifact: {registration.register_result.artifact.calibration_artifact_id}")
 
     report: dict[str, Any] = {
         "phase": "10C3A",
         "mode": config.mode,
+        "evidence_mode": EVIDENCE_MODE.value,
+        "model_profile": MODEL_PROFILE.value,
+        "evidence_class": evidence_class.value,
+        "evidence_estimated_rows": evidence_rows,
+        "pit_faithful_definition": (
+            "profile-input-faithful: every input the model profile consumes is "
+            "certified at the cutoff (STRUCTURAL_CORE consumes no injury feed)"
+        ),
         "n_draws": config.n_draws,
         "model_version": config.model_version,
         "data_root": str(config.data_root),
         "data_root_manifest_sha256": data_manifest_sha256,
-        "evidence_class": str(evidence_class),
         "evidence_policy": {
             "requested": config.evidence,
-            "source_data_class": str(source_class),
-            "estimated_rows_in_source": estimated_rows,
-            "estimated_rows_excluded": estimated_rows if config.evidence == "official" else {},
+            "source_data_class": source_class.value,
+            "estimated_rows_in_source": evidence_rows,
         },
         "season_min": config.season_min,
         "season_max": config.season_max,

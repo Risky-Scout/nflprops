@@ -110,6 +110,31 @@ def _build_two_season_warehouse(root: Path) -> Warehouse:
             ]
         ),
     )
+    warehouse.write(
+        "historical_player_positions",
+        pl.DataFrame(
+            [
+                {"canonical_player_id": pid, "season": 2023, "week": 1, "team": team,
+                 "position_group": group, "conflict_status": "NONE"}
+                for pid, team, group in (
+                    (HOME_WR_ID, "HOME", "WR"), (HOME_RB_ID, "HOME", "RB"), (AWAY_WR_ID, "AWAY", "WR"),
+                )
+            ]
+        ),
+    )
+    warehouse.write(
+        "historical_team_membership",
+        pl.DataFrame(
+            [
+                {"canonical_player_id": pid, "season": 2023, "week": 1, "team": team,
+                 "canonical_team_id": team_id, "roster_status": "ACT", "is_member": True}
+                for pid, team, team_id in (
+                    (HOME_WR_ID, "HOME", HOME_TEAM_ID), (HOME_RB_ID, "HOME", HOME_TEAM_ID),
+                    (AWAY_WR_ID, "AWAY", AWAY_TEAM_ID),
+                )
+            ]
+        ),
+    )
     return warehouse
 
 
@@ -202,6 +227,18 @@ def test_full_smoke_run_produces_report_and_exit_zero(tmp_path: Path) -> None:
 
     # report is genuinely JSON-serializable (already written to disk by run())
     json.dumps(report)
+
+
+def test_runner_refuses_a_data_root_without_team_membership(tmp_path: Path) -> None:
+    warehouse = _build_two_season_warehouse(tmp_path)
+    (warehouse.root / "historical_team_membership.parquet").unlink()
+    config = RunnerConfig(
+        data_root=warehouse.root, output_dir=tmp_path / "out", season_min=2023,
+        season_max=2024, n_draws=60, mode="smoke", model_version="smoke-v1",
+        regularization_lambda=0.01, max_fit_iterations=20, expect_data_manifest_sha256=None,
+    )
+    with pytest.raises(ConfigurationError, match="historical_team_membership"):
+        run(config)
 
 
 def test_main_writes_json_report_file_and_returns_zero(tmp_path: Path) -> None:

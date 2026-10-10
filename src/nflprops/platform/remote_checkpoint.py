@@ -60,6 +60,7 @@ from nflprops.data.evidence_policy import (
     require_official_warehouse,
 )
 from nflprops.data.warehouse import Warehouse
+from nflprops.domain.model_profile import ModelProfile, resolve_model_profile
 from nflprops.errors import NflpropsError
 from nflprops.orchestration.checkpoints import CheckpointName
 from nflprops.orchestration.dispatch_plan import as_run_store_backend
@@ -384,16 +385,22 @@ def verify_request_against_snapshot(
     return run
 
 
-def evaluate_calibration_gate(warehouse: Warehouse, run: PredictionRunRecord) -> dict[str, Any]:
+def evaluate_calibration_gate(
+    warehouse: Warehouse, run: PredictionRunRecord, *, model_profile: ModelProfile
+) -> dict[str, Any]:
     """Fail-closed calibration applicability for one run. Never a raw-model
-    fallback labelled calibrated: anything but APPLIED blocks PUBLIC_READY."""
+    fallback labelled calibrated: anything but APPLIED blocks PUBLIC_READY.
+    Only a champion fitted on `model_profile`'s predictions -- bound to the
+    profile's science contract (`profile_base_model_version`) -- resolves."""
     from nflprops.calibration.contract import load_calibration_registry_contract
     from nflprops.calibration.joint_feature_contract import FEATURE_CONTRACT_VERSION
     from nflprops.calibration.registry import resolve_calibration_champion
+    from nflprops.domain.model_profile import profile_base_model_version
 
     base: dict[str, Any] = {
         "scope_type": CALIBRATION_SCOPE_TYPE,
-        "base_model_version": run.model_version,
+        "model_profile": model_profile.value,
+        "base_model_version": profile_base_model_version(run.model_version, model_profile),
         "simulation_config_version": SIMULATION_CONFIG_VERSION,
         "feature_contract_version": FEATURE_CONTRACT_VERSION,
         "prop_contract_version": PROP_CONTRACT_VERSION,
@@ -412,7 +419,8 @@ def evaluate_calibration_gate(warehouse: Warehouse, run: PredictionRunRecord) ->
             as_run_store_backend(warehouse),
             scope_type=CALIBRATION_SCOPE_TYPE,
             checkpoint_scope=scope,
-            base_model_version=run.model_version,
+            model_profile=model_profile.value,
+            base_model_version=base["base_model_version"],
             simulation_config_version=SIMULATION_CONFIG_VERSION,
             feature_contract_version=FEATURE_CONTRACT_VERSION,
             prop_contract_version=PROP_CONTRACT_VERSION,
@@ -489,6 +497,7 @@ def execute_checkpoint(
     )
 
     player_state_cfg, team_state_cfg = state_configs_from_app_config(config)
+    model_profile = resolve_model_profile(config)
     ctx = CheckpointRunContext(
         warehouse=warehouse,
         season=run.season,
@@ -503,6 +512,7 @@ def execute_checkpoint(
         retain_joint_draws=int(config.get_path("simulation.retain_joint_draws", 0)),
         max_confidence_tier=int(config.get_path("market.max_confidence_tier", 2)),
         market_mode=market_mode,
+        model_profile=model_profile,
         simulation_config=simulation_config_from_app_config(config, n_draws=PRODUCTION_N_DRAWS),
         player_state_config=player_state_cfg,
         team_state_config=team_state_cfg,
@@ -523,7 +533,7 @@ def execute_checkpoint(
             rows.write_parquet(tables_dir / f"{table}.parquet")
     _run_rows(warehouse, "prediction_runs", run.run_id).write_parquet(out_dir / RUN_TABLE_FILE)
 
-    calibration = evaluate_calibration_gate(warehouse, final)
+    calibration = evaluate_calibration_gate(warehouse, final, model_profile=model_profile)
     decision, reasons = public_decision(
         final, calibration=calibration, distribution_count=counts["player_prop_distributions"]
     )

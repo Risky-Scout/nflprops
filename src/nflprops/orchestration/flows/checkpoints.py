@@ -52,6 +52,7 @@ from nflprops.backtest.provenance import StateProvenanceContext
 from nflprops.config import Config
 from nflprops.data.warehouse import Warehouse
 from nflprops.distributions.build import build_player_prop_distributions
+from nflprops.domain.model_profile import ModelProfile, resolve_model_profile
 from nflprops.errors import LeakageError as CoreLeakageError
 from nflprops.orchestration.checkpoints import (
     CheckpointAction,
@@ -113,6 +114,8 @@ class CheckpointRunContext:
     retain_joint_draws: int
     max_confidence_tier: int
     market_mode: str
+    #: Required: an official execution never infers its model profile.
+    model_profile: ModelProfile
     simulation_config: SimulationConfig | None = None
     player_state_config: PlayerStateConfig | None = None
     team_state_config: TeamStateConfig | None = None
@@ -263,6 +266,7 @@ def _run_game_checkpoint_task(
         max_confidence_tier=ctx.max_confidence_tier,
         market_mode=ctx.market_mode,
         state_context_callback=on_state_context,
+        model_profile=ctx.model_profile,
     )
     if computation is None:
         return _CheckpointExecution(
@@ -797,6 +801,9 @@ def checkpoint_dispatch_flow(
     `claim_checkpoint`'s atomic insert is the sole source of that
     guarantee, not any check performed here.
     """
+    # Fail closed before claiming anything: the profile is part of the
+    # config identity (config_sha256 -> run_id) and must be explicit.
+    resolved_model_profile = resolve_model_profile(config)
     settings = DispatchSettings.resolve(
         config,
         model_version=model_version,
@@ -844,6 +851,7 @@ def checkpoint_dispatch_flow(
             retain_joint_draws=settings.retain_joint_draws,
             max_confidence_tier=resolved_tier,
             market_mode=market_mode,
+            model_profile=resolved_model_profile,
             simulation_config=simulation_config,
             player_state_config=player_state_config,
             team_state_config=team_state_config,
