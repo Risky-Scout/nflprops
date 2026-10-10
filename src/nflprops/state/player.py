@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -10,6 +11,7 @@ import polars as pl
 
 from nflprops.data.outcome_versions import as_known_at
 from nflprops.features.asof import filter_pit
+from nflprops.features.historical_evidence import PERFORMANCE_EVENT_COL
 
 
 @dataclass(frozen=True)
@@ -268,6 +270,55 @@ def _qb_weights(
     return weights * valid
 
 
+def _team_qb_opportunity(
+    ps: pl.DataFrame,
+    *,
+    as_of: datetime,
+    weight_col: str,
+    half_life_days: float,
+) -> tuple[dict[str, float], dict[tuple[str, str], float]]:
+    """Team-relative prior QB opportunity.
+
+    Returns (team -> recency-weighted reconciled QB attempts over ALL of the
+    team's admissible prior games, (player, team) -> the player's
+    recency-weighted attempts in those same games). A game is weighted once,
+    by its own clock and reconciliation, for numerator and denominator
+    alike, so a game in which a player threw nothing still counts in his
+    team's denominator."""
+    keys = ["canonical_game_id", "canonical_team_id"]
+    team_games = (
+        ps.group_by(keys)
+        .agg(
+            pl.col(weight_col).max().alias("_tg_time"),
+            pl.col("_qb_reconciled").any().alias("_tg_reconciled"),
+            pl.when(pl.col("_qb_reconciled"))
+            .then(pl.col("passing_attempts").fill_null(0))
+            .otherwise(0)
+            .sum()
+            .alias("_tg_qb_attempts"),
+        )
+        .sort(keys)
+    )
+    weights = _time_weights(
+        team_games["_tg_time"].to_list(), as_of, half_life_days
+    ) * np.asarray(team_games["_tg_reconciled"].to_list(), dtype=float)
+    game_weight: dict[tuple[str, str], float] = {}
+    team_total: dict[str, float] = {}
+    for (gid, tid, attempts), w in zip(
+        team_games.select(*keys, "_tg_qb_attempts").iter_rows(), weights, strict=True
+    ):
+        game_weight[(str(gid), str(tid))] = float(w)
+        team_total[str(tid)] = team_total.get(str(tid), 0.0) + float(w) * float(attempts)
+    player_attempts: dict[tuple[str, str], float] = {}
+    rows = ps.select(*keys, "canonical_player_id", pl.col("passing_attempts").fill_null(0))
+    for gid, tid, pid, attempts in rows.sort([*keys, "canonical_player_id"]).iter_rows():
+        key = (str(pid), str(tid))
+        player_attempts[key] = player_attempts.get(key, 0.0) + (
+            game_weight[(str(gid), str(tid))] * float(attempts)
+        )
+    return team_total, player_attempts
+
+
 def build_player_states(
     player_stats: pl.DataFrame,
     team_stats: pl.DataFrame,
@@ -278,31 +329,59 @@ def build_player_states(
     injuries: pl.DataFrame | None = None,
     strict: bool = True,
     config: PlayerStateConfig | None = None,
+    history_time_col: str = "available_at",
+    recency_time_col: str | None = None,
+    qb_membership: Mapping[str, str] | None = None,
 ) -> dict[str, PlayerState]:
+    """`history_time_col` / `recency_time_col` are the eligibility and
+    recency clocks of the game-stat history (see `build_team_states`).
+    Roster and injury snapshots are pregame observations and always use
+    genuine `available_at`.
+
+    A player's current team is the team of his chronologically latest
+    eligible game: ordered by source-game kickoff (`PERFORMANCE_EVENT_COL`;
+    a game without one sorts first), then `history_time_col`, then game id
+    -- never by storage/join order.
+
+    QB candidates (`qb_membership`, `nflprops.features.team_membership`):
+    when given, a QB-group player is a candidate only for the team the
+    mapping places him on at the target, and a QB it does not place is
+    REMOVED -- never merely penalised. `None` applies no membership rule.
+
+    `qb_attempt_share` is team-relative: the player's recency-weighted
+    reconciled attempts over ALL of his state team's admissible prior
+    games, divided by that team's QB attempts in the same games, shrunk to
+    the QB prior. A QB with no attempts for the team has no evidence of a
+    share there, however much he threw elsewhere or long ago."""
     if config is None:
         config = PlayerStateConfig()
+    weight_col = recency_time_col or history_time_col
 
     # One version per outcome: the latest genuinely known at as_of.
-    ps = as_known_at(player_stats, "player_game_stats", as_of, strict=strict)
-    ts = as_known_at(team_stats, "team_game_stats", as_of, strict=strict)
+    ps = as_known_at(
+        player_stats, "player_game_stats", as_of, strict=strict, time_col=history_time_col
+    )
+    ts = as_known_at(
+        team_stats, "team_game_stats", as_of, strict=strict, time_col=history_time_col
+    )
     if ps.is_empty():
         return {}
+    # Canonical chronological row order (see `build_team_states`).
+    ps = ps.sort([weight_col, "canonical_game_id", "canonical_team_id", "canonical_player_id"])
+    if not ts.is_empty():
+        ts = ts.sort([weight_col, "canonical_game_id", "canonical_team_id"])
 
     ps = _with_qb_reconciliation(ps, ts)
     priors = _position_priors(ps, players)
+    team_qb_total, team_qb_player = _team_qb_opportunity(
+        ps, as_of=as_of, weight_col=weight_col, half_life_days=config.role_half_life_days
+    )
 
     # team game totals needed for shares.
     team_targets = ps.group_by(["canonical_game_id", "canonical_team_id"]).agg(
         pl.col("receiving_targets").fill_null(0).sum().alias("_team_targets"),
         pl.col("receiving_touchdowns").fill_null(0).sum().alias("_team_rec_tds"),
         pl.col("rushing_touchdowns").fill_null(0).sum().alias("_team_rush_tds"),
-        (
-            pl.when(pl.col("_qb_reconciled"))
-            .then(pl.col("passing_attempts").fill_null(0))
-            .otherwise(0)
-            .sum()
-            .alias("_team_qb_attempts")
-        ),
     )
     joined = ps.join(
         team_targets,
@@ -367,17 +446,28 @@ def build_player_states(
             "rush": float(sub["_rush_share_game"].mean() or 0.01),
         }
 
+    team_order = [
+        *([PERFORMANCE_EVENT_COL] if PERFORMANCE_EVENT_COL in joined.columns else []),
+        history_time_col,
+        "canonical_game_id",
+    ]
+
     out: dict[str, PlayerState] = {}
-    for pid in joined["canonical_player_id"].unique().to_list():
+    for pid in sorted(joined["canonical_player_id"].unique().to_list()):
         sub = joined.filter(pl.col("canonical_player_id") == pid)
-        team_id = str(sub["canonical_team_id"][-1])
+        team_id = str(sub.sort(team_order, nulls_last=False)["canonical_team_id"][-1])
         pos = player_pos.get(str(pid), "OTHER")
+        if qb_membership is not None and pos == "QB":
+            member_team = qb_membership.get(str(pid))
+            if member_team is None:
+                continue  # departed / retired / unrostered: not a candidate
+            team_id = member_team
         pp = priors.get(pos, priors.get("OTHER", {}))
         sp = pos_share.get(pos, {"target": 0.02, "rush": 0.01})
 
-        sub = sub.sort("available_at")
+        sub = sub.sort([weight_col, "canonical_game_id"])
         weight_sets = _role_weight_sets(
-            sub["available_at"].to_list(),
+            sub[weight_col].to_list(),
             as_of,
             config,
         )
@@ -395,7 +485,6 @@ def build_player_states(
         attempts = _wsum(sub, "passing_attempts", role_qb_w)
         team_target_total = _wsum(sub, "_team_targets", target_role_w)
         team_rush_total = _wsum(sub, "_team_rush_attempts", rush_role_w)
-        team_qb_attempts = _wsum(sub, "_team_qb_attempts", role_qb_w)
         team_rec_tds = _wsum(sub, "_team_rec_tds", role_w)
         team_rush_tds = _wsum(sub, "_team_rush_tds", role_w)
         rec_tds = _wsum(sub, "receiving_touchdowns", role_w)
@@ -475,8 +564,8 @@ def build_player_states(
             config.skill_prior_opportunities,
         )
         qb_attempt_share = _posterior_rate(
-            attempts,
-            team_qb_attempts,
+            team_qb_player.get((str(pid), team_id), 0.0),
+            team_qb_total.get(team_id, 0.0),
             0.97 if pos == "QB" else 0.0,
             config.role_prior_opportunities,
         )
@@ -533,6 +622,12 @@ def build_player_states(
                 continue
             team_id = str(row["canonical_team_id"])
             pos = player_pos.get(pid, "OTHER")
+            if (
+                qb_membership is not None
+                and pos == "QB"
+                and qb_membership.get(pid) != team_id
+            ):
+                continue  # a depth row never restores a non-member QB
             pp = priors.get(pos, priors.get("OTHER", {}))
             sp = pos_share.get(pos, {"target": 0.02, "rush": 0.01})
             depth = int(row["depth"]) if row.get("depth") is not None else None

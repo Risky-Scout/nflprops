@@ -42,17 +42,23 @@ exit 0):
 from __future__ import annotations
 
 import argparse
+import gc
+import hashlib
 import itertools
 import json
+import os
+import resource
+import subprocess
 import sys
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
+import polars as pl
 
 from nflprops.backtest.protocol import WalkForwardFold
 from nflprops.calibration.artifact import (
@@ -60,37 +66,84 @@ from nflprops.calibration.artifact import (
     UNLABELED_PROP_TYPES,
 )
 from nflprops.calibration.challenger import (
+    CalibrationGame,
     LabeledGame,
     _aggregate_scores,
     coverage_report,
     evaluate_promotion_gate,
     fit_challenger_theta,
+    game_draw_features,
+    game_n_draws,
     mean_skill_score,
     run_walk_forward_challenger,
 )
 from nflprops.calibration.challenger_registration import register_challenger
+from nflprops.calibration.compact_game import (
+    CompactGame,
+    compact_first_td_simplex,
+    compact_from_labeled_game,
+    read_compact_game,
+    write_compact_game,
+)
 from nflprops.calibration.diagnostics import (
     compute_weight_diagnostics,
     parameter_magnitude,
 )
-from nflprops.calibration.entropy_tilting import softmax_weights
+from nflprops.calibration.entropy_tilting import (
+    ALGORITHM_FAMILY,
+    ALGORITHM_VERSION,
+    softmax_weights,
+)
 from nflprops.calibration.historical_runner import (
+    EVIDENCE_MODE,
+    MODEL_PROFILE,
+    GameReplaySkip,
     compute_data_root_manifest_sha256,
     compute_training_manifest_sha256,
+    iter_replay_games,
     list_final_games,
     load_warehouse_tables,
-    official_tables,
-    replay_games,
 )
 from nflprops.calibration.joint_feature_contract import (
+    FEATURE_CONTRACT_VERSION,
     FEATURE_NAMES,
-    compute_draw_features,
 )
+from nflprops.calibration.oof_report import (
+    game_rows,
+    promotion_gates,
+    score_rows,
+    segment_scores,
+    zero_tail_report,
+)
+from nflprops.calibration.registry import require_calibrator_applicable
 from nflprops.calibration.scoring import skill_score
 from nflprops.calibration.weighted_pmf import build_weighted_first_td_simplex
-from nflprops.data.evidence_policy import EvidenceClass, classify_tables, official_view
+from nflprops.data.evidence_policy import (
+    EvidenceClass,
+    classify_model_evidence,
+    promotion_evidence_allowed,
+)
 from nflprops.data.warehouse import Warehouse
 from nflprops.domain.enums import PropType
+from nflprops.domain.model_profile import (
+    PROFILE_SCIENCE_VERSIONS,
+    ModelProfile,
+    ModelProfileError,
+    parse_model_profile,
+    profile_base_model_version,
+)
+from nflprops.features.historical_positions import (
+    HISTORICAL_POSITIONS_TABLE,
+    NFLVERSE_WEEKLY_ROSTER_SOURCES,
+    RESOLUTION_VERSION,
+)
+from nflprops.features.team_membership import (
+    HISTORICAL_TEAM_MEMBERSHIP_TABLE,
+    MEMBERSHIP_VERSION,
+)
+from nflprops.simulation.game import SimulationConfig
+from nflprops.state.player import PlayerStateConfig
+from nflprops.state.team import TeamStateConfig
 
 if TYPE_CHECKING:
     from nflprops.data.storage.base import StorageBackend
@@ -159,13 +212,41 @@ class RunnerConfig:
     regularization_lambda: float
     max_fit_iterations: int
     expect_data_manifest_sha256: str | None
-    #: "official" (default): RESEARCH_ONLY estimated-availability rows are
-    #: dropped before replay, so only genuinely PIT-known data is used.
-    #: "research": every row is used, and the run can NEVER be promotion,
+    #: "official" (default): the run's evidence class is the Gate 1
+    #: semantic classification of what STRUCTURAL_CORE consumes under
+    #: HISTORICAL_WALK_FORWARD (`classify_model_evidence`).
+    #: "research": the run is RESEARCH_ONLY and can NEVER be promotion,
     #: recalibration-approval or certification evidence.
     evidence: str = "official"
+    #: Historical replay can only certify STRUCTURAL_CORE (Gate 1): the
+    #: 2022-2025 pregame observations LIVE_ENHANCED needs have no certified
+    #: historical availability. Anything else is refused before replay.
+    model_profile: str = ModelProfile.STRUCTURAL_CORE.value
+    #: "all": replay + independent first-season re-replay + evaluate in one
+    #: process. "replay": stream-replay (optionally one `shard_season`) into
+    #: `compact_dir`. "evaluate": fit/score/report from `compact_dirs`
+    #: (+ `repro_compact_dir`), never simulating.
+    stage: str = "all"
+    shard_season: int | None = None
+    compact_dir: Path | None = None
+    compact_dirs: tuple[Path, ...] = ()
+    repro_compact_dir: Path | None = None
+    #: Recorded identities (the git SHA executing, and the certified model
+    #: science base it must be prediction-equivalent to).
+    execution_sha: str | None = None
+    science_base_sha: str | None = None
 
     def __post_init__(self) -> None:
+        try:
+            profile = parse_model_profile(self.model_profile)
+        except ModelProfileError as exc:
+            raise ConfigurationError(str(exc)) from None
+        if profile is not MODEL_PROFILE:
+            raise ConfigurationError(
+                f"--model-profile {profile.value} cannot run under {EVIDENCE_MODE.value}: "
+                "historical game odds, injuries and roster depth have no certified "
+                f"availability; Phase 10C3A validates {MODEL_PROFILE.value} only"
+            )
         if self.mode not in ("production", "smoke"):
             raise ConfigurationError(f"--mode must be 'production' or 'smoke', got {self.mode!r}")
         if self.evidence not in ("official", "research"):
@@ -180,6 +261,8 @@ class RunnerConfig:
             )
         if self.season_min > self.season_max:
             raise ConfigurationError("--season-min must be <= --season-max")
+        if self.stage not in ("all", "replay", "evaluate"):
+            raise ConfigurationError(f"--stage must be all/replay/evaluate, got {self.stage!r}")
 
 
 def parse_args(argv: list[str] | None = None) -> RunnerConfig:
@@ -211,6 +294,11 @@ def parse_args(argv: list[str] | None = None) -> RunnerConfig:
              "rows are excluded). research: all rows; never promotion evidence.",
     )
     parser.add_argument("--model-version", default="phase10c3a-real-run-v1")
+    parser.add_argument(
+        "--model-profile", choices=[p.value for p in ModelProfile],
+        default=ModelProfile.STRUCTURAL_CORE.value,
+        help="Only STRUCTURAL_CORE is accepted (historical walk-forward).",
+    )
     parser.add_argument("--regularization-lambda", type=float, default=0.01)
     parser.add_argument("--max-fit-iterations", type=int, default=200)
     parser.add_argument(
@@ -219,6 +307,17 @@ def parse_args(argv: list[str] | None = None) -> RunnerConfig:
              "manifest hash exactly matches this value -- ties a remote run to an "
              "independently verified data snapshot.",
     )
+    parser.add_argument("--stage", choices=("all", "replay", "evaluate"), default="all")
+    parser.add_argument("--shard-season", type=int, default=None,
+                        help="--stage replay: replay only this season's final games.")
+    parser.add_argument("--compact-dir", default=None,
+                        help="--stage replay: compact shard output directory.")
+    parser.add_argument("--compact-dirs", nargs="*", default=(),
+                        help="--stage evaluate: every primary compact shard directory.")
+    parser.add_argument("--repro-compact-dir", default=None,
+                        help="--stage evaluate: independent re-replay shard (reproducibility).")
+    parser.add_argument("--execution-sha", default=None)
+    parser.add_argument("--science-base-sha", default=None)
     ns = parser.parse_args(argv)
     return RunnerConfig(
         data_root=Path(ns.data_root),
@@ -232,7 +331,73 @@ def parse_args(argv: list[str] | None = None) -> RunnerConfig:
         max_fit_iterations=ns.max_fit_iterations,
         expect_data_manifest_sha256=ns.expect_data_manifest_sha256,
         evidence=ns.evidence,
+        model_profile=ns.model_profile,
+        stage=ns.stage,
+        shard_season=ns.shard_season,
+        compact_dir=Path(ns.compact_dir) if ns.compact_dir else None,
+        compact_dirs=tuple(Path(d) for d in ns.compact_dirs),
+        repro_compact_dir=Path(ns.repro_compact_dir) if ns.repro_compact_dir else None,
+        execution_sha=ns.execution_sha,
+        science_base_sha=ns.science_base_sha,
     )
+
+
+#: Columns replay reads from each week-versioned identity table, and the
+#: build-version column/value `tools/build_historical_positions.py` stamps.
+_IDENTITY_TABLE_CONTRACTS: dict[str, tuple[tuple[str, ...], str, str]] = {
+    HISTORICAL_POSITIONS_TABLE: (
+        ("canonical_player_id", "season", "week", "team", "position_group", "conflict_status"),
+        "resolution_version",
+        RESOLUTION_VERSION,
+    ),
+    HISTORICAL_TEAM_MEMBERSHIP_TABLE: (
+        ("canonical_player_id", "season", "week", "team", "canonical_team_id", "is_member"),
+        "membership_version",
+        MEMBERSHIP_VERSION,
+    ),
+}
+
+
+def _require_compatible_identity_tables(
+    tables: dict[str, pl.DataFrame], *, production: bool
+) -> None:
+    """Fail closed on an empty or schema-incompatible identity table. A
+    production run also requires this build version and every row sourced
+    from a pinned nflverse weekly-roster file."""
+    pinned = {str(src["sha256"]) for src in NFLVERSE_WEEKLY_ROSTER_SOURCES.values()}
+    for table, (columns, version_col, version) in _IDENTITY_TABLE_CONTRACTS.items():
+        frame = tables[table]
+        missing = sorted(set(columns) - set(frame.columns))
+        if frame.is_empty() or missing:
+            raise ConfigurationError(
+                f"{table!r} is empty or incompatible (missing columns {missing}); "
+                "rebuild it with tools/build_historical_positions.py"
+            )
+        if not production:
+            continue
+        versions = (
+            set(frame[version_col].unique().to_list()) if version_col in frame.columns else {None}
+        )
+        sources = (
+            set(frame["source_sha256"].unique().to_list())
+            if "source_sha256" in frame.columns else {None}
+        )
+        if versions != {version} or not sources <= pinned:
+            raise ConfigurationError(
+                f"{table!r} was not built by this science from the pinned nflverse "
+                f"weekly rosters (versions {sorted(map(str, versions))}, "
+                f"unpinned sources {sorted(map(str, sources - pinned))}); "
+                "rebuild it with tools/build_historical_positions.py"
+            )
+
+
+def _profile_input_faithful(game: CalibrationGame) -> bool:
+    """Whether every input the certified profile consumes was PIT-faithful
+    for `game`. STRUCTURAL_CORE consumes no injury input, so a missing
+    injury feed (`injury_data_available=False`, every 2022-2025 game)
+    degrades nothing it uses -- historically or live. A profile that
+    consumed injuries would need the feed."""
+    return MODEL_PROFILE is ModelProfile.STRUCTURAL_CORE or game.injury_data_available
 
 
 def _log(output_dir: Path, msg: str) -> None:
@@ -243,7 +408,7 @@ def _log(output_dir: Path, msg: str) -> None:
 
 
 def build_season_boundary_folds(
-    labeled_games: tuple[LabeledGame, ...], season_by_game_id: dict[str, int]
+    labeled_games: tuple[CalibrationGame, ...], season_by_game_id: dict[str, int]
 ) -> tuple[WalkForwardFold, ...]:
     """One expanding-window fold per season boundary: train on every prior
     season's replayable games, score the very next season. Purely a
@@ -252,7 +417,7 @@ def build_season_boundary_folds(
     semantics; `nflprops.calibration.challenger.run_walk_forward_challenger`
     still does all leakage/overlap enforcement.
     """
-    by_season: dict[int, list[LabeledGame]] = {}
+    by_season: dict[int, list[CalibrationGame]] = {}
     for g in labeled_games:
         season = season_by_game_id.get(g.game_id)
         if season is None:
@@ -296,7 +461,7 @@ def build_season_boundary_folds(
 
 def compute_season_skip_accounting(
     all_game_rows: list[dict[str, Any]],
-    labeled_games: tuple[LabeledGame, ...],
+    labeled_games: tuple[CalibrationGame, ...],
     skips: tuple[Any, ...],
 ) -> dict[str, dict[str, Any]]:
     """Section-5 replay-coverage accounting, by season: total/replayable/
@@ -346,7 +511,7 @@ def _skill_by_prop(
 
 
 def verify_weight_health_and_positivity(
-    fold_id: str, score_games: tuple[LabeledGame, ...], theta: np.ndarray
+    fold_id: str, score_games: tuple[CalibrationGame, ...], theta: np.ndarray
 ) -> dict[str, Any]:
     """Section-11 numerical strict-positivity check on EVERY real scored
     game's fitted weight vector: finite, strictly positive, sums to 1.0
@@ -359,7 +524,7 @@ def verify_weight_health_and_positivity(
     max_weights: list[float] = []
     normalized_entropies: list[float] = []
     for g in score_games:
-        features = compute_draw_features(g.simulation)
+        features = game_draw_features(g)
         w = softmax_weights(theta, features)
         if not np.all(np.isfinite(w)):
             raise NumericalSafetyViolationError(f"fold {fold_id!r} game {g.game_id!r}: non-finite weight")
@@ -375,7 +540,7 @@ def verify_weight_health_and_positivity(
                 f"{STRICT_WEIGHT_SUM_TOLERANCE} tolerance"
             )
         diag = compute_weight_diagnostics(w)
-        ess_ratios.append(diag.effective_sample_size / g.simulation.n_draws)
+        ess_ratios.append(diag.effective_sample_size / game_n_draws(g))
         max_weights.append(diag.max_weight)
         normalized_entropies.append(diag.normalized_entropy)
 
@@ -392,7 +557,9 @@ def verify_weight_health_and_positivity(
     }
 
 
-def check_real_game_coherence(sample_games: tuple[LabeledGame, ...], theta: np.ndarray) -> dict[str, Any]:
+def check_real_game_coherence(
+    sample_games: tuple[CalibrationGame, ...], theta: np.ndarray
+) -> dict[str, Any]:
     """Real-replayed-game confirmatory spot check (section 10): first-TD
     simplex sums to 1 under both theta=0 and the real fitted theta, for a
     sample of REAL replayed games. The general proof (any theta, any
@@ -403,8 +570,12 @@ def check_real_game_coherence(sample_games: tuple[LabeledGame, ...], theta: np.n
     for g in sample_games:
         for name, t in (("theta_zero", np.zeros(len(FEATURE_NAMES))), ("fitted_theta", theta)):
             try:
-                w = softmax_weights(t, compute_draw_features(g.simulation))
-                field = build_weighted_first_td_simplex(g.simulation, w)
+                w = softmax_weights(t, game_draw_features(g))
+                field = (
+                    compact_first_td_simplex(g, w)
+                    if isinstance(g, CompactGame)
+                    else build_weighted_first_td_simplex(g.simulation, w)
+                )
                 total = sum(field.values())
                 if abs(total - 1.0) > 1e-9 or any(p <= 0 for p in field.values()):
                     failures.append(f"{g.game_id}/{name}: first_td field invalid (sum={total})")
@@ -413,63 +584,141 @@ def check_real_game_coherence(sample_games: tuple[LabeledGame, ...], theta: np.n
     return {"checked_games": len(sample_games), "failures": failures, "passed": not failures}
 
 
+def _set_sha256(entries: dict[str, str]) -> str:
+    payload = "\n".join(f"{gid}:{sha}" for gid, sha in sorted(entries.items()))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
 def check_reproducibility(
-    warehouse: Warehouse,
-    tables: Any,
-    fold0_game_rows: Any,
+    primary_fit_games: tuple[CompactGame, ...],
+    primary_hashes: dict[str, str],
     fold0_fit: Any,
-    fold0_labeled_by_id: dict[str, LabeledGame],
-    model_version: str,
-    n_draws: int,
+    repro_games: dict[str, CompactGame],
+    repro_hashes: dict[str, str],
     regularization_lambda: float,
 ) -> dict[str, Any]:
-    """Section-14: independently re-replay + re-fit fold[0]'s training set
-    and require an identical training-manifest hash, theta, and objective
-    value. Any unavoidable nondeterminism must show up here as a mismatch,
-    never be hidden."""
-    repro_batch = replay_games(
-        cast("StorageBackend", warehouse),
-        fold0_game_rows,
-        model_version=model_version,
-        n_draws=n_draws,
-        tables=tables,
+    """Section-14, streaming: fold[0]'s training games were independently
+    re-replayed into a separate compact store. Require identical compact
+    content hashes for every re-replayed game, an identical training-manifest
+    hash, and an identical re-fit theta/objective. Any unavoidable
+    nondeterminism shows up here as a mismatch, never hidden."""
+    fit_ids = [g.game_id for g in primary_fit_games]
+    missing = sorted(set(fit_ids) - set(repro_games))
+    mismatched = sorted(
+        gid for gid, sha in repro_hashes.items() if primary_hashes.get(gid) != sha
     )
-    manifest_a = compute_training_manifest_sha256(tuple(fold0_labeled_by_id.values()))
-    manifest_b = compute_training_manifest_sha256(repro_batch.labeled_games)
-    fit_b = fit_challenger_theta(repro_batch.labeled_games, regularization_lambda=regularization_lambda)
-
+    hash_1 = _set_sha256({gid: primary_hashes[gid] for gid in repro_hashes if gid in primary_hashes})
+    hash_2 = _set_sha256(repro_hashes)
+    result: dict[str, Any] = {
+        "repro_game_count": len(repro_hashes),
+        "fold0_training_game_count": len(fit_ids),
+        "missing_fold0_games": missing,
+        "hash_mismatched_games": mismatched,
+        "repro_hash_1": hash_1,
+        "repro_hash_2": hash_2,
+        "hash_match": not mismatched and not missing and hash_1 == hash_2,
+    }
+    if missing:
+        result.update(passed=False, manifest_match=False, theta_match=False, objective_match=False)
+        return result
+    repro_fit_games = tuple(repro_games[gid] for gid in fit_ids)
+    manifest_a = compute_training_manifest_sha256(primary_fit_games)
+    manifest_b = compute_training_manifest_sha256(repro_fit_games)
+    fit_b = fit_challenger_theta(repro_fit_games, regularization_lambda=regularization_lambda)
     theta_match = tuple(fold0_fit.theta) == tuple(fit_b.theta)
     objective_match = abs(fold0_fit.objective_value - fit_b.objective_value) < 1e-9
-    manifest_match = manifest_a == manifest_b
+    result.update(
+        manifest_a=manifest_a,
+        manifest_b=manifest_b,
+        manifest_match=manifest_a == manifest_b,
+        theta_a=list(fold0_fit.theta),
+        theta_b=list(fit_b.theta),
+        theta_match=theta_match,
+        objective_a=fold0_fit.objective_value,
+        objective_b=fit_b.objective_value,
+        objective_match=objective_match,
+    )
+    result["passed"] = bool(
+        result["hash_match"] and manifest_a == manifest_b and theta_match and objective_match
+    )
+    return result
+
+
+# ------------------------------------------------------------------ identity
+
+
+def _canonical_sha256(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
+
+
+def run_identity(config: RunnerConfig, data_manifest_sha256: str) -> dict[str, Any]:
+    """Every identity a compact game / OOF row / report is bound to."""
+    model_config = {
+        "model_version": config.model_version,
+        "model_profile": MODEL_PROFILE.value,
+        "profile_science_version": PROFILE_SCIENCE_VERSIONS[MODEL_PROFILE],
+        "evidence_mode": EVIDENCE_MODE.value,
+        "player_state_config": asdict(PlayerStateConfig()),
+        "team_state_config": asdict(TeamStateConfig()),
+        "feature_contract_version": FEATURE_CONTRACT_VERSION,
+        "calibration_algorithm": f"{ALGORITHM_FAMILY}/{ALGORITHM_VERSION}",
+        "regularization_lambda": config.regularization_lambda,
+    }
     return {
-        "manifest_a": manifest_a,
-        "manifest_b": manifest_b,
-        "manifest_match": manifest_match,
-        "theta_a": list(fold0_fit.theta),
-        "theta_b": list(fit_b.theta),
-        "theta_match": theta_match,
-        "objective_a": fold0_fit.objective_value,
-        "objective_b": fit_b.objective_value,
-        "objective_match": objective_match,
-        "passed": bool(manifest_match and theta_match and objective_match),
+        "model_profile": MODEL_PROFILE.value,
+        "model_profile_id": profile_base_model_version(config.model_version, MODEL_PROFILE),
+        "science_base_sha": config.science_base_sha,
+        "execution_sha": config.execution_sha,
+        "model_config_sha256": _canonical_sha256(model_config),
+        "sim_config_sha256": _canonical_sha256(asdict(SimulationConfig(n_draws=config.n_draws))),
+        "data_manifest_sha256": data_manifest_sha256,
     }
 
 
-def run(config: RunnerConfig) -> dict[str, Any]:
-    """The full Phase 10C3A pipeline. Returns the complete machine-readable
-    report dict (also written to `config.output_dir/phase10c3a_report.json`
-    by `main`). Raises `InsufficientDataError` / `NumericalSafetyViolationError`
-    / `ConfigurationError` to fail closed rather than ever returning a
-    report claiming more than the evidence supports.
-    """
-    config.output_dir.mkdir(parents=True, exist_ok=True)
+# ------------------------------------------------------------------ memory
 
-    def log(msg: str) -> None:
-        _log(config.output_dir, msg)
 
-    log(f"Phase 10C3A runner starting: mode={config.mode} n_draws={config.n_draws} "
-        f"data_root={config.data_root} seasons=[{config.season_min},{config.season_max}]")
+def current_rss_mb() -> float:
+    """Resident set size of this process now (Linux /proc, else `ps`)."""
+    statm = Path("/proc/self/statm")
+    if statm.exists():
+        pages = int(statm.read_text().split()[1])
+        return pages * os.sysconf("SC_PAGE_SIZE") / 1e6
+    out = subprocess.run(["ps", "-o", "rss=", "-p", str(os.getpid())],
+                         capture_output=True, text=True, check=True)
+    return int(out.stdout.strip()) / 1e3
 
+
+def peak_rss_mb() -> float:
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak / 1e6 if sys.platform == "darwin" else peak / 1e3
+
+
+def rss_growth_per_game(samples: list[float]) -> float | None:
+    """Least-squares slope of post-release RSS against completed games."""
+    if len(samples) < 3:
+        return None
+    x = np.arange(len(samples), dtype=float)
+    return float(np.polyfit(x, np.asarray(samples, dtype=float), 1)[0])
+
+
+# ------------------------------------------------------------------ stages
+
+
+@dataclass(frozen=True)
+class _Prepared:
+    warehouse: Warehouse
+    tables: Any
+    data_manifest_sha256: str
+    source_class: EvidenceClass
+    evidence_class: EvidenceClass
+    evidence_rows: dict[str, int]
+    games: pl.DataFrame
+
+
+def _prepare(config: RunnerConfig, log: Any) -> _Prepared:
     data_manifest_sha256 = compute_data_root_manifest_sha256(config.data_root)
     log(f"data root manifest sha256: {data_manifest_sha256}")
     if config.expect_data_manifest_sha256 is not None and data_manifest_sha256 != config.expect_data_manifest_sha256:
@@ -479,69 +728,218 @@ def run(config: RunnerConfig) -> dict[str, Any]:
         )
 
     warehouse = Warehouse(config.data_root)
+    if not warehouse.exists(HISTORICAL_POSITIONS_TABLE):
+        # The 2026 players dimension marks departed players Unknown; without
+        # week-versioned historical positions replay would mis-group them.
+        raise ConfigurationError(
+            f"data root has no {HISTORICAL_POSITIONS_TABLE!r} table "
+            "(tools/build_historical_positions.py)"
+        )
+    if not warehouse.exists(HISTORICAL_TEAM_MEMBERSHIP_TABLE):
+        # Without week-versioned roster membership no QB is a structural
+        # candidate; departed/retired QBs must never be inferred instead.
+        raise ConfigurationError(
+            f"data root has no {HISTORICAL_TEAM_MEMBERSHIP_TABLE!r} table "
+            "(tools/build_historical_positions.py)"
+        )
     tables = load_warehouse_tables(cast("StorageBackend", warehouse))
+    _require_compatible_identity_tables(
+        tables.as_table_mapping(), production=config.mode == "production"
+    )
+    source_class, evidence_rows = classify_model_evidence(
+        tables.as_table_mapping(), evidence_mode=EVIDENCE_MODE, model_profile=MODEL_PROFILE
+    )
+    # "research" can only ever demote: such a run is never promotion evidence.
+    evidence_class = (
+        source_class if config.evidence == "official" else EvidenceClass.RESEARCH_ONLY
+    )
     games = list_final_games(
         cast("StorageBackend", warehouse),
         season_min=config.season_min,
         season_max=config.season_max,
     )
-    source_class, estimated_rows = classify_tables(tables.as_mapping())
-    if config.evidence == "official":
-        # Official evidence: only what was genuinely known at each cutoff.
-        tables = official_tables(tables)
-        games = official_view(games)
-        evidence_class = EvidenceClass.OFFICIAL_PIT_FAITHFUL
-    else:
-        evidence_class = EvidenceClass.RESEARCH_ONLY
-    log(f"evidence={config.evidence} class={evidence_class} source={source_class} "
-        f"estimated_rows={estimated_rows}")
-    log(f"total final games: {games.height}")
+    log(f"total final games: {games.height}; model_profile={MODEL_PROFILE.value} "
+        f"evidence_mode={EVIDENCE_MODE.value} evidence={config.evidence} "
+        f"evidence_class={evidence_class.value} source_class={source_class.value} "
+        f"estimated_rows={evidence_rows}")
+    return _Prepared(warehouse, tables, data_manifest_sha256, source_class, evidence_class,
+                     evidence_rows, games)
+
+
+SHARD_MANIFEST = "shard_manifest.json"
+
+
+def replay_to_compact(
+    config: RunnerConfig,
+    prepared: _Prepared,
+    game_rows: pl.DataFrame,
+    compact_dir: Path,
+    log: Any,
+) -> dict[str, Any]:
+    """Stream-replay `game_rows` in order: simulate ONE game, extract and
+    persist its compact evidence, release the full simulation, continue.
+    At most one full `GameSimulationResult` is alive at any time. Writes
+    and returns the shard manifest."""
+    compact_dir.mkdir(parents=True, exist_ok=True)
+    games_dir = compact_dir / "games"
+    games_dir.mkdir(exist_ok=True)
+    entries: list[dict[str, Any]] = []
+    skips: list[dict[str, str]] = []
+    post_release_rss: list[float] = []
+    t0 = time.time()
 
     def progress(i: int, total: int, _gid: str) -> None:
-        if i % 200 == 0 or i == total:
-            log(f"replay progress {i}/{total}")
+        if i % 25 == 0 or i == total:
+            log(f"replay progress {i}/{total} rss={current_rss_mb():.0f}MB "
+                f"peak={peak_rss_mb():.0f}MB")
 
-    t0 = time.time()
-    batch = replay_games(
-        cast("StorageBackend", warehouse), games, model_version=config.model_version, n_draws=config.n_draws,
-        tables=tables, on_progress=progress,
+    stream = iter_replay_games(
+        cast("StorageBackend", prepared.warehouse), game_rows,
+        model_version=config.model_version, n_draws=config.n_draws,
+        tables=prepared.tables, on_progress=progress,
     )
-    replay_seconds = time.time() - t0
-    log(f"replay done in {replay_seconds:.1f}s: labeled={len(batch.labeled_games)} skips={len(batch.skips)}")
+    for item in stream:
+        if isinstance(item, LabeledGame):
+            compact = compact_from_labeled_game(item)
+            sha = write_compact_game(compact, games_dir)
+            entries.append({"game_id": compact.game_id, "sha256": sha,
+                            "n_labels": len(compact.labels)})
+            del compact
+        else:
+            skips.append({"game_id": item.game_id, "reason": item.reason})
+        # Release the full draw table before the next game is simulated.
+        del item
+        gc.collect()
+        post_release_rss.append(current_rss_mb())
 
-    if not batch.labeled_games:
+    manifest = {
+        "shard_manifest_version": "phase10c3a_shard/v1",
+        "seasons": sorted({int(s) for s in game_rows["season"].to_list()}),
+        "game_count": game_rows.height,
+        "games": entries,
+        "skips": skips,
+        "replay_seconds": time.time() - t0,
+        "memory": {
+            "peak_rss_mb": peak_rss_mb(),
+            "post_release_rss_mb": post_release_rss,
+            "rss_growth_per_completed_game_mb": rss_growth_per_game(post_release_rss),
+        },
+        "n_draws": config.n_draws,
+        "mode": config.mode,
+        **run_identity(config, prepared.data_manifest_sha256),
+    }
+    (compact_dir / SHARD_MANIFEST).write_text(json.dumps(manifest, indent=1, sort_keys=True))
+    log(f"replay shard done: games={len(entries)} skips={len(skips)} "
+        f"peak_rss={manifest['memory']['peak_rss_mb']:.0f}MB "
+        f"growth/game={manifest['memory']['rss_growth_per_completed_game_mb']}")
+    return manifest
+
+
+def _load_shards(
+    config: RunnerConfig, prepared: _Prepared, dirs: tuple[Path, ...]
+) -> tuple[dict[str, CompactGame], dict[str, str], list[GameReplaySkip], list[dict[str, Any]]]:
+    identity = run_identity(config, prepared.data_manifest_sha256)
+    games: dict[str, CompactGame] = {}
+    hashes: dict[str, str] = {}
+    skips: list[GameReplaySkip] = []
+    manifests: list[dict[str, Any]] = []
+    for directory in dirs:
+        manifest = json.loads((directory / SHARD_MANIFEST).read_text())
+        for key in ("data_manifest_sha256", "model_profile_id", "model_config_sha256",
+                    "sim_config_sha256", "execution_sha"):
+            if manifest.get(key) != identity[key]:
+                raise ConfigurationError(
+                    f"compact shard {directory} {key}={manifest.get(key)!r} does not match "
+                    f"this run's {identity[key]!r}"
+                )
+        if manifest["n_draws"] != config.n_draws:
+            raise ConfigurationError(f"compact shard {directory} has n_draws {manifest['n_draws']}")
+        for entry in manifest["games"]:
+            gid = entry["game_id"]
+            if gid in games or gid in hashes:
+                raise ConfigurationError(f"game {gid} appears in more than one compact shard")
+            games[gid] = read_compact_game(directory / "games" / gid)
+            hashes[gid] = entry["sha256"]
+        skips.extend(GameReplaySkip(game_id=s["game_id"], reason=s["reason"]) for s in manifest["skips"])
+        manifests.append({k: v for k, v in manifest.items() if k not in ("games",)})
+    return games, hashes, skips, manifests
+
+
+def _fold_id_for_season(season: int, folds: tuple[WalkForwardFold, ...], first_season: int) -> str:
+    if season == first_season:
+        return f"fold0_uncalibrated_{season}"
+    for fold in folds:
+        if fold.fold_id.endswith(f"_score_{season}"):
+            return fold.fold_id
+    raise InsufficientDataError(f"no walk-forward fold scores season {season}")
+
+
+def evaluate(
+    config: RunnerConfig,
+    prepared: _Prepared,
+    compact_dirs: tuple[Path, ...],
+    repro_dir: Path | None,
+    log: Any,
+) -> dict[str, Any]:
+    """Fit/score/calibrate/report from persisted compact shards. Never
+    simulates. Calibrators are fitted on prior completed seasons only (the
+    existing expanding-window folds); the first season stays uncalibrated."""
+    games = prepared.games
+    labeled_map, primary_hashes, skips, shard_manifests = _load_shards(config, prepared, compact_dirs)
+    accounted = set(labeled_map) | {s.game_id for s in skips}
+    expected = set(games["canonical_game_id"].to_list())
+    if accounted != expected:
+        raise ConfigurationError(
+            f"compact shards do not account for every final game exactly once "
+            f"(missing {len(expected - accounted)}, unexpected {len(accounted - expected)})"
+        )
+    # Chronological order identical to an in-memory replay of `games`.
+    labeled_games = tuple(
+        labeled_map[gid] for gid in games["canonical_game_id"].to_list() if gid in labeled_map
+    )
+    log(f"loaded {len(labeled_games)} compact games, {len(skips)} skips")
+    if not labeled_games:
         raise InsufficientDataError("no replayable/labeled games at all")
 
-    season_by_game_id = {r["canonical_game_id"]: r["season"] for r in games.to_dicts()}
-    skip_accounting = compute_season_skip_accounting(games.to_dicts(), batch.labeled_games, batch.skips)
+    game_rows_by_id = {r["canonical_game_id"]: r for r in games.to_dicts()}
+    season_by_game_id = {gid: int(r["season"]) for gid, r in game_rows_by_id.items()}
+    skip_accounting = compute_season_skip_accounting(games.to_dicts(), labeled_games, tuple(skips))
     log(f"skip accounting by season: {json.dumps(skip_accounting)}")
 
-    coverage = coverage_report(batch.labeled_games)
-    full_manifest = compute_training_manifest_sha256(batch.labeled_games)
+    coverage = coverage_report(labeled_games)
+    full_manifest = compute_training_manifest_sha256(labeled_games)
 
-    folds = build_season_boundary_folds(batch.labeled_games, season_by_game_id)
+    folds = build_season_boundary_folds(labeled_games, season_by_game_id)
     log(f"built {len(folds)} walk-forward fold(s): {[f.fold_id for f in folds]}")
 
     t0 = time.time()
     fold_results = run_walk_forward_challenger(
-        batch.labeled_games, folds, regularization_lambda=config.regularization_lambda
+        labeled_games, folds, regularization_lambda=config.regularization_lambda
     )
     walk_forward_seconds = time.time() - t0
     log(f"walk-forward complete in {walk_forward_seconds:.1f}s")
 
-    labeled_by_id = {g.game_id: g for g in batch.labeled_games}
-    games_by_fold: list[tuple[LabeledGame, ...]] = []
+    labeled_by_id = {g.game_id: g for g in labeled_games}
+    games_by_fold: list[tuple[CalibrationGame, ...]] = []
     fold_reports: list[dict[str, Any]] = []
+    chronology_ok = True
 
     for fold, fr in zip(folds, fold_results, strict=True):
         theta = np.array(fr.fit.theta)
         score_games = tuple(labeled_by_id[gid] for gid in fr.scoring_game_ids)
+        train_games = tuple(labeled_by_id[gid] for gid in fr.training_game_ids)
         games_by_fold.append(score_games)
+        chronology_ok &= all(
+            g.as_of <= fold.train_end and g.outcome_available_at <= fold.train_end
+            for g in train_games
+        ) and all(fold.train_end < g.as_of for g in score_games) and not (
+            set(fr.training_game_ids) & set(fr.scoring_game_ids)
+        )
 
         weight_health = verify_weight_health_and_positivity(fr.fold_id, score_games, theta)
 
-        faithful = tuple(g for g in score_games if g.injury_data_available)
-        degraded = tuple(g for g in score_games if not g.injury_data_available)
+        faithful = tuple(g for g in score_games if _profile_input_faithful(g))
+        degraded = tuple(g for g in score_games if not _profile_input_faithful(g))
         faithful_challenger = _aggregate_scores(faithful, theta) if faithful else {}
         faithful_baseline = _aggregate_scores(faithful, np.zeros(len(FEATURE_NAMES))) if faithful else {}
         degraded_challenger = _aggregate_scores(degraded, theta) if degraded else {}
@@ -556,10 +954,18 @@ def run(config: RunnerConfig) -> dict[str, Any]:
                 "train_end": fold.train_end.isoformat(),
                 "score_start": fold.score_start.isoformat(),
                 "score_end": fold.score_end.isoformat(),
+                "training_seasons": sorted({season_by_game_id[gid] for gid in fr.training_game_ids}),
+                "scoring_seasons": sorted({season_by_game_id[gid] for gid in fr.scoring_game_ids}),
                 "training_game_count": len(fr.training_game_ids),
                 "scoring_game_count": len(score_games),
+                "training_label_count": sum(len(g.labels) for g in train_games),
+                "scoring_label_count": sum(len(g.labels) for g in score_games),
+                "training_manifest_sha256": compute_training_manifest_sha256(train_games),
                 "pit_faithful_scoring_game_count": len(faithful),
                 "pit_degraded_scoring_game_count": len(degraded),
+                "injury_feed_available_scoring_game_count": sum(
+                    1 for g in score_games if g.injury_data_available
+                ),
                 "theta": list(fr.fit.theta),
                 "theta_norm": parameter_magnitude(theta),
                 "converged": fr.fit.converged,
@@ -594,25 +1000,61 @@ def run(config: RunnerConfig) -> dict[str, Any]:
             f"iters={fr.fit.iterations}")
 
     # ---------------------------------------------------- coherence spot check
-    sample_games = batch.labeled_games[: min(10, len(batch.labeled_games))]
+    sample_games = labeled_games[: min(10, len(labeled_games))]
     coherence = check_real_game_coherence(sample_games, np.array(fold_results[-1].fit.theta))
     log(f"coherence spot check: {coherence}")
 
     # ---------------------------------------------------- reproducibility check
-    fold0_train_ids = set(fold_results[0].training_game_ids)
-    fold0_labeled_by_id = {gid: labeled_by_id[gid] for gid in fold0_train_ids}
-    fold0_game_rows = games.filter(games["canonical_game_id"].is_in(list(fold0_train_ids)))
-    reproducibility = check_reproducibility(
-        warehouse, tables, fold0_game_rows, fold_results[0].fit, fold0_labeled_by_id,
-        config.model_version, config.n_draws, config.regularization_lambda,
-    )
+    fold0_ids = set(fold_results[0].training_game_ids)
+    fold0_fit_games = tuple(g for g in labeled_games if g.game_id in fold0_ids)
+    if repro_dir is not None:
+        repro_games, repro_hashes, _, _ = _load_shards(config, prepared, (repro_dir,))
+        reproducibility = check_reproducibility(
+            fold0_fit_games, primary_hashes, fold_results[0].fit, repro_games, repro_hashes,
+            config.regularization_lambda,
+        )
+    else:
+        reproducibility = {"passed": False, "reason": "no independent re-replay supplied"}
     log(f"reproducibility check: passed={reproducibility['passed']}")
 
     # ---------------------------------------------------- overall promotion decision
     overall_promo = evaluate_promotion_gate(list(fold_results), games_by_fold)
     faithful_evidence_exists = any(fr["pit_faithful_scoring_game_count"] > 0 for fr in fold_reports)
 
-    if config.mode == "smoke" or evidence_class is not EvidenceClass.OFFICIAL_PIT_FAITHFUL:
+    # ---------------------------------------------------- OOF rows + §65 gates
+    identity = run_identity(config, prepared.data_manifest_sha256)
+    first_season = min(season_by_game_id[g.game_id] for g in labeled_games)
+    theta_by_fold = {fr.fold_id: np.array(fr.fit.theta) for fr in fold_results}
+    raw_frames: list[pl.DataFrame] = []
+    cal_frames: list[pl.DataFrame] = []
+    zero = np.zeros(len(FEATURE_NAMES))
+    for g in labeled_games:
+        row = game_rows_by_id[g.game_id]
+        season = int(row["season"])
+        fold_id = _fold_id_for_season(season, folds, first_season)
+        week = int(row["week"])
+        raw_frames.append(pl.DataFrame(game_rows(
+            g, zero, variant="raw", season=season, week=week, fold_id=fold_id,
+            identity=identity)))
+        if fold_id in theta_by_fold:
+            cal_frames.append(pl.DataFrame(game_rows(
+                g, theta_by_fold[fold_id], variant="calibrated", season=season, week=week,
+                fold_id=fold_id, identity=identity)))
+    raw_oof = pl.concat(raw_frames, how="vertical_relaxed")
+    cal_oof = pl.concat(cal_frames, how="vertical_relaxed")
+    raw_scored = raw_oof.filter(pl.col("fold_id").is_in(list(theta_by_fold)))
+
+    simulation_invariants = bool(coherence["passed"])  # weight health raises on failure
+    gates = promotion_gates(
+        raw_scored, cal_oof,
+        zero_leakage_failures=chronology_ok,
+        simulation_invariants_pass=simulation_invariants,
+        reproducibility_pass=bool(reproducibility["passed"]),
+    )
+
+    if config.mode == "smoke" or not promotion_evidence_allowed(
+        prepared.evidence_class, evidence_mode=EVIDENCE_MODE
+    ):
         promotion_decision = "INSUFFICIENT_EVIDENCE"  # never promotable
     elif not faithful_evidence_exists:
         promotion_decision = "INSUFFICIENT_EVIDENCE"  # INSUFFICIENT_PIT_FAITHFUL_EVIDENCE
@@ -624,71 +1066,178 @@ def run(config: RunnerConfig) -> dict[str, Any]:
         promotion_decision = "NOT_ELIGIBLE_FOR_PROMOTION"
 
     # ---------------------------------------------------- non-promoting registration
-    last_fold = fold_results[-1]
-    last_fold_train_games = tuple(labeled_by_id[gid] for gid in last_fold.training_game_ids)
     dev_registry_dir = config.output_dir / "dev_registry_warehouse"
     dev_backend = Warehouse(dev_registry_dir)
     payload_store = _InMemoryObjectStore()
+    base_model_version = profile_base_model_version(config.model_version, MODEL_PROFILE)
+    calibrators: list[dict[str, Any]] = []
+    registration = None
+    for fold, fr in zip(folds, fold_results, strict=True):
+        fit_games = tuple(labeled_by_id[gid] for gid in fr.training_game_ids)
+        registration = register_challenger(
+            cast("StorageBackend", dev_backend),
+            payload_store,
+            fit=fr.fit,
+            optimizer="L-BFGS-B",
+            tolerance=1e-8,
+            calibration_schema_version="2026.1.0",
+            base_model_version=base_model_version,
+            simulation_config_version="sim-v1",
+            prop_contract_version="2026.1.0",
+            calibration_contract_version="2026.1.0",
+            checkpoint_scope="ALL_PREGAME_CHECKPOINTS",
+            training_cutoff=fold.train_end,
+            training_start=fold.train_start,
+            training_end=fold.train_end,
+            training_manifest_sha256=compute_training_manifest_sha256(fit_games),
+            code_sha=config.execution_sha or "phase10c3a-runner",
+            payload_key=f"calibration/phase10c3a-challenger-{fr.fold_id}.json",
+            created_at=datetime.now(UTC),
+            scored_from=fold.score_start,
+            scored_through=fold.score_end,
+            validation_schema_version="v1",
+            validation_manifest_sha256=prepared.data_manifest_sha256,
+            training_games=fit_games,
+            metrics={
+                "objective_value": fr.fit.objective_value,
+                "aggregate_mean_skill_score": mean_skill_score(fr.challenger_scores, fr.baseline_scores),
+            },
+            chronology_checks_passed=chronology_ok,
+            leakage_checks_passed=chronology_ok,
+            simulation_invariants_passed=coherence["passed"],
+            reproducibility_passed=reproducibility["passed"],
+            support_preservation_passed=True,
+            first_td_simplex_passed=coherence["passed"],
+            promotion_gate_passed=(promotion_decision == "ELIGIBLE_FOR_PROMOTION"),
+            model_profile=MODEL_PROFILE.value,
+            evidence_mode=EVIDENCE_MODE.value,
+            evidence_class=prepared.evidence_class.value,
+        )
+        artifact = registration.register_result.artifact
+        require_calibrator_applicable(artifact, prediction_profile=MODEL_PROFILE.value)
+        cross_profile_refused = []
+        for other in ModelProfile:
+            if other is MODEL_PROFILE:
+                continue
+            try:
+                require_calibrator_applicable(artifact, prediction_profile=other.value)
+            except Exception:
+                cross_profile_refused.append(other.value)
+        calibrators.append({
+            "fold_id": fr.fold_id,
+            "calibration_artifact_id": artifact.calibration_artifact_id,
+            "payload_sha256": artifact.payload_sha256,
+            "theta": list(fr.fit.theta),
+            "model_profile": artifact.model_profile,
+            "base_model_version": artifact.base_model_version,
+            "feature_contract_version": artifact.feature_contract_version,
+            "algorithm": f"{artifact.algorithm_family}/{artifact.algorithm_version}",
+            "training_cutoff": fold.train_end.isoformat(),
+            "training_manifest_sha256": artifact.training_manifest_sha256,
+            "applies_to_scoring_window": [fold.score_start.isoformat(), fold.score_end.isoformat()],
+            "cross_profile_refused": cross_profile_refused,
+        })
+        log(f"registered challenger artifact for {fr.fold_id}: {artifact.calibration_artifact_id}")
+    assert registration is not None
 
-    registration = register_challenger(
-        cast("StorageBackend", dev_backend),
-        payload_store,
-        fit=last_fold.fit,
-        optimizer="L-BFGS-B",
-        tolerance=1e-8,
-        calibration_schema_version="2026.1.0",
-        base_model_version=config.model_version,
-        simulation_config_version="sim-v1",
-        prop_contract_version="2026.1.0",
-        calibration_contract_version="2026.1.0",
-        checkpoint_scope="ALL_PREGAME_CHECKPOINTS",
-        training_cutoff=folds[-1].train_end,
-        training_start=folds[-1].train_start,
-        training_end=folds[-1].train_end,
-        training_manifest_sha256=compute_training_manifest_sha256(last_fold_train_games),
-        code_sha="phase10c3a-runner",
-        payload_key="calibration/phase10c3a-challenger-1.json",
-        created_at=datetime.now(UTC),
-        scored_from=folds[-1].score_start,
-        scored_through=folds[-1].score_end,
-        validation_schema_version="v1",
-        validation_manifest_sha256=data_manifest_sha256,
-        training_games=last_fold_train_games,
-        metrics={
-            "objective_value": last_fold.fit.objective_value,
-            "aggregate_mean_skill_score": mean_skill_score(last_fold.challenger_scores, last_fold.baseline_scores),
+    # ---------------------------------------------------- persisted artifacts
+    oof_dir = config.output_dir / "oof"
+    reports_dir = config.output_dir / "reports"
+    oof_dir.mkdir(parents=True, exist_ok=True)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    raw_oof.write_parquet(oof_dir / "raw_oof.parquet", compression="zstd")
+    cal_oof.write_parquet(oof_dir / "calibrated_oof.parquet", compression="zstd")
+
+    def segments(frame: pl.DataFrame) -> dict[str, Any]:
+        return {col: segment_scores(frame, col)
+                for col in ("prop_type", "position_group", "season", "fold_id")}
+
+    fold_table = [
+        {"fold_id": _fold_id_for_season(first_season, folds, first_season),
+         "calibrator": None, "training_seasons": [], "scoring_seasons": [first_season],
+         "scoring_game_count": sum(1 for g in labeled_games
+                                   if season_by_game_id[g.game_id] == first_season),
+         "policy": "first season: no prior completed fold, raw (uncalibrated) only"},
+        *[{k: fr_report[k] for k in ("fold_id", "training_seasons", "scoring_seasons",
+                                     "train_start", "train_end", "score_start", "score_end",
+                                     "training_game_count", "scoring_game_count",
+                                     "training_label_count", "scoring_label_count")}
+          | {"calibrator": fr_report["fold_id"], "policy": "calibrator fit on prior completed seasons only"}
+          for fr_report in fold_reports],
+    ]
+    report_files = {
+        "raw_score_report.json": {
+            "all_seasons": score_rows(raw_oof),
+            "scored_folds_only": score_rows(raw_scored),
+            "segments_all_seasons": segments(raw_oof),
+            "zero_tail": zero_tail_report(raw_oof),
         },
-        chronology_checks_passed=True,
-        leakage_checks_passed=True,
-        simulation_invariants_passed=coherence["passed"],
-        reproducibility_passed=reproducibility["passed"],
-        support_preservation_passed=True,
-        first_td_simplex_passed=coherence["passed"],
-        promotion_gate_passed=(promotion_decision == "ELIGIBLE_FOR_PROMOTION"),
-    )
-    log(f"registered challenger artifact: {registration.register_result.artifact.calibration_artifact_id}")
+        "calibrated_score_report.json": {
+            "scored_folds": score_rows(cal_oof),
+            "raw_same_rows": score_rows(raw_scored),
+            "segments": segments(cal_oof),
+            "raw_segments_same_rows": segments(raw_scored),
+            "zero_tail": zero_tail_report(cal_oof),
+            "raw_zero_tail_same_rows": zero_tail_report(raw_scored),
+        },
+        "folds.json": fold_table,
+        "calibrators.json": calibrators,
+        "reproducibility_report.json": reproducibility,
+        "promotion_gate_report.json": gates,
+        "run_manifest.json": {
+            "phase": "10C3A",
+            "identity": identity,
+            "github_run_id": os.environ.get("GITHUB_RUN_ID"),
+            "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+            "github_repository": os.environ.get("GITHUB_REPOSITORY"),
+            "mode": config.mode,
+            "n_draws": config.n_draws,
+            "seasons": [config.season_min, config.season_max],
+            "evidence_mode": EVIDENCE_MODE.value,
+            "evidence_class": prepared.evidence_class.value,
+            "regularization_lambda": config.regularization_lambda,
+            "shards": shard_manifests,
+            "fold_table": fold_table,
+            "artifacts": {
+                "raw_oof": "oof/raw_oof.parquet",
+                "calibrated_oof": "oof/calibrated_oof.parquet",
+                "reports": sorted(["raw_score_report.json", "calibrated_score_report.json",
+                                   "folds.json", "calibrators.json",
+                                   "reproducibility_report.json", "promotion_gate_report.json"]),
+            },
+        },
+    }
+    for name, payload in report_files.items():
+        (reports_dir / name).write_text(json.dumps(payload, indent=1, default=str))
 
     report: dict[str, Any] = {
         "phase": "10C3A",
         "mode": config.mode,
+        "evidence_mode": EVIDENCE_MODE.value,
+        "model_profile": MODEL_PROFILE.value,
+        "evidence_class": prepared.evidence_class.value,
+        "evidence_estimated_rows": prepared.evidence_rows,
+        "pit_faithful_definition": (
+            "profile-input-faithful: every input the model profile consumes is "
+            "certified at the cutoff (STRUCTURAL_CORE consumes no injury feed)"
+        ),
         "n_draws": config.n_draws,
         "model_version": config.model_version,
+        "identity": identity,
         "data_root": str(config.data_root),
-        "data_root_manifest_sha256": data_manifest_sha256,
-        "evidence_class": str(evidence_class),
+        "data_root_manifest_sha256": prepared.data_manifest_sha256,
         "evidence_policy": {
             "requested": config.evidence,
-            "source_data_class": str(source_class),
-            "estimated_rows_in_source": estimated_rows,
-            "estimated_rows_excluded": estimated_rows if config.evidence == "official" else {},
+            "source_data_class": prepared.source_class.value,
+            "estimated_rows_in_source": prepared.evidence_rows,
         },
         "season_min": config.season_min,
         "season_max": config.season_max,
-        "replay_seconds": replay_seconds,
+        "shards": shard_manifests,
         "walk_forward_seconds": walk_forward_seconds,
         "total_final_games": games.height,
-        "replayable_game_count": len(batch.labeled_games),
-        "skip_count": len(batch.skips),
+        "replayable_game_count": len(labeled_games),
+        "skip_count": len(skips),
         "skip_accounting_by_season": skip_accounting,
         "coverage": {
             "total_game_count": coverage["total_game_count"],
@@ -702,14 +1251,18 @@ def run(config: RunnerConfig) -> dict[str, Any]:
         "directly_labeled_prop_types": sorted(DIRECTLY_LABELED_PROP_TYPES),
         "unlabeled_prop_types": sorted(UNLABELED_PROP_TYPES),
         "full_training_manifest_sha256": full_manifest,
+        "fold_table": fold_table,
         "folds": fold_reports,
         "real_game_coherence_check": coherence,
         "reproducibility_check": reproducibility,
         "overall_promotion_gate": {"promote": overall_promo.promote, "reasons": list(overall_promo.reasons)}
         if overall_promo is not None
         else None,
+        "full_promotion_gate_spec65": gates,
         "pit_faithful_evidence_exists": faithful_evidence_exists,
         "promotion_decision": promotion_decision,
+        "oof_row_counts": {"raw": raw_oof.height, "calibrated": cal_oof.height},
+        "calibrators": calibrators,
         "registration": {
             "calibration_artifact_id": registration.register_result.artifact.calibration_artifact_id,
             "inserted": registration.register_result.inserted,
@@ -720,6 +1273,48 @@ def run(config: RunnerConfig) -> dict[str, Any]:
         },
     }
     return report
+
+
+def run(config: RunnerConfig) -> dict[str, Any]:
+    """The full Phase 10C3A pipeline in one process (stage "all"): stream-
+    replay every final game into `output_dir/compact`, independently
+    re-replay the first season into `output_dir/repro_compact`, then
+    `evaluate`. The remote workflow runs the same stages as separate jobs
+    (`--stage replay` per season shard, then `--stage evaluate`). Raises
+    `InsufficientDataError` / `NumericalSafetyViolationError` /
+    `ConfigurationError` to fail closed rather than ever returning a report
+    claiming more than the evidence supports.
+    """
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def log(msg: str) -> None:
+        _log(config.output_dir, msg)
+
+    log(f"Phase 10C3A runner starting: stage={config.stage} mode={config.mode} "
+        f"n_draws={config.n_draws} data_root={config.data_root} "
+        f"seasons=[{config.season_min},{config.season_max}]")
+    prepared = _prepare(config, log)
+
+    if config.stage == "replay":
+        rows = prepared.games
+        if config.shard_season is not None:
+            rows = rows.filter(pl.col("season") == config.shard_season)
+        target = config.compact_dir or config.output_dir / "compact"
+        return replay_to_compact(config, prepared, rows, target, log)
+
+    if config.stage == "evaluate":
+        if not config.compact_dirs:
+            raise ConfigurationError("--stage evaluate requires --compact-dirs")
+        return evaluate(config, prepared, config.compact_dirs, config.repro_compact_dir, log)
+
+    primary = config.output_dir / "compact"
+    repro = config.output_dir / "repro_compact"
+    replay_to_compact(config, prepared, prepared.games, primary, log)
+    first_season = min(int(s) for s in prepared.games["season"].to_list())
+    replay_to_compact(
+        config, prepared, prepared.games.filter(pl.col("season") == first_season), repro, log
+    )
+    return evaluate(config, prepared, (primary,), repro, log)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -746,13 +1341,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"NUMERICAL SAFETY VIOLATION -- STOPPING: {exc}", file=sys.stderr)
         return EXIT_NUMERICAL_SAFETY_VIOLATION
     except Exception as exc:
+        import traceback
+
+        traceback.print_exc()
         print(f"UNHANDLED ERROR: {exc}", file=sys.stderr)
         return EXIT_UNHANDLED_ERROR
 
+    if config.stage == "replay":
+        print(f"SHARD WRITTEN: games={len(report['games'])} skips={len(report['skips'])}")
+        return EXIT_OK
     report_path = config.output_dir / "phase10c3a_report.json"
     report_path.write_text(json.dumps(report, indent=2, default=str))
     print(f"REPORT WRITTEN: {report_path}")
     print(f"PROMOTION_DECISION: {report['promotion_decision']}")
+    print(f"FULL_PROMOTION_GATE_SPEC65: {report['full_promotion_gate_spec65']['decision']}")
     return EXIT_OK
 
 

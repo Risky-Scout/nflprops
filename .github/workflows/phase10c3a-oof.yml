@@ -1,0 +1,232 @@
+name: Phase 10C3A OOF (streaming)
+
+# Real Phase 10C3A historical walk-forward OOF run at an exact, frozen git
+# SHA on GitHub-hosted compute -- never Joseph's Mac, never Wizard.
+#
+# Secretless. The immutable data root is REBUILT, never fetched from a
+# private store: the existing public canonical snapshot release used by
+# reproduce-historical.yml (archive SHA-256 verified BEFORE extraction) plus
+# the four pinned nflverse weekly-roster files (SHA-256 verified), passed
+# through tools/build_historical_positions.py at this SHA. The resulting
+# parquet manifest must equal DATA_MANIFEST_SHA256 before any science runs,
+# and every science job re-verifies it (--expect-data-manifest-sha256).
+#
+# Stages: one streaming replay job per season (each keeps at most one full
+# 20,000-draw simulation in memory and persists compact per-game evidence),
+# one independent re-replay of the first season (reproducibility), then one
+# evaluate job (fit/score/calibrate/gates; never simulates). Every certifying
+# output is uploaded; nothing deletes an output directory.
+#
+# Triggered by pushing a `phase10c3a-run-*` tag at the frozen SHA (a
+# workflow_dispatch needs the file on the default branch first).
+
+on:
+  push:
+    tags:
+      - "phase10c3a-run-*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phase10c3a-oof-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  SNAPSHOT_RELEASE_TAG: repro-data-1c823c1884eb
+  SNAPSHOT_ARCHIVE: nflprops-canonical-1c823c1884eb.tar
+  SNAPSHOT_ARCHIVE_SHA256: 9dac3e85dff58faf0272687ef150304c9ff78244c7702102cb78bfb9dc39ba00
+  DATA_MANIFEST_SHA256: 9d530788a83e3f350f48d3c25a0ea838435fa750109eb7499b0e1755f74345d5
+  SCIENCE_BASE_SHA: 4c66ed4402cea32f0bfec4ed4d297b3eed1b20ee
+  N_DRAWS: "20000"
+  MODE: production
+  # Same numerical stack the runner-equivalence proof ran on.
+  PINNED_STACK: "polars==1.44.2 numpy==2.4.6 scipy==1.18.1"
+
+jobs:
+  data-root:
+    name: Rebuild and verify data root
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project
+        run: pip install -e ".[dev]" $PINNED_STACK
+
+      - name: Download public canonical snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/dl"
+          gh release download "$SNAPSHOT_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$SNAPSHOT_ARCHIVE" --dir "$RUNNER_TEMP/dl"
+
+      - name: Verify snapshot archive SHA-256 before extraction
+        run: |
+          echo "$SNAPSHOT_ARCHIVE_SHA256  $RUNNER_TEMP/dl/$SNAPSHOT_ARCHIVE" | sha256sum --check --strict
+
+      - name: Extract snapshot
+        run: |
+          mkdir -p "$RUNNER_TEMP/snap"
+          tar -xf "$RUNNER_TEMP/dl/$SNAPSHOT_ARCHIVE" -C "$RUNNER_TEMP/snap"
+
+      - name: Download pinned nflverse weekly rosters
+        run: |
+          mkdir -p "$RUNNER_TEMP/nflverse"
+          python - <<'PY'
+          import os, urllib.request
+          from pathlib import Path
+          from nflprops.features.historical_positions import (
+              NFLVERSE_WEEKLY_ROSTER_SOURCES, NFLVERSE_WEEKLY_ROSTER_URL, file_sha256)
+          out = Path(os.environ["RUNNER_TEMP"]) / "nflverse"
+          for season, pinned in sorted(NFLVERSE_WEEKLY_ROSTER_SOURCES.items()):
+              path = out / f"roster_weekly_{season}.parquet"
+              urllib.request.urlretrieve(NFLVERSE_WEEKLY_ROSTER_URL.format(season=season), path)
+              sha = file_sha256(path)
+              print(f"NFLVERSE_{season}_SHA256={sha}")
+              if sha != pinned["sha256"]:
+                  raise SystemExit(f"{path.name}: sha256 {sha} != pinned {pinned['sha256']}")
+          PY
+
+      - name: Build historical identity tables
+        run: |
+          python tools/build_historical_positions.py \
+            --data-root "$RUNNER_TEMP/snap/canonical" --nflverse-dir "$RUNNER_TEMP/nflverse"
+
+      - name: Verify data-root manifest
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          from nflprops.calibration.historical_runner import compute_data_root_manifest_sha256
+          sha = compute_data_root_manifest_sha256(Path(os.environ["RUNNER_TEMP"]) / "snap" / "canonical")
+          print(f"REMOTE_DATA_MANIFEST_SHA256={sha}")
+          if sha != os.environ["DATA_MANIFEST_SHA256"]:
+              raise SystemExit("data-root manifest SHA mismatch")
+          PY
+
+      - name: Upload verified data root
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase10c3a-data-root
+          path: ${{ runner.temp }}/snap/canonical
+          if-no-files-found: error
+          retention-days: 90
+
+  replay:
+    name: Replay ${{ matrix.shard }}
+    needs: data-root
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { shard: s2022, season: 2022 }
+          - { shard: s2023, season: 2023 }
+          - { shard: s2024, season: 2024 }
+          - { shard: s2025, season: 2025 }
+          # Independent re-replay of the first season: the fold-0 training
+          # set the reproducibility check re-fits and hash-compares.
+          - { shard: repro2022, season: 2022 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project
+        run: pip install -e ".[dev]" $PINNED_STACK
+
+      - name: Download verified data root
+        uses: actions/download-artifact@v4
+        with:
+          name: phase10c3a-data-root
+          path: ${{ runner.temp }}/data-root
+
+      - name: Streaming replay (${{ matrix.shard }})
+        run: |
+          set -o pipefail
+          python -m nflprops.calibration.phase10c3a_runner \
+            --stage replay \
+            --shard-season "${{ matrix.season }}" \
+            --data-root "$RUNNER_TEMP/data-root" \
+            --output-dir "$RUNNER_TEMP/out-${{ matrix.shard }}" \
+            --compact-dir "$RUNNER_TEMP/out-${{ matrix.shard }}/compact" \
+            --n-draws "$N_DRAWS" --mode "$MODE" \
+            --expect-data-manifest-sha256 "$DATA_MANIFEST_SHA256" \
+            --execution-sha "$GITHUB_SHA" \
+            --science-base-sha "$SCIENCE_BASE_SHA"
+
+      - name: Upload compact shard (certifying evidence)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase10c3a-compact-${{ matrix.shard }}
+          path: ${{ runner.temp }}/out-${{ matrix.shard }}
+          if-no-files-found: error
+          retention-days: 90
+
+  evaluate:
+    name: Evaluate, calibrate, gate
+    needs: replay
+    runs-on: ubuntu-24.04
+    timeout-minutes: 345
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project
+        run: pip install -e ".[dev]" $PINNED_STACK
+
+      - name: Download verified data root
+        uses: actions/download-artifact@v4
+        with:
+          name: phase10c3a-data-root
+          path: ${{ runner.temp }}/data-root
+
+      - name: Download compact shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: phase10c3a-compact-*
+          path: ${{ runner.temp }}/shards
+
+      - name: Evaluate
+        run: |
+          set -o pipefail
+          S="$RUNNER_TEMP/shards"
+          python -m nflprops.calibration.phase10c3a_runner \
+            --stage evaluate \
+            --data-root "$RUNNER_TEMP/data-root" \
+            --output-dir "$RUNNER_TEMP/evaluate" \
+            --compact-dirs \
+              "$S/phase10c3a-compact-s2022/compact" "$S/phase10c3a-compact-s2023/compact" \
+              "$S/phase10c3a-compact-s2024/compact" "$S/phase10c3a-compact-s2025/compact" \
+            --repro-compact-dir "$S/phase10c3a-compact-repro2022/compact" \
+            --n-draws "$N_DRAWS" --mode "$MODE" \
+            --expect-data-manifest-sha256 "$DATA_MANIFEST_SHA256" \
+            --execution-sha "$GITHUB_SHA" \
+            --science-base-sha "$SCIENCE_BASE_SHA" \
+            | tee "$RUNNER_TEMP/evaluate-stdout.txt"
+
+      - name: Upload full science output set
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase10c3a-science-output
+          if-no-files-found: error
+          retention-days: 90
+          path: |
+            ${{ runner.temp }}/evaluate
+            ${{ runner.temp }}/evaluate-stdout.txt

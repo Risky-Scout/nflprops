@@ -223,6 +223,24 @@ _STRUCTURED_RUNNER_REGULARIZATION_LAMBDA = 0.01
 _STRUCTURED_RUNNER_MAX_FIT_ITERATIONS = 200
 
 
+def _certified_promotion_evidence(result: dict[str, Any]) -> bool:
+    """Whether a runner report's (evidence_mode, evidence_class) is promotion
+    evidence under `nflprops.data.evidence_policy.promotion_evidence_allowed`.
+    A missing or unknown mode/class never is."""
+    from nflprops.data.evidence_policy import EvidenceClass, promotion_evidence_allowed
+    from nflprops.features.historical_evidence import EvidenceMode
+
+    claimed_class, claimed_mode = result.get("evidence_class"), result.get("evidence_mode")
+    if not isinstance(claimed_class, str) or not isinstance(claimed_mode, str):
+        return False
+    try:
+        evidence_class = EvidenceClass(claimed_class)
+        evidence_mode = EvidenceMode(claimed_mode)
+    except ValueError:
+        return False
+    return promotion_evidence_allowed(evidence_class, evidence_mode=evidence_mode)
+
+
 def _adapt_structured_runner(
     module: Any, runner_config_cls: Any, structured_run: Callable[[Any], dict[str, Any]]
 ) -> Callable[..., dict[str, Any]]:
@@ -285,10 +303,11 @@ def _adapt_structured_runner(
                 "reproducibility_check": result.get("reproducibility_check"),
             },
             "promotion_eligibility_result": {
-                # Promotion evidence must be OFFICIAL (strict PIT): a run
-                # reporting no evidence class, or RESEARCH_ONLY, never is.
+                # Promotion evidence must be its evidence mode's certified
+                # class (`promotion_evidence_allowed`): a run reporting no
+                # class/mode, or RESEARCH_ONLY, never is.
                 "eligible": result.get("promotion_decision") == "ELIGIBLE_FOR_PROMOTION"
-                and result.get("evidence_class") == "OFFICIAL_PIT_FAITHFUL",
+                and _certified_promotion_evidence(result),
                 "evidence_class": result.get("evidence_class"),
                 "decision": result.get("promotion_decision"),
                 "overall_promotion_gate": result.get("overall_promotion_gate"),

@@ -27,6 +27,7 @@ import pytest
 
 from nflprops.config import Config
 from nflprops.data.warehouse import Warehouse
+from nflprops.domain.model_profile import ModelProfile
 from nflprops.orchestration.checkpoints import CheckpointName
 from nflprops.orchestration.flows import checkpoints as checkpoints_flow
 from nflprops.orchestration.flows.checkpoints import (
@@ -61,7 +62,7 @@ def _game_row(
 
 
 def _minimal_config() -> Config:
-    return Config(data={})
+    return Config(data={"model": {"profile": "LIVE_ENHANCED"}})
 
 
 def test_dispatch_called_twice_at_same_frozen_now_produces_no_duplicates(
@@ -248,6 +249,7 @@ def test_predict_game_retry_with_fixed_run_id_never_fabricates_a_new_identity_or
         persist=True,
         official_run_id=fixed_run_id,
         checkpoint_name=CheckpointName.T30M.value,
+        model_profile=ModelProfile.LIVE_ENHANCED,
     )
     second_attempt = predict_game(
         warehouse,
@@ -258,6 +260,7 @@ def test_predict_game_retry_with_fixed_run_id_never_fabricates_a_new_identity_or
         persist=True,
         official_run_id=fixed_run_id,
         checkpoint_name=CheckpointName.T30M.value,
+        model_profile=ModelProfile.LIVE_ENHANCED,
     )
 
     assert not first_attempt.is_empty()

@@ -104,6 +104,9 @@ def test_register_challenger_creates_immutable_artifact_and_validation(tmp_path:
         support_preservation_passed=True,
         first_td_simplex_passed=True,
         promotion_gate_passed=False,
+        model_profile="STRUCTURAL_CORE",
+        evidence_mode="HISTORICAL_WALK_FORWARD",
+        evidence_class="CERTIFIED_HISTORICAL_EVENT_CHRONOLOGY",
     )
 
     assert result.register_result.inserted is True
@@ -162,6 +165,9 @@ def test_register_challenger_never_creates_a_champion_pointer(tmp_path: Path) ->
         support_preservation_passed=True,
         first_td_simplex_passed=True,
         promotion_gate_passed=True,
+        model_profile="STRUCTURAL_CORE",
+        evidence_mode="HISTORICAL_WALK_FORWARD",
+        evidence_class="CERTIFIED_HISTORICAL_EVENT_CHRONOLOGY",
     )
 
     artifact_id = result.register_result.artifact.calibration_artifact_id

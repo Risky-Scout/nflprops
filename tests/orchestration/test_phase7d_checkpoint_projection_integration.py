@@ -28,6 +28,7 @@ from _fixtures import (
 
 import nflprops.pipelines.pregame as pregame_module
 from nflprops.data.warehouse import Warehouse
+from nflprops.domain.model_profile import ModelProfile
 from nflprops.orchestration.checkpoints import CheckpointName
 from nflprops.orchestration.flows import checkpoints as checkpoints_flow
 from nflprops.orchestration.flows.checkpoints import (
@@ -181,6 +182,7 @@ def _ctx(
         retain_joint_draws=0,
         max_confidence_tier=2,
         market_mode="live",
+        model_profile=ModelProfile.LIVE_ENHANCED,
     )
 
 
@@ -747,6 +749,7 @@ def test_current_pricing_is_regression_equivalent_to_pre_7d(tmp_path: Path) -> N
         as_of=AS_OF,
         model_version="phase7d-test",
         n_draws=N_DRAWS,
+        model_profile=ModelProfile.LIVE_ENHANCED,
     )
     assert computation is not None
     integrated = pl.DataFrame(computation.price_markets())
@@ -789,10 +792,12 @@ def test_phase5_data_manifest_and_sim_input_sha_unchanged_by_projection_persist(
     comp_no = compute_game_prediction(
         no_book, season=SEASON, week=WEEK, game_id=TARGET_GAME_ID, as_of=AS_OF,
         model_version="phase7d-test", n_draws=N_DRAWS,
+        model_profile=ModelProfile.LIVE_ENHANCED,
     )
     comp_with = compute_game_prediction(
         with_book, season=SEASON, week=WEEK, game_id=TARGET_GAME_ID, as_of=AS_OF,
         model_version="phase7d-test", n_draws=N_DRAWS,
+        model_profile=ModelProfile.LIVE_ENHANCED,
     )
     assert comp_no is not None and comp_with is not None
     assert comp_no.simulation_input_sha256 == comp_with.simulation_input_sha256
@@ -838,7 +843,7 @@ def test_dispatcher_end_to_end_persists_projections_for_due_checkpoints(
     warehouse = _build_warehouse(tmp_path)
     results = checkpoint_dispatch_flow(
         warehouse=warehouse,
-        config=Config(data={}),
+        config=Config(data={"model": {"profile": "LIVE_ENHANCED"}}),
         season=SEASON,
         week=WEEK,
         now=AS_OF,

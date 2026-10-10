@@ -53,6 +53,7 @@ checkpoint_scopes:
 # they distinguish one artifact from another but do not define whether an
 # artifact is structurally compatible with an active model/config.
 compatibility_digest_fields:
+  - model_profile
   - base_model_version
   - simulation_config_version
   - feature_contract_version
@@ -72,6 +73,7 @@ artifact_identity_fields:
   - algorithm_version
   - scope_type
   - checkpoint_scope
+  - model_profile
   - base_model_version
   - simulation_config_version
   - feature_contract_version
@@ -92,6 +94,7 @@ artifact_immutable_fields:
   - algorithm_version
   - scope_type
   - checkpoint_scope
+  - model_profile
   - base_model_version
   - simulation_config_version
   - feature_contract_version

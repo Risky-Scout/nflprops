@@ -460,20 +460,27 @@ def test_no_heavy_compute_keywords_on_wizard_facing_files(path: Path) -> None:
 # ------------------------------------------------------- migration head / science
 
 
-def test_compact_pmf_migration_0009_remains_the_alembic_head() -> None:
+def test_compact_pmf_migration_0009_is_extended_only_by_gate1_0010() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "alembic", "heads"],
         cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stderr
-    assert "0009_compact_pmf_payload" in result.stdout
+    # Gate 1's 0010_cal_model_profile revises 0009_compact_pmf_payload.
+    assert "0010_cal_model_profile" in result.stdout
     heads = [line for line in result.stdout.splitlines() if line.strip()]
     assert len(heads) == 1
+    history = subprocess.run(
+        [sys.executable, "-m", "alembic", "history"],
+        cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=30,
+    )
+    assert "0009_compact_pmf_payload -> 0010_cal_model_profile (head)" in history.stdout
 
 
 def test_block_2b_adds_no_new_alembic_migration() -> None:
     versions_dir = REPO_ROOT / "migrations" / "versions"
     revisions = sorted(p.name for p in versions_dir.glob("0*.py"))
-    assert revisions[-1].startswith("0009_"), (
-        f"BLOCK 2B must not add a migration -- highest revision is {revisions[-1]!r}"
-    )
+    # The only migration after BLOCK 2B's 0009 is Gate 1's 0010.
+    assert revisions[-2].startswith("0009_") and revisions[-1] == (
+        "0010_calibration_model_profile.py"
+    ), f"BLOCK 2B must not add a migration -- highest revisions are {revisions[-2:]!r}"

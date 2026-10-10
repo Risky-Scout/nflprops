@@ -40,6 +40,7 @@ _ARTIFACTS_SCHEMA: dict[str, pl.DataType] = {
     "algorithm_version": pl.String(),
     "scope_type": pl.String(),
     "checkpoint_scope": pl.String(),
+    "model_profile": pl.String(),
     "base_model_version": pl.String(),
     "simulation_config_version": pl.String(),
     "feature_contract_version": pl.String(),
@@ -235,6 +236,7 @@ def _artifact_as_row(artifact: CalibrationArtifact) -> dict[str, object]:
         "algorithm_version": artifact.algorithm_version,
         "scope_type": artifact.scope_type,
         "checkpoint_scope": artifact.checkpoint_scope,
+        "model_profile": artifact.model_profile,
         "base_model_version": artifact.base_model_version,
         "simulation_config_version": artifact.simulation_config_version,
         "feature_contract_version": artifact.feature_contract_version,
@@ -263,6 +265,9 @@ def _row_to_artifact(record: Mapping[str, Any]) -> CalibrationArtifact:
         algorithm_version=str(record["algorithm_version"]),
         scope_type=str(record["scope_type"]),
         checkpoint_scope=str(record["checkpoint_scope"]),
+        # A legacy (pre-Gate-1) row has no model_profile: "" is refused by
+        # CalibrationArtifact, never silently assumed to be any profile.
+        model_profile=str(record.get("model_profile") or ""),
         base_model_version=str(record["base_model_version"]),
         simulation_config_version=str(record["simulation_config_version"]),
         feature_contract_version=str(record["feature_contract_version"]),

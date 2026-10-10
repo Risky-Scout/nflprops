@@ -23,6 +23,11 @@ artifact structurally usable with the currently active model/config", and
 deliberately excludes training window, training manifest, payload hash,
 and code SHA -- fields that distinguish one artifact from another but do
 not define compatibility.
+
+`model_profile` (Gate 1) is in all three: a calibrator is fitted on one
+model profile's raw predictions and applies to that profile only, so two
+artifacts that differ only in profile are different artifacts with
+different champion slots (v2 of each hash).
 """
 
 from __future__ import annotations
@@ -35,6 +40,7 @@ from enum import Enum
 
 from nflprops.collection.resource_availability import deterministic_id
 from nflprops.domain.enums import PropType
+from nflprops.domain.model_profile import ModelProfileError, parse_model_profile
 
 #: The only live public calibration scope (PHASE 10C-A architecture lock).
 #: See contracts/calibration_registry.yml `live_scope_is_joint_game_only`.
@@ -125,6 +131,7 @@ class CalibrationArtifact:
     algorithm_version: str
     scope_type: str
     checkpoint_scope: str
+    model_profile: str
     base_model_version: str
     simulation_config_version: str
     feature_contract_version: str
@@ -153,6 +160,10 @@ class CalibrationArtifact:
             self.checkpoint_scope in CHECKPOINT_SCOPES,
             f"checkpoint_scope {self.checkpoint_scope!r} is not one of {sorted(CHECKPOINT_SCOPES)}",
         )
+        try:
+            parse_model_profile(self.model_profile)
+        except ModelProfileError as exc:
+            raise CalibrationArtifactError(f"calibration artifact: {exc}") from None
         _require(self.payload_byte_count > 0, "payload_byte_count must be positive")
         _aware(self.training_cutoff, field="training_cutoff")
         _aware(self.training_start, field="training_start")
@@ -172,6 +183,7 @@ class CalibrationArtifact:
             ("algorithm_version", self.algorithm_version),
             ("scope_type", self.scope_type),
             ("checkpoint_scope", self.checkpoint_scope),
+            ("model_profile", self.model_profile),
             ("base_model_version", self.base_model_version),
             ("simulation_config_version", self.simulation_config_version),
             ("feature_contract_version", self.feature_contract_version),
@@ -188,6 +200,7 @@ class CalibrationArtifact:
         -- `contracts/calibration_registry.yml: compatibility_digest_fields`.
         Deliberately excludes training window/manifest/payload/code SHA."""
         return (
+            ("model_profile", self.model_profile),
             ("base_model_version", self.base_model_version),
             ("simulation_config_version", self.simulation_config_version),
             ("feature_contract_version", self.feature_contract_version),
@@ -227,9 +240,9 @@ def _serialize_scalar(value: object) -> str:
     return str(value)
 
 
-_ARTIFACT_ID_SCHEMA_MARKER = "calibration_artifact_id/v1"
-_COMPATIBILITY_SCHEMA_MARKER = "calibration_compatibility_digest/v1"
-_SCIENTIFIC_HASH_SCHEMA_MARKER = "calibration_artifact_scientific_content/v1"
+_ARTIFACT_ID_SCHEMA_MARKER = "calibration_artifact_id/v2"
+_COMPATIBILITY_SCHEMA_MARKER = "calibration_compatibility_digest/v2"
+_SCIENTIFIC_HASH_SCHEMA_MARKER = "calibration_artifact_scientific_content/v2"
 
 
 def compute_calibration_artifact_id(
@@ -239,6 +252,7 @@ def compute_calibration_artifact_id(
     algorithm_version: str,
     scope_type: str,
     checkpoint_scope: str,
+    model_profile: str,
     base_model_version: str,
     simulation_config_version: str,
     feature_contract_version: str,
@@ -260,6 +274,7 @@ def compute_calibration_artifact_id(
         algorithm_version,
         scope_type,
         checkpoint_scope,
+        parse_model_profile(model_profile).value,
         base_model_version,
         simulation_config_version,
         feature_contract_version,
@@ -274,6 +289,7 @@ def compute_calibration_artifact_id(
 
 def compute_compatibility_digest(
     *,
+    model_profile: str,
     base_model_version: str,
     simulation_config_version: str,
     feature_contract_version: str,
@@ -287,6 +303,7 @@ def compute_compatibility_digest(
     distinguish artifacts but never define structural compatibility."""
     return deterministic_id(
         _COMPATIBILITY_SCHEMA_MARKER,
+        parse_model_profile(model_profile).value,
         base_model_version,
         simulation_config_version,
         feature_contract_version,
@@ -314,6 +331,7 @@ def build_calibration_artifact(
     algorithm_version: str,
     scope_type: str,
     checkpoint_scope: str,
+    model_profile: str,
     base_model_version: str,
     simulation_config_version: str,
     feature_contract_version: str,
@@ -336,12 +354,17 @@ def build_calibration_artifact(
     internally from the raw inputs, so the two hash fields are never
     supplied (and therefore never trusted) from outside this function.
     """
+    try:
+        model_profile = parse_model_profile(model_profile).value
+    except ModelProfileError as exc:
+        raise CalibrationArtifactError(f"calibration artifact: {exc}") from None
     calibration_artifact_id = compute_calibration_artifact_id(
         calibration_schema_version=calibration_schema_version,
         algorithm_family=algorithm_family,
         algorithm_version=algorithm_version,
         scope_type=scope_type,
         checkpoint_scope=checkpoint_scope,
+        model_profile=model_profile,
         base_model_version=base_model_version,
         simulation_config_version=simulation_config_version,
         feature_contract_version=feature_contract_version,
@@ -359,6 +382,7 @@ def build_calibration_artifact(
         algorithm_version=algorithm_version,
         scope_type=scope_type,
         checkpoint_scope=checkpoint_scope,
+        model_profile=model_profile,
         base_model_version=base_model_version,
         simulation_config_version=simulation_config_version,
         feature_contract_version=feature_contract_version,

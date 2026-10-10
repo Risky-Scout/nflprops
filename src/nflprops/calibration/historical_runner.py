@@ -12,23 +12,27 @@ This module never:
 * runs a second, simplified, or approximate simulation -- one
   `GameSimulationResult` per game, from the certified pregame path;
 * introduces realized-outcome information into simulation inputs -- state
-  is built only from data with `available_at <= as_of` (the game's own
-  kickoff), via the same `filter_pit` gate the live pipeline uses;
+  is built under `EvidenceMode.HISTORICAL_WALK_FORWARD`
+  (`nflprops.features.historical_evidence`): completed-game stats enter
+  only when their slate precedes the target's slate (event chronology,
+  never NFLProps' 2026 import date and never a `kickoff + lag` estimate),
+  and pregame observations (rosters, injuries, game odds) only with a
+  genuine availability time at or before `as_of` -- the LIVE_PIT rule;
 * fabricates a label for an unlabeled (PBP-gated) PropType -- only
   `nflprops.calibration.artifact.DIRECTLY_LABELED_PROP_TYPES` are ever
   scored, via the SAME settlement rules
   (`nflprops.market.rules`/`nflprops.pipelines.settle`) production
   settlement uses;
 * fabricates PIT faithfulness -- `LabeledGame.injury_data_available`
-  comes from the real `nflprops.backtest.provenance.
-  build_state_provenance_context` / `injury_feed_available_at` mechanism,
-  never hardcoded.
+  comes from the real `nflprops.data.injury_availability.
+  injury_feed_available_at` mechanism (the one
+  `build_state_provenance_context` uses), never hardcoded.
 
 `as_of` is each game's own kickoff time (`games.date`), matching the T30M
-production checkpoint's spirit (the latest possible pregame cutoff) while
-remaining strictly PIT-safe: a game's OWN `player_game_stats` row is never
-visible at its own kickoff (its `available_at` is always later -- the
-stats are ingested after the game finishes).
+production checkpoint's spirit (the latest possible pregame cutoff). A
+game's OWN stats are never visible to it (same slate, and excluded by id);
+they are its labels, and enter history for later slates at its slate
+boundary (`LabeledGame.outcome_available_at`).
 """
 
 from __future__ import annotations
@@ -42,27 +46,41 @@ from typing import TYPE_CHECKING
 
 import polars as pl
 
-from nflprops.backtest.provenance import build_state_provenance_context
 from nflprops.calibration.artifact import DIRECTLY_LABELED_PROP_TYPES
-from nflprops.calibration.challenger import LabeledGame, PropLabel
+from nflprops.calibration.challenger import CalibrationGame, LabeledGame, PropLabel
 from nflprops.data.evidence_policy import official_view
+from nflprops.data.injury_availability import injury_feed_available_at
 from nflprops.data.outcome_versions import latest_final
 from nflprops.domain.enums import PropType
+from nflprops.domain.model_profile import ModelProfile
+from nflprops.features.historical_evidence import (
+    EvidenceMode,
+    build_slate_chronology,
+    schedule_identity,
+)
+from nflprops.features.historical_positions import HISTORICAL_POSITIONS_TABLE
+from nflprops.features.team_membership import HISTORICAL_TEAM_MEMBERSHIP_TABLE
 from nflprops.market.rules import (
     SettlementRuleError,
     SettlementRuleSet,
     evaluate_actual_value,
     load_settlement_rules,
 )
+from nflprops.pipelines.model_inputs import build_model_inputs
 from nflprops.pipelines.pregame import simulate_game_for_prediction
 from nflprops.simulation.game import SimulationConfig
-from nflprops.state.player import PlayerStateConfig, build_player_states
-from nflprops.state.team import TeamStateConfig, build_team_states
+from nflprops.state.player import PlayerStateConfig
+from nflprops.state.team import TeamStateConfig
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     from nflprops.data.storage.base import StorageBackend
+
+#: Historical replay's only evidence mode and the only model profile it can
+#: certify; both are recorded in the 10C3A report and calibration artifact.
+EVIDENCE_MODE = EvidenceMode.HISTORICAL_WALK_FORWARD
+MODEL_PROFILE = ModelProfile.STRUCTURAL_CORE
 
 _REQUIRED_WAREHOUSE_TABLES: tuple[str, ...] = (
     "games",
@@ -82,7 +100,7 @@ class HistoricalReplayError(ValueError):
 class WarehouseTables:
     """Every warehouse table `build_labeled_game` reads, loaded once.
 
-    `build_labeled_game` re-reads all eight tables from `backend` on
+    `build_labeled_game` re-reads all ten tables from `backend` on
     every call when `tables` is omitted -- correct, but O(n_games) redundant
     disk I/O over an unchanging historical warehouse (the dominant real-run
     cost, unrelated to `n_draws`). A caller replaying many games loads this
@@ -99,6 +117,27 @@ class WarehouseTables:
     injuries: pl.DataFrame
     injury_runs: pl.DataFrame
     game_odds: pl.DataFrame
+    #: Week-versioned historical positions (empty = none built; position
+    #: groups then come from the `players` dimension alone).
+    historical_positions: pl.DataFrame
+    #: Week-versioned roster membership (empty = none built; no QB is then
+    #: a structural candidate and the simulator's generic QB stands in).
+    historical_team_membership: pl.DataFrame
+
+    def as_table_mapping(self) -> dict[str, pl.DataFrame]:
+        """These frames keyed by their warehouse table name."""
+        return {
+            "games": self.games,
+            "player_game_stats": self.player_stats,
+            "team_game_stats": self.team_stats,
+            "players": self.players,
+            "roster_snapshots": self.roster,
+            "injury_snapshots": self.injuries,
+            "collector_resource_runs": self.injury_runs,
+            "game_odds_snapshots": self.game_odds,
+            HISTORICAL_POSITIONS_TABLE: self.historical_positions,
+            HISTORICAL_TEAM_MEMBERSHIP_TABLE: self.historical_team_membership,
+        }
 
     def as_mapping(self) -> dict[str, pl.DataFrame]:
         return {f.name: getattr(self, f.name) for f in fields(self)}
@@ -124,6 +163,8 @@ def load_warehouse_tables(backend: StorageBackend) -> WarehouseTables:
         injuries=_empty_or(backend, "injury_snapshots"),
         injury_runs=_empty_or(backend, "collector_resource_runs"),
         game_odds=_empty_or(backend, "game_odds_snapshots"),
+        historical_positions=_empty_or(backend, HISTORICAL_POSITIONS_TABLE),
+        historical_team_membership=_empty_or(backend, HISTORICAL_TEAM_MEMBERSHIP_TABLE),
     )
 
 
@@ -217,6 +258,7 @@ def build_labeled_game(
     team_state_config: TeamStateConfig | None = None,
     settlement_rules: SettlementRuleSet | None = None,
     tables: WarehouseTables | None = None,
+    model_profile: ModelProfile = ModelProfile.STRUCTURAL_CORE,
 ) -> LabeledGame | GameReplaySkip:
     """Real historical replay of one game: build PIT-safe states from data
     strictly available at kickoff, run the certified
@@ -243,31 +285,44 @@ def build_labeled_game(
     injuries = loaded.injuries
     injury_runs = loaded.injury_runs
     game_odds = loaded.game_odds
-
-    team_states = build_team_states(
-        team_stats, player_stats, as_of=as_of, strict=False,
-        config=team_state_config or TeamStateConfig(),
+    historical_positions = (
+        None if loaded.historical_positions.is_empty() else loaded.historical_positions
     )
-    player_states = build_player_states(
-        player_stats, team_stats, players, as_of=as_of,
-        roster=roster if roster.height > 0 else None,
-        injuries=injuries if injuries.height > 0 else None,
-        strict=False, config=player_state_config or PlayerStateConfig(),
+    historical_team_membership = (
+        None
+        if loaded.historical_team_membership.is_empty()
+        else loaded.historical_team_membership
+    )
+
+    # STRUCTURAL_CORE under HISTORICAL_WALK_FORWARD, through the SAME
+    # assembly live execution uses (nflprops.pipelines.model_inputs): history
+    # by slate order, recency by source kickoff, no market/injury/roster
+    # input. LIVE_ENHANCED is refused there, before any simulation.
+    chronology = build_slate_chronology(games)
+    inputs = build_model_inputs(
+        model_profile=model_profile,
+        evidence_mode=EVIDENCE_MODE,
+        games=games, player_stats=player_stats, team_stats=team_stats, players=players,
+        roster=roster, injuries=injuries, game_odds=game_odds,
+        as_of=as_of, target_slate=chronology.slate_of(game_id), target_game_id=game_id,
+        player_state_config=player_state_config, team_state_config=team_state_config,
+        historical_positions=historical_positions,
+        historical_team_membership=historical_team_membership,
     )
 
     prepared = simulate_game_for_prediction(
-        game=game_row, team_states=team_states, player_states=player_states,
-        game_odds=game_odds, as_of=as_of, model_version=model_version,
+        game=schedule_identity(game_row), team_states=inputs.team_states,
+        player_states=inputs.player_states,
+        game_odds=inputs.game_odds, as_of=as_of, model_version=model_version,
         market_mode="live", simulation_config=simulation_config, n_draws=n_draws,
     )
     if prepared is None:
         return GameReplaySkip(game_id=game_id, reason="UNTRUSTWORTHY_TEAM_STRUCTURAL_STATE")
 
-    state_context = build_state_provenance_context(
-        games=games, player_stats=player_stats, team_stats=team_stats, players=players,
-        roster=roster, injuries=injuries, injury_runs=injury_runs,
-        as_of=as_of, model_version=model_version,
-    )
+    # Not `build_state_provenance_context`: it re-derives the state universe
+    # on the LIVE_PIT clock (`available_at`), which historical replay does
+    # not use. Only its injury-feed flag is needed, from the same mechanism.
+    injury_data_available = injury_feed_available_at(injury_runs, as_of=as_of)
 
     # Not every player with a real box-score line is part of the coherent
     # simulated player universe (e.g. a rarely-used player the eligibility
@@ -287,16 +342,14 @@ def build_labeled_game(
     if not labels:
         return GameReplaySkip(game_id=game_id, reason="NO_SCOREABLE_EVIDENCE")
 
-    outcome_available_at = this_game_stats["available_at"].max()
-    if outcome_available_at is None:
-        return GameReplaySkip(game_id=game_id, reason="NO_OUTCOME_AVAILABLE_AT")
-
+    # The label enters history for later targets at its slate boundary --
+    # event chronology, not the stats' (2026 or estimated) `available_at`.
     return LabeledGame(
         game_id=game_id,
         simulation=prepared.result,
         as_of=as_of,
-        outcome_available_at=_aware(outcome_available_at, field="outcome_available_at"),
-        injury_data_available=state_context.injury_data_available,
+        outcome_available_at=chronology.label_available_at(game_id),
+        injury_data_available=injury_data_available,
         labels=labels,
     )
 
@@ -327,6 +380,7 @@ def replay_games(
     settlement_rules: SettlementRuleSet | None = None,
     on_progress: Callable[[int, int, str], None] | None = None,
     tables: WarehouseTables | None = None,
+    model_profile: ModelProfile = ModelProfile.STRUCTURAL_CORE,
 ) -> ReplayBatchResult:
     """Replay every row of `game_rows` (as returned by `list_final_games`).
     Honest bookkeeping: every game becomes exactly one `LabeledGame` or one
@@ -338,30 +392,63 @@ def replay_games(
     reads fresh (and therefore redundantly, once per game) exactly as
     before.
     """
-    rules = settlement_rules if settlement_rules is not None else load_settlement_rules()
-    loaded = tables if tables is not None else load_warehouse_tables(backend)
     labeled: list[LabeledGame] = []
     skips: list[GameReplaySkip] = []
+    for result in iter_replay_games(
+        backend, game_rows, model_version=model_version, n_draws=n_draws,
+        simulation_config=simulation_config,
+        player_state_config=player_state_config,
+        team_state_config=team_state_config,
+        settlement_rules=settlement_rules,
+        on_progress=on_progress,
+        tables=tables,
+        model_profile=model_profile,
+    ):
+        if isinstance(result, LabeledGame):
+            labeled.append(result)
+        else:
+            skips.append(result)
+    return ReplayBatchResult(labeled_games=tuple(labeled), skips=tuple(skips))
+
+
+def iter_replay_games(
+    backend: StorageBackend,
+    game_rows: pl.DataFrame,
+    *,
+    model_version: str,
+    n_draws: int,
+    simulation_config: SimulationConfig | None = None,
+    player_state_config: PlayerStateConfig | None = None,
+    team_state_config: TeamStateConfig | None = None,
+    settlement_rules: SettlementRuleSet | None = None,
+    on_progress: Callable[[int, int, str], None] | None = None,
+    tables: WarehouseTables | None = None,
+    model_profile: ModelProfile = ModelProfile.STRUCTURAL_CORE,
+) -> Iterator[LabeledGame | GameReplaySkip]:
+    """`replay_games` one game at a time, in `game_rows` order: each
+    game's `LabeledGame` (with its full simulation) or `GameReplaySkip` is
+    yielded before the next game is simulated, so a streaming caller holds
+    at most one full simulation at a time."""
+    rules = settlement_rules if settlement_rules is not None else load_settlement_rules()
+    loaded = tables if tables is not None else load_warehouse_tables(backend)
     total = game_rows.height
     for i, row in enumerate(game_rows.iter_rows(named=True)):
-        result = build_labeled_game(
+        yield build_labeled_game(
             backend, row, model_version=model_version, n_draws=n_draws,
             simulation_config=simulation_config,
             player_state_config=player_state_config,
             team_state_config=team_state_config,
             settlement_rules=rules,
             tables=loaded,
+            model_profile=model_profile,
         )
-        if isinstance(result, LabeledGame):
-            labeled.append(result)
-        else:
-            skips.append(result)
         if on_progress is not None:
             on_progress(i + 1, total, str(row["canonical_game_id"]))
-    return ReplayBatchResult(labeled_games=tuple(labeled), skips=tuple(skips))
 
 
-def compute_training_manifest_sha256(games: list[LabeledGame] | tuple[LabeledGame, ...]) -> str:
+def compute_training_manifest_sha256(
+    games: list[CalibrationGame] | tuple[CalibrationGame, ...],
+) -> str:
     """Deterministic, order-independent SHA-256 fingerprint of the exact
     training evidence one fit consumed: every game's id/as_of/
     outcome_available_at/injury_data_available plus every one of its
@@ -372,7 +459,7 @@ def compute_training_manifest_sha256(games: list[LabeledGame] | tuple[LabeledGam
     if -- and only if -- the actual training evidence changes.
     """
 
-    def _serialize_game(game: LabeledGame) -> str:
+    def _serialize_game(game: CalibrationGame) -> str:
         label_parts = sorted(
             f"{label.player_id}|{label.prop_type.value}|{label.observed_value!r}"
             for label in game.labels
