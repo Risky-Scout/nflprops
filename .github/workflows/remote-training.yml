@@ -124,6 +124,18 @@ jobs:
             --workflow-sha "${{ github.sha }}" \
             --data-dir "$RUNNER_TEMP/training-data"
 
+      # The Science runner writes its full output set (report, logs, dev
+      # registry) under the training-data workspace; upload it BEFORE the
+      # workspace cleanup below deletes it.
+      - name: Upload full science output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-training-output-${{ inputs.mode }}-${{ github.run_id }}
+          if-no-files-found: warn
+          retention-days: 90
+          path: ${{ runner.temp }}/training-data/phase10c3a-output
+
       - name: Clean ephemeral training-data workspace
         if: always()
         run: |

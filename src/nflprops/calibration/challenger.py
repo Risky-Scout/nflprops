@@ -50,6 +50,7 @@ from nflprops.calibration.artifact import (
     DIRECTLY_LABELED_PROP_TYPES,
     UNLABELED_PROP_TYPES,
 )
+from nflprops.calibration.compact_game import CompactGame, compact_weighted_pmf
 from nflprops.calibration.diagnostics import (
     WeightDiagnostics,
     compute_weight_diagnostics,
@@ -60,7 +61,7 @@ from nflprops.calibration.joint_feature_contract import (
     compute_draw_features,
 )
 from nflprops.calibration.scoring import crps_from_pmf, skill_score
-from nflprops.calibration.weighted_pmf import build_weighted_pmf
+from nflprops.calibration.weighted_pmf import WeightedPMF, build_weighted_pmf
 from nflprops.distributions.pmf import BINARY_COUNT_COLLAPSE_PROPS
 from nflprops.domain.enums import PropType
 from nflprops.simulation.game import GameSimulationResult
@@ -130,17 +131,42 @@ class LabeledGame:
             )
 
 
-def score_game(game: LabeledGame, theta: np.ndarray) -> dict[PropType, list[float]]:
+#: A calibration game: the full-simulation `LabeledGame`, or its streaming
+#: `CompactGame` (`nflprops.calibration.compact_game`) -- identical scores.
+CalibrationGame = LabeledGame | CompactGame
+
+
+def game_draw_features(game: CalibrationGame) -> np.ndarray:
+    """`compute_draw_features` of the game's simulation (precomputed once
+    for a `CompactGame`)."""
+    if isinstance(game, CompactGame):
+        return game.draw_features()
+    return compute_draw_features(game.simulation)
+
+
+def game_n_draws(game: CalibrationGame) -> int:
+    return game.n_draws if isinstance(game, CompactGame) else game.simulation.n_draws
+
+
+def game_label_pmf(game: CalibrationGame, index: int, weights: np.ndarray) -> WeightedPMF:
+    """`build_weighted_pmf` for `game.labels[index]`."""
+    if isinstance(game, CompactGame):
+        return compact_weighted_pmf(game, index, weights)
+    label = game.labels[index]
+    return build_weighted_pmf(game.simulation, weights, label.player_id, label.prop_type)
+
+
+def score_game(game: CalibrationGame, theta: np.ndarray) -> dict[PropType, list[float]]:
     """Per-PropType proper-scoring-rule values for one game's labeled
     targets, under ONE shared theta -- one softmax weight vector computed
     once per game and reused for every player/prop, per the joint-game
     scientific lock."""
-    features = compute_draw_features(game.simulation)
+    features = game_draw_features(game)
     weights = softmax_weights(theta, features)
 
     scores: dict[PropType, list[float]] = {}
-    for label in game.labels:
-        pmf = build_weighted_pmf(game.simulation, weights, label.player_id, label.prop_type)
+    for index, label in enumerate(game.labels):
+        pmf = game_label_pmf(game, index, weights)
         if label.prop_type in _BINARY_LOG_LOSS_PROPS:
             p_hit = sum(
                 p for outcome, p in zip(pmf.outcomes, pmf.probabilities, strict=True) if outcome >= 1
@@ -154,7 +180,7 @@ def score_game(game: LabeledGame, theta: np.ndarray) -> dict[PropType, list[floa
 
 
 def _aggregate_scores(
-    games: Sequence[LabeledGame], theta: np.ndarray
+    games: Sequence[CalibrationGame], theta: np.ndarray
 ) -> dict[PropType, list[float]]:
     aggregate: dict[PropType, list[float]] = {}
     for game in games:
@@ -185,7 +211,7 @@ def mean_skill_score(
 
 def _objective(
     theta: np.ndarray,
-    games: Sequence[LabeledGame],
+    games: Sequence[CalibrationGame],
     baseline_scores: dict[PropType, list[float]],
     regularization_lambda: float,
 ) -> float:
@@ -207,7 +233,7 @@ class FitResult:
 
 
 def fit_challenger_theta(
-    games: Sequence[LabeledGame],
+    games: Sequence[CalibrationGame],
     *,
     regularization_lambda: float = 0.01,
     initial_theta: np.ndarray | None = None,
@@ -266,8 +292,8 @@ class FoldChallengerResult:
 
 
 def _fit_games_for_fold(
-    games: Sequence[LabeledGame], fold: WalkForwardFold
-) -> tuple[LabeledGame, ...]:
+    games: Sequence[CalibrationGame], fold: WalkForwardFold
+) -> tuple[CalibrationGame, ...]:
     """Every training example's realized result must have been knowable at
     the fold's training cutoff: `outcome_available_at <= fold.train_end`,
     in addition to the checkpoint itself (`as_of`) falling inside the
@@ -278,13 +304,13 @@ def _fit_games_for_fold(
 
 
 def _score_games_for_fold(
-    games: Sequence[LabeledGame], fold: WalkForwardFold
-) -> tuple[LabeledGame, ...]:
+    games: Sequence[CalibrationGame], fold: WalkForwardFold
+) -> tuple[CalibrationGame, ...]:
     return tuple(g for g in games if fold.score_start <= g.as_of <= fold.score_end)
 
 
 def run_walk_forward_challenger(
-    games: Sequence[LabeledGame],
+    games: Sequence[CalibrationGame],
     folds: Sequence[WalkForwardFold],
     *,
     regularization_lambda: float = 0.01,
@@ -321,7 +347,7 @@ def run_walk_forward_challenger(
         baseline_scores = _aggregate_scores(score_games, np.zeros(len(FEATURE_NAMES)))
         diagnostics = {
             g.game_id: compute_weight_diagnostics(
-                softmax_weights(theta, compute_draw_features(g.simulation))
+                softmax_weights(theta, game_draw_features(g))
             )
             for g in score_games
         }
@@ -341,7 +367,7 @@ def run_walk_forward_challenger(
     return tuple(results)
 
 
-def coverage_report(games: Sequence[LabeledGame]) -> dict[str, object]:
+def coverage_report(games: Sequence[CalibrationGame]) -> dict[str, object]:
     """Honest evidence accounting: directly-scored vs. unlabeled
     PropTypes, and PIT-faithful vs. PIT-degraded game counts. Never claims
     direct historical calibration evidence for any of the ten PBP-gated
@@ -365,7 +391,7 @@ def coverage_report(games: Sequence[LabeledGame]) -> dict[str, object]:
 
 def binary_market_benchmark(
     fold_results: Sequence[FoldChallengerResult],
-    games_by_fold: Sequence[tuple[LabeledGame, ...]],
+    games_by_fold: Sequence[tuple[CalibrationGame, ...]],
     *,
     prop_type: PropType = PropType.ANYTIME_TD,
 ) -> MarketBenchmark | None:
@@ -382,18 +408,14 @@ def binary_market_benchmark(
     for fold_result, score_games in zip(fold_results, games_by_fold, strict=True):
         theta = np.array(fold_result.fit.theta)
         for game in score_games:
-            for label in game.labels:
+            for index, label in enumerate(game.labels):
                 if label.prop_type != prop_type:
                     continue
-                features = compute_draw_features(game.simulation)
+                features = game_draw_features(game)
                 w_challenger = softmax_weights(theta, features)
                 w_baseline = softmax_weights(np.zeros(len(FEATURE_NAMES)), features)
-                pmf_challenger = build_weighted_pmf(
-                    game.simulation, w_challenger, label.player_id, label.prop_type
-                )
-                pmf_baseline = build_weighted_pmf(
-                    game.simulation, w_baseline, label.player_id, label.prop_type
-                )
+                pmf_challenger = game_label_pmf(game, index, w_challenger)
+                pmf_baseline = game_label_pmf(game, index, w_baseline)
                 y.append(label.observed_value)
                 p_challenger.append(
                     sum(
@@ -421,7 +443,7 @@ def binary_market_benchmark(
 
 def evaluate_promotion_gate(
     fold_results: Sequence[FoldChallengerResult],
-    games_by_fold: Sequence[tuple[LabeledGame, ...]],
+    games_by_fold: Sequence[tuple[CalibrationGame, ...]],
 ) -> PromotionDecision | None:
     """Reuses the EXISTING repository market-superiority gate
     (`nflprops.backtest.promotion.market_superiority_gate`) against the

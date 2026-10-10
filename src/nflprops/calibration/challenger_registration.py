@@ -52,7 +52,7 @@ from nflprops.features.historical_evidence import EvidenceMode
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from nflprops.calibration.challenger import LabeledGame
+    from nflprops.calibration.challenger import CalibrationGame
     from nflprops.calibration.payload import JointCalibrationPayload
     from nflprops.data.storage.base import StorageBackend
     from nflprops.orchestration.calibration_store import CalibrationValidation
@@ -106,7 +106,7 @@ def register_challenger(
     scored_through: datetime,
     validation_schema_version: str,
     validation_manifest_sha256: str,
-    training_games: Sequence[LabeledGame],
+    training_games: Sequence[CalibrationGame],
     metrics: dict[str, object],
     chronology_checks_passed: bool,
     leakage_checks_passed: bool,

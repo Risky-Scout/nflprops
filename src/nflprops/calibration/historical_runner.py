@@ -47,7 +47,7 @@ from typing import TYPE_CHECKING
 import polars as pl
 
 from nflprops.calibration.artifact import DIRECTLY_LABELED_PROP_TYPES
-from nflprops.calibration.challenger import LabeledGame, PropLabel
+from nflprops.calibration.challenger import CalibrationGame, LabeledGame, PropLabel
 from nflprops.data.evidence_policy import official_view
 from nflprops.data.injury_availability import injury_feed_available_at
 from nflprops.data.outcome_versions import latest_final
@@ -73,7 +73,7 @@ from nflprops.state.player import PlayerStateConfig
 from nflprops.state.team import TeamStateConfig
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     from nflprops.data.storage.base import StorageBackend
 
@@ -392,13 +392,48 @@ def replay_games(
     reads fresh (and therefore redundantly, once per game) exactly as
     before.
     """
-    rules = settlement_rules if settlement_rules is not None else load_settlement_rules()
-    loaded = tables if tables is not None else load_warehouse_tables(backend)
     labeled: list[LabeledGame] = []
     skips: list[GameReplaySkip] = []
+    for result in iter_replay_games(
+        backend, game_rows, model_version=model_version, n_draws=n_draws,
+        simulation_config=simulation_config,
+        player_state_config=player_state_config,
+        team_state_config=team_state_config,
+        settlement_rules=settlement_rules,
+        on_progress=on_progress,
+        tables=tables,
+        model_profile=model_profile,
+    ):
+        if isinstance(result, LabeledGame):
+            labeled.append(result)
+        else:
+            skips.append(result)
+    return ReplayBatchResult(labeled_games=tuple(labeled), skips=tuple(skips))
+
+
+def iter_replay_games(
+    backend: StorageBackend,
+    game_rows: pl.DataFrame,
+    *,
+    model_version: str,
+    n_draws: int,
+    simulation_config: SimulationConfig | None = None,
+    player_state_config: PlayerStateConfig | None = None,
+    team_state_config: TeamStateConfig | None = None,
+    settlement_rules: SettlementRuleSet | None = None,
+    on_progress: Callable[[int, int, str], None] | None = None,
+    tables: WarehouseTables | None = None,
+    model_profile: ModelProfile = ModelProfile.STRUCTURAL_CORE,
+) -> Iterator[LabeledGame | GameReplaySkip]:
+    """`replay_games` one game at a time, in `game_rows` order: each
+    game's `LabeledGame` (with its full simulation) or `GameReplaySkip` is
+    yielded before the next game is simulated, so a streaming caller holds
+    at most one full simulation at a time."""
+    rules = settlement_rules if settlement_rules is not None else load_settlement_rules()
+    loaded = tables if tables is not None else load_warehouse_tables(backend)
     total = game_rows.height
     for i, row in enumerate(game_rows.iter_rows(named=True)):
-        result = build_labeled_game(
+        yield build_labeled_game(
             backend, row, model_version=model_version, n_draws=n_draws,
             simulation_config=simulation_config,
             player_state_config=player_state_config,
@@ -407,16 +442,13 @@ def replay_games(
             tables=loaded,
             model_profile=model_profile,
         )
-        if isinstance(result, LabeledGame):
-            labeled.append(result)
-        else:
-            skips.append(result)
         if on_progress is not None:
             on_progress(i + 1, total, str(row["canonical_game_id"]))
-    return ReplayBatchResult(labeled_games=tuple(labeled), skips=tuple(skips))
 
 
-def compute_training_manifest_sha256(games: list[LabeledGame] | tuple[LabeledGame, ...]) -> str:
+def compute_training_manifest_sha256(
+    games: list[CalibrationGame] | tuple[CalibrationGame, ...],
+) -> str:
     """Deterministic, order-independent SHA-256 fingerprint of the exact
     training evidence one fit consumed: every game's id/as_of/
     outcome_available_at/injury_data_available plus every one of its
@@ -427,7 +459,7 @@ def compute_training_manifest_sha256(games: list[LabeledGame] | tuple[LabeledGam
     if -- and only if -- the actual training evidence changes.
     """
 
-    def _serialize_game(game: LabeledGame) -> str:
+    def _serialize_game(game: CalibrationGame) -> str:
         label_parts = sorted(
             f"{label.player_id}|{label.prop_type.value}|{label.observed_value!r}"
             for label in game.labels
