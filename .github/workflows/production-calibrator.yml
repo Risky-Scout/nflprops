@@ -1,0 +1,96 @@
+name: Production calibrator (final fit)
+
+# Round 4: fit the final STRUCTURAL_CORE production calibrator from the
+# CERTIFIED Phase 10C3A run's own outputs -- never re-simulated, never on
+# Joseph's Mac, never on Wizard. Inputs are downloaded from the certified
+# run (verified data root + the four primary compact shards + its fold
+# calibrators), the data root manifest is re-verified, every shard must
+# carry the certified execution identity, and the certified last-fold theta
+# must be reproduced bit-for-bit before the final fit. The artifact is
+# registered only (PRODUCTION_CANDIDATE); no champion pointer exists here.
+#
+# Triggered by pushing a `production-calibrator-run-*` tag.
+
+on:
+  push:
+    tags:
+      - "production-calibrator-run-*"
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  CERTIFIED_RUN_ID: "38080594155"
+  CERTIFIED_EXECUTION_SHA: a04f64c19f2d0de900c88154923c96b78f7353f4
+  SCIENCE_BASE_SHA: 4c66ed4402cea32f0bfec4ed4d297b3eed1b20ee
+  DATA_MANIFEST_SHA256: 9d530788a83e3f350f48d3c25a0ea838435fa750109eb7499b0e1755f74345d5
+  PINNED_STACK: "polars==1.44.2 numpy==2.4.6 scipy==1.18.1"
+
+jobs:
+  fit:
+    name: Fit final production calibrator
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install project
+        run: pip install -e ".[dev]" $PINNED_STACK
+
+      - name: Download certified data root
+        uses: actions/download-artifact@v4
+        with:
+          name: phase10c3a-data-root
+          path: ${{ runner.temp }}/data-root
+          run-id: ${{ env.CERTIFIED_RUN_ID }}
+          github-token: ${{ github.token }}
+
+      - name: Download certified compact shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: phase10c3a-compact-s*
+          path: ${{ runner.temp }}/shards
+          run-id: ${{ env.CERTIFIED_RUN_ID }}
+          github-token: ${{ github.token }}
+
+      - name: Download certified science output
+        uses: actions/download-artifact@v4
+        with:
+          name: phase10c3a-science-output
+          path: ${{ runner.temp }}/science
+          run-id: ${{ env.CERTIFIED_RUN_ID }}
+          github-token: ${{ github.token }}
+
+      - name: Fit
+        run: |
+          set -o pipefail
+          S="$RUNNER_TEMP/shards"
+          python -m nflprops.calibration.production_calibrator \
+            --data-root "$RUNNER_TEMP/data-root" \
+            --output-dir "$RUNNER_TEMP/production-calibrator" \
+            --compact-dirs \
+              "$S/phase10c3a-compact-s2022/compact" "$S/phase10c3a-compact-s2023/compact" \
+              "$S/phase10c3a-compact-s2024/compact" "$S/phase10c3a-compact-s2025/compact" \
+            --certified-calibrators "$RUNNER_TEMP/science/evaluate/reports/calibrators.json" \
+            --expect-data-manifest-sha256 "$DATA_MANIFEST_SHA256" \
+            --shard-execution-sha "$CERTIFIED_EXECUTION_SHA" \
+            --execution-sha "$GITHUB_SHA" \
+            --science-base-sha "$SCIENCE_BASE_SHA" \
+            --certification-run-id "$CERTIFIED_RUN_ID" \
+            | tee "$RUNNER_TEMP/production-calibrator-stdout.txt"
+
+      - name: Upload production calibrator
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-calibrator
+          if-no-files-found: error
+          retention-days: 90
+          path: |
+            ${{ runner.temp }}/production-calibrator
+            ${{ runner.temp }}/production-calibrator-stdout.txt
