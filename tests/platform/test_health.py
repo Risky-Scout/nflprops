@@ -174,7 +174,7 @@ def test_memory_available_check_never_raises() -> None:
 def test_migration_storage_version_check_reports_single_head() -> None:
     healthy, detail = migration_storage_version_check()()
     assert healthy is True
-    assert "0009_compact_pmf_payload" in detail
+    assert "0010_cal_model_profile" in detail  # Gate 1 extends 0009_compact_pmf_payload
 
 
 def test_collector_and_checkpoint_placeholders_are_honest_not_fabricated() -> None:

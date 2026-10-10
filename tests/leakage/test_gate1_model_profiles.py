@@ -724,6 +724,7 @@ def test_official_live_runs_require_an_explicit_profile(tmp_path: Path) -> None:
     with pytest.raises(ModelProfileError):
         pregame.predict_week(warehouse, season=2024, week=3, as_of=AS_OF, n_draws=50,
                              persist=False, official_run_id="run-x")
+    pytest.importorskip("prefect")  # the `leakage` CI job installs no orchestration extra
     from nflprops.orchestration.flows.checkpoints import checkpoint_dispatch_flow
 
     with pytest.raises(ModelProfileError):
