@@ -73,6 +73,7 @@ PRODUCTION_N_DRAWS = 20_000
 CHECKPOINT_NAME = "ROUND4_SHADOW_CURRENT"
 CALIBRATION_APPLIED = "APPLIED"
 CALIBRATION_PROFILE_MISMATCH = "UNAVAILABLE_PROFILE_MISMATCH"
+CALIBRATION_NO_CALIBRATOR = "UNAVAILABLE_NO_CALIBRATOR"
 
 GENUINE_PROSPECTIVE = "GENUINE_PROSPECTIVE"
 HISTORICAL_REPLAY = "HISTORICAL_REPLAY"
@@ -138,7 +139,7 @@ def calibration_status(
 ) -> str:
     """APPLIED only on an exact profile / science / feature-contract match."""
     if calibrator is None:
-        return CALIBRATION_PROFILE_MISMATCH
+        return CALIBRATION_NO_CALIBRATOR
     if (
         calibrator["model_profile"] == profile.value
         and calibrator["base_model_version"] == profile_base_model_version(model_version, profile)
@@ -250,6 +251,27 @@ def calibrate_price_rows(
     return out
 
 
+def persist_draw_evidence(
+    directory: Path, result: GameSimulationResult, real_players: set[str]
+) -> str:
+    """The joint-game feature matrix plus every non-degenerate per-draw
+    outcome vector (player x SUMMARY_PROPS), so any later calibrator can be
+    applied to THIS forecast's exact draws without re-simulating. Returns
+    the file's SHA-256."""
+    directory.mkdir(parents=True, exist_ok=True)
+    arrays: dict[str, np.ndarray] = {"__features__": compute_draw_features(result)}
+    for pid, sub in sorted(_player_values(result).items()):
+        if pid not in real_players:
+            continue
+        for prop_name in SUMMARY_PROPS:
+            values = prop_values(sub, pid, PropType(prop_name)).astype(np.int32)
+            if values.any():
+                arrays[f"{pid}|{prop_name}"] = values
+    path = directory / f"{result.game_id}.npz"
+    np.savez_compressed(path, **arrays)  # type: ignore[arg-type]
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def distribution_hash(rows: list[dict[str, Any]], column: str) -> str:
     digest = hashlib.sha256()
     for r in sorted(rows, key=lambda r: (r["player_id"], r["prop_type"])):
@@ -320,6 +342,7 @@ def run_forecast(args: argparse.Namespace) -> dict[str, Any]:
         real_players = {str(p) for p in comp.player_states} & {
             str(p) for p in result.player_draws["player_id"].unique().to_list()}
         dists = summarize_distributions(result, weights, real_players=real_players)
+        draws_sha = persist_draw_evidence(out / "draws", result, real_players)
         quotes = comp.latest_quotes.filter(pl.col("canonical_game_id") == game_id)
         priceable, excluded = split_priceable_quotes(quotes)
         priced = calibrate_price_rows(
@@ -338,6 +361,7 @@ def run_forecast(args: argparse.Namespace) -> dict[str, Any]:
             "raw_distribution_sha256": distribution_hash(dists, "probabilities_raw"),
             "calibrated_distribution_sha256": distribution_hash(dists, "probabilities_calibrated"),
             "calibration_status": status,
+            "draw_evidence_sha256": draws_sha,
             "players_simulated": len(real_players),
             "book_quotes": quotes.height,
             "book_quotes_priceable": priceable.height,

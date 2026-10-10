@@ -90,7 +90,7 @@ def test_forecast_applies_the_champion_only_on_an_exact_profile_match(champion) 
     assert pf.calibration_status(calibrator, profile=ModelProfile.STRUCTURAL_CORE,
                                  model_version="2027.0.0") == pf.CALIBRATION_PROFILE_MISMATCH
     assert pf.calibration_status(None, profile=ModelProfile.STRUCTURAL_CORE,
-                                 model_version=MODEL_VERSION) == pf.CALIBRATION_PROFILE_MISMATCH
+                                 model_version=MODEL_VERSION) == pf.CALIBRATION_NO_CALIBRATOR
 
 
 def test_tampered_calibrator_payload_is_refused(champion) -> None:  # type: ignore[no-untyped-def]
