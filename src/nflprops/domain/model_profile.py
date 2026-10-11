@@ -37,9 +37,12 @@ class ModelProfileError(ValueError):
 
 #: v2: QB candidates are the target team's structural roster members and
 #: `qb_attempt_share` is team-relative (nflprops.features.team_membership).
+#: v3: EVERY real player candidate (not only QBs) is a structural member of
+#: the target team; a non-member is removed before opportunity
+#: normalization.
 PROFILE_SCIENCE_VERSIONS: dict[ModelProfile, str] = {
-    ModelProfile.STRUCTURAL_CORE: "structural-core.v2-qb-roster-membership",
-    ModelProfile.LIVE_ENHANCED: "live-enhanced.v2-qb-roster-membership",
+    ModelProfile.STRUCTURAL_CORE: "structural-core.v3-roster-eligible-player-universe",
+    ModelProfile.LIVE_ENHANCED: "live-enhanced.v3-roster-eligible-player-universe",
 }
 
 

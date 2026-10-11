@@ -88,6 +88,14 @@ def _augment_with_backup_player(warehouse: Warehouse) -> None:
             how="diagonal_relaxed",
         ),
     )
+    roster = warehouse.read("roster_snapshots")
+    backup_member = {col: roster[col][0] for col in roster.columns}
+    backup_member["canonical_player_id"] = AWAY_BACKUP_ID
+    backup_member["canonical_team_id"] = AWAY_TEAM_ID
+    warehouse.write(
+        "roster_snapshots",
+        pl.concat([roster, pl.DataFrame([backup_member], schema=roster.schema)]),
+    )
 
 
 def _build_warehouse(

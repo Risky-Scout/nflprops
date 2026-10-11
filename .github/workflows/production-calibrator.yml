@@ -9,7 +9,10 @@ name: Production calibrator (final fit)
 # must be reproduced bit-for-bit before the final fit. The artifact is
 # registered only (PRODUCTION_CANDIDATE); no champion pointer exists here.
 #
-# Triggered by pushing a `production-calibrator-run-*` tag.
+# Triggered by pushing a `production-calibrator-run-<CERTIFIED_RUN_ID>` tag:
+# the certified Phase 10C3A run is named by the tag, and its execution and
+# science SHAs are read from that run's own report -- never assumed. The fit
+# refuses a run whose report did not pass every locked promotion gate.
 
 on:
   push:
@@ -21,9 +24,6 @@ permissions:
   actions: read
 
 env:
-  CERTIFIED_RUN_ID: "38080594155"
-  CERTIFIED_EXECUTION_SHA: a04f64c19f2d0de900c88154923c96b78f7353f4
-  SCIENCE_BASE_SHA: 4c66ed4402cea32f0bfec4ed4d297b3eed1b20ee
   DATA_MANIFEST_SHA256: 9d530788a83e3f350f48d3c25a0ea838435fa750109eb7499b0e1755f74345d5
   PINNED_STACK: "polars==1.44.2 numpy==2.4.6 scipy==1.18.1"
 
@@ -41,6 +41,12 @@ jobs:
 
       - name: Install project
         run: pip install -e ".[dev]" $PINNED_STACK
+
+      - name: Certified run id from the tag
+        run: |
+          RUN_ID="${GITHUB_REF_NAME#production-calibrator-run-}"
+          case "$RUN_ID" in ''|*[!0-9]*) echo "tag must be production-calibrator-run-<run id>"; exit 1;; esac
+          echo "CERTIFIED_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
 
       - name: Download certified data root
         uses: actions/download-artifact@v4
@@ -66,6 +72,18 @@ jobs:
           run-id: ${{ env.CERTIFIED_RUN_ID }}
           github-token: ${{ github.token }}
 
+      - name: Certified identity from the run's own report
+        run: |
+          python - <<'PY' >> "$GITHUB_ENV"
+          import json, os
+          from pathlib import Path
+          report = json.loads((Path(os.environ["RUNNER_TEMP"]) / "science" / "evaluate"
+                               / "phase10c3a_report.json").read_text())
+          identity = report["identity"]
+          print(f"CERTIFIED_EXECUTION_SHA={identity['execution_sha']}")
+          print(f"SCIENCE_BASE_SHA={identity['science_base_sha']}")
+          PY
+
       - name: Fit
         run: |
           set -o pipefail
@@ -77,6 +95,7 @@ jobs:
               "$S/phase10c3a-compact-s2022/compact" "$S/phase10c3a-compact-s2023/compact" \
               "$S/phase10c3a-compact-s2024/compact" "$S/phase10c3a-compact-s2025/compact" \
             --certified-calibrators "$RUNNER_TEMP/science/evaluate/reports/calibrators.json" \
+            --certification-report "$RUNNER_TEMP/science/evaluate/phase10c3a_report.json" \
             --expect-data-manifest-sha256 "$DATA_MANIFEST_SHA256" \
             --shard-execution-sha "$CERTIFIED_EXECUTION_SHA" \
             --execution-sha "$GITHUB_SHA" \

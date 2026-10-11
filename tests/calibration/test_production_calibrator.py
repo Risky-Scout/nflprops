@@ -29,6 +29,8 @@ from nflprops.data.warehouse import Warehouse
 from nflprops.domain.model_profile import ModelProfileError
 
 SHARD_SHA = "a" * 40
+SCIENCE_SHA = "c" * 40
+CERTIFIED_REPORT = "certified_report.json"
 TARGET_KICKOFF = datetime(2025, 9, 7, 17, 0, tzinfo=UTC)
 
 
@@ -44,21 +46,35 @@ def _round3(tmp_path: Path) -> tuple[Path, Path, Path]:
     base = dict(data_root=warehouse.root, season_min=2023, season_max=2024, n_draws=60,
                 mode="smoke", model_version="smoke-v1", regularization_lambda=0.01,
                 max_fit_iterations=20, expect_data_manifest_sha256=None,
-                execution_sha=SHARD_SHA)
+                execution_sha=SHARD_SHA, science_base_sha=SCIENCE_SHA)
     runner.run(runner.RunnerConfig(output_dir=tmp_path / "r", stage="replay",
                                    compact_dir=shard, **base))  # type: ignore[arg-type]
-    runner.run(runner.RunnerConfig(output_dir=tmp_path / "e", stage="evaluate",
-                                   compact_dirs=(shard,), **base))  # type: ignore[arg-type]
+    evaluated = runner.run(runner.RunnerConfig(output_dir=tmp_path / "e", stage="evaluate",
+                                               compact_dirs=(shard,), **base))  # type: ignore[arg-type]
+    # A smoke evaluate is never promotable; stand in the certified decision
+    # (every locked gate PASS) with the run's own identity.
+    report = json.loads(json.dumps(evaluated, default=str))
+    _certify(report)
+    (tmp_path / CERTIFIED_REPORT).write_text(json.dumps(report))
     return warehouse.root, shard, tmp_path / "e" / "reports" / "calibrators.json"
+
+
+def _certify(report: dict) -> None:
+    report["promotion_decision"] = "ELIGIBLE_FOR_PROMOTION"
+    gates = report["full_promotion_gate_spec65"]
+    gates["decision"] = {"promote": True, "reasons": []}
+    for row in gates["rows"]:
+        row["result"] = "PASS"
 
 
 def _argv(root: Path, shard: Path, calibrators: Path, out: Path, **kw: str) -> list[str]:
     args = {
+        "--certification-report": str(calibrators.parents[2] / CERTIFIED_REPORT),
         "--data-root": str(root), "--output-dir": str(out), "--compact-dirs": str(shard),
         "--certified-calibrators": str(calibrators),
         "--expect-data-manifest-sha256": compute_data_root_manifest_sha256(root),
         "--shard-execution-sha": SHARD_SHA, "--execution-sha": "b" * 40,
-        "--science-base-sha": "c" * 40, "--certification-run-id": "1",
+        "--science-base-sha": SCIENCE_SHA, "--certification-run-id": "1",
         "--evidence-model-version": "smoke-v1", "--season-min": "2023",
         "--season-max": "2024", "--target-season": "2025", "--n-draws": "60",
         "--mode": "smoke",
@@ -78,10 +94,13 @@ def test_final_fit_uses_every_pre_target_game_and_is_never_promoted(tmp_path: Pa
     assert manifest["training_games"] == 2  # one certified skip
     assert datetime.fromisoformat(manifest["training_end"]) < TARGET_KICKOFF
     assert manifest["model_profile"] == "STRUCTURAL_CORE"
-    assert manifest["base_model_version"] == "2026.1.0+structural-core.v2-qb-roster-membership"
+    assert manifest["base_model_version"] == (
+        "2026.1.0+structural-core.v3-roster-eligible-player-universe")
     assert manifest["cross_profile_refused"] == ["LIVE_ENHANCED"]
     assert manifest["champion_pointer_changed"] is False
     assert manifest["status"] == "SMOKE_NOT_A_CANDIDATE"
+    assert manifest["certification"]["decision"] == "PROMOTION_CERTIFIED"
+    assert len(manifest["certification"]["gates_passed"]) == 13
 
     # Payload ships with the artifact and matches its registered SHA.
     payload = (out / manifest["payload_path"]).read_bytes()
@@ -113,7 +132,8 @@ def test_final_fit_refuses_a_non_equivalent_estimator(tmp_path: Path) -> None:
     tampered[-1]["theta"] = [t + 1e-12 for t in tampered[-1]["theta"]]
     bad = tmp_path / "tampered.json"
     bad.write_text(json.dumps(tampered))
-    assert pc.main(_argv(root, shard, bad, tmp_path / "x")) == 2
+    assert pc.main(_argv(root, shard, bad, tmp_path / "x",
+                         **{"--certification-report": str(tmp_path / CERTIFIED_REPORT)})) == 2
 
 
 def test_final_training_end_is_strictly_before_the_target_season() -> None:
@@ -137,3 +157,34 @@ def test_production_calibrator_never_applies_to_live_enhanced(tmp_path: Path) ->
     require_calibrator_applicable(artifact, prediction_profile="STRUCTURAL_CORE")
     with pytest.raises(ModelProfileError):
         require_calibrator_applicable(artifact, prediction_profile="LIVE_ENHANCED")
+
+
+@pytest.mark.parametrize("tamper", ["decision", "gate_row", "spec65", "no_rows"])
+def test_final_fit_refuses_a_run_that_failed_a_locked_gate(tmp_path: Path, tamper: str) -> None:
+    root, shard, calibrators = _round3(tmp_path)
+    report = json.loads((tmp_path / CERTIFIED_REPORT).read_text())
+    gates = report["full_promotion_gate_spec65"]
+    if tamper == "decision":
+        report["promotion_decision"] = "NOT_ELIGIBLE_FOR_PROMOTION"
+    elif tamper == "gate_row":
+        gates["rows"][1]["result"] = "FAIL"
+    elif tamper == "spec65":
+        gates["decision"] = {"promote": False, "reasons": ["x"]}
+    else:
+        gates["rows"] = []
+    bad = tmp_path / "bad_report.json"
+    bad.write_text(json.dumps(report))
+    assert pc.main(_argv(root, shard, calibrators, tmp_path / "x",
+                         **{"--certification-report": str(bad)})) == 2
+
+
+def test_final_fit_refuses_a_report_of_another_profile_identity(tmp_path: Path) -> None:
+    """A Round 3 (v2-qb-roster-membership) certification never certifies
+    shards of the corrected v3 player universe."""
+    root, shard, calibrators = _round3(tmp_path)
+    report = json.loads((tmp_path / CERTIFIED_REPORT).read_text())
+    report["identity"]["model_profile_id"] = "smoke-v1+structural-core.v2-qb-roster-membership"
+    bad = tmp_path / "old_profile.json"
+    bad.write_text(json.dumps(report))
+    assert pc.main(_argv(root, shard, calibrators, tmp_path / "x",
+                         **{"--certification-report": str(bad)})) == 2

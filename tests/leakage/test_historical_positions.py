@@ -26,6 +26,7 @@ from test_gate1_model_profiles import (
     PLAYERS,
     TARGET_SLATE,
     TRADED,
+    historical_membership,
     historical_world,
     live_world,
     prepared,
@@ -305,11 +306,9 @@ HOME_RB_QB = _positions([(HOME_RB, 1, "QB")])
 G1_AS_OF = datetime(2024, 9, 22, 16, 30, tzinfo=UTC)
 #: HOME_RB is on HOME's roster at the target week (week 3): the weekly
 #: roster membership row (historical) and a live roster batch row (live).
-HOME_RB_MEMBER = pl.DataFrame(
-    [{"canonical_player_id": HOME_RB, "season": 2024, "week": 3, "team": "HOM",
-      "canonical_team_id": HOME, "roster_status": "ACT", "is_member": True}],
-    schema_overrides={"season": pl.Int64, "week": pl.Int64},
-)
+#: The world's week-3 membership (HOME_RB on HOME among them) -- every real
+#: candidate needs it (v3), and the live world's roster batch says the same.
+HOME_RB_MEMBER = historical_membership()
 HOME_RB_ROSTER = pl.DataFrame([
     {"canonical_player_id": HOME_RB, "canonical_team_id": HOME, "depth": 3,
      "available_at": G1_AS_OF - timedelta(hours=3), "available_at_is_estimated": False},

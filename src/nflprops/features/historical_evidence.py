@@ -476,7 +476,7 @@ HISTORICAL_REPLAY_INPUT_SURFACE: Mapping[str, InputAudit] = {
     ),
     "historical_team_membership": InputAudit(
         "historical_team_membership",
-        "QB candidate membership: which team, if any, a QB belongs to at the target week",
+        "player candidate membership: which team, if any, a real player belongs to at the target week",
         "nflverse weekly roster status per (season, week, team), keyed by the same "
         "team-week-co-occurrence crosswalk",
         InputCertification.SAFE_HISTORICAL_PREGAME,

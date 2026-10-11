@@ -103,6 +103,20 @@ GAMES = (
     (G_THU3, THU3, 3, OTH_A, OTH_B, {"g1:p:thu-wr": OTH_A}),
     (G_W4, W4, 4, OTH_A, HOME, {HOME_WR: HOME, TRADED: OTH_A}),
 )
+#: Structural membership at the target (week 3) -- every real candidate
+#: needs it (v3). The same football in both modes: historical weekly-roster
+#: rows, and each team's latest live roster batch.
+TARGET_MEMBERS = {HOME_WR: HOME, HOME_RB: HOME, AWAY_WR: AWAY, TRADED: AWAY, ROOKIE: HOME}
+
+
+def historical_membership(members: dict | None = None) -> pl.DataFrame:
+    return pl.DataFrame([
+        {"canonical_player_id": pid, "season": 2024, "week": 3, "team": team,
+         "canonical_team_id": team, "roster_status": "ACT", "is_member": True}
+        for pid, team in sorted((members or TARGET_MEMBERS).items())
+    ])
+
+
 PLAYERS = pl.DataFrame(
     [
         {"canonical_player_id": p, "position_group": g}
@@ -176,7 +190,10 @@ def live_world(*, w2_scale=1, w4_scale=1, receipt=_live_receipt):
              "available_at": AS_OF - timedelta(hours=3), "available_at_is_estimated": False},
             {"canonical_player_id": HOME_WR, "canonical_team_id": HOME, "depth": 2,
              "available_at": AS_OF - timedelta(hours=3), "available_at_is_estimated": False},
-        ]),
+            *({"canonical_player_id": pid, "canonical_team_id": TARGET_MEMBERS[pid],
+               "depth": None, "available_at": AS_OF - timedelta(hours=3),
+               "available_at_is_estimated": False} for pid in (HOME_RB, AWAY_WR, TRADED)),
+        ], schema_overrides={"depth": pl.Int64}),
         "injuries": pl.DataFrame([
             {"canonical_player_id": HOME_RB, "status": "Out",
              "available_at": AS_OF - timedelta(hours=2), "available_at_is_estimated": False},
@@ -212,13 +229,16 @@ def historical_world():
 
 
 def inputs(world, *, profile=ModelProfile.STRUCTURAL_CORE, mode=EvidenceMode.LIVE_PIT,
-           as_of=AS_OF) -> ModelInputs:
+           as_of=AS_OF, membership: pl.DataFrame | None = None) -> ModelInputs:
+    hwf = mode is EvidenceMode.HISTORICAL_WALK_FORWARD
     return build_model_inputs(
         model_profile=profile, evidence_mode=mode, games=world["games"],
         player_stats=world["player_stats"], team_stats=world["team_stats"], players=PLAYERS,
         roster=world["roster"], injuries=world["injuries"], game_odds=world["game_odds"],
         as_of=as_of, target_slate=TARGET_SLATE,
-        target_game_id=G_TARGET if mode is EvidenceMode.HISTORICAL_WALK_FORWARD else None,
+        target_game_id=G_TARGET if hwf else None,
+        historical_team_membership=(
+            membership if membership is not None else historical_membership()) if hwf else None,
     )
 
 
@@ -415,7 +435,9 @@ def test_ir1_ir2_structural_core_ignores_injuries_and_roster(monkeypatch) -> Non
     base, _ = simulator_input(inputs(live_world()), monkeypatch)
     for changed in (
         dict(live_world(), injuries=pl.DataFrame()),
-        dict(live_world(), roster=pl.DataFrame()),
+        # Roster depth is never read; roster IDENTITY is membership (v3).
+        dict(live_world(), roster=live_world()["roster"].with_columns(
+            pl.lit(9).alias("depth"))),
         dict(live_world(), injuries=live_world()["injuries"].with_columns(
             pl.lit(HOME_WR).alias("canonical_player_id"))),
     ):
@@ -435,8 +457,11 @@ def test_ir3_ir4_live_enhanced_consumes_only_known_observations() -> None:
     future = dict(live_world())
     future["injuries"] = future["injuries"].with_columns(
         pl.lit(AS_OF + timedelta(seconds=1)).alias("available_at"))
+    # A roster row received after the cutoff is never consumed.
     future["roster"] = future["roster"].with_columns(
-        pl.lit(AS_OF + timedelta(seconds=1)).alias("available_at"))
+        pl.when(pl.col("canonical_player_id") == ROOKIE)
+        .then(pl.lit(AS_OF + timedelta(seconds=1)))
+        .otherwise(pl.col("available_at")).alias("available_at"))
     later = inputs(future, profile=ModelProfile.LIVE_ENHANCED)
     assert later.player_states[HOME_RB].active is True
     assert ROOKIE not in later.player_states

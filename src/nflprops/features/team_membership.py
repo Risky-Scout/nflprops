@@ -1,8 +1,11 @@
-"""Structural team membership: which players a team's QB candidates may be.
+"""Structural team membership: which real players a team's target-game
+candidates may be.
 
-A QB is a candidate for a team only if roster evidence admissible at the
-target puts him on that team. Without this, a departed or retired QB keeps
-the team of his last box-score line indefinitely (`build_player_states`).
+A player of ANY position is a candidate for a team only if roster evidence
+admissible at the target puts him on that team (QBs since v2, every real
+player since v3). Without this, a departed or retired player keeps the team
+of his last box-score line indefinitely and absorbs its opportunity
+(`build_player_states`).
 Membership is roster IDENTITY only: never depth, injury designation,
 market, target outcome or a later week.
 
@@ -22,7 +25,7 @@ Live (`roster_snapshots`)
     batch was received last. Depth and injury columns are never read.
 
 A player with no admissible membership row, or whose membership is
-ambiguous, is no team's QB candidate: membership is never inferred.
+ambiguous, is no team's candidate: membership is never inferred.
 """
 
 from __future__ import annotations

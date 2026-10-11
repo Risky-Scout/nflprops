@@ -331,7 +331,7 @@ def build_player_states(
     config: PlayerStateConfig | None = None,
     history_time_col: str = "available_at",
     recency_time_col: str | None = None,
-    qb_membership: Mapping[str, str] | None = None,
+    team_membership: Mapping[str, str] | None = None,
 ) -> dict[str, PlayerState]:
     """`history_time_col` / `recency_time_col` are the eligibility and
     recency clocks of the game-stat history (see `build_team_states`).
@@ -343,10 +343,15 @@ def build_player_states(
     a game without one sorts first), then `history_time_col`, then game id
     -- never by storage/join order.
 
-    QB candidates (`qb_membership`, `nflprops.features.team_membership`):
-    when given, a QB-group player is a candidate only for the team the
-    mapping places him on at the target, and a QB it does not place is
-    REMOVED -- never merely penalised. `None` applies no membership rule.
+    Target-game candidates (`team_membership`,
+    `nflprops.features.team_membership`): when given, EVERY real player --
+    any position group -- is a candidate only for the team the mapping
+    places him on at the target, and a player it does not place
+    (departed, retired, unrostered, ambiguous) is REMOVED before any
+    opportunity-share normalization -- never merely penalised. His
+    admissible prior games still form his history; membership decides only
+    which team's opportunity he may receive. `None` applies no membership
+    rule.
 
     `qb_attempt_share` is team-relative: the player's recency-weighted
     reconciled attempts over ALL of his state team's admissible prior
@@ -457,8 +462,8 @@ def build_player_states(
         sub = joined.filter(pl.col("canonical_player_id") == pid)
         team_id = str(sub.sort(team_order, nulls_last=False)["canonical_team_id"][-1])
         pos = player_pos.get(str(pid), "OTHER")
-        if qb_membership is not None and pos == "QB":
-            member_team = qb_membership.get(str(pid))
+        if team_membership is not None:
+            member_team = team_membership.get(str(pid))
             if member_team is None:
                 continue  # departed / retired / unrostered: not a candidate
             team_id = member_team
@@ -622,12 +627,8 @@ def build_player_states(
                 continue
             team_id = str(row["canonical_team_id"])
             pos = player_pos.get(pid, "OTHER")
-            if (
-                qb_membership is not None
-                and pos == "QB"
-                and qb_membership.get(pid) != team_id
-            ):
-                continue  # a depth row never restores a non-member QB
+            if team_membership is not None and team_membership.get(pid) != team_id:
+                continue  # a depth row never restores a non-member
             pp = priors.get(pos, priors.get("OTHER", {}))
             sp = pos_share.get(pos, {"target": 0.02, "rush": 0.01})
             depth = int(row["depth"]) if row.get("depth") is not None else None

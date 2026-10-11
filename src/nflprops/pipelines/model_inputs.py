@@ -15,23 +15,24 @@ STRUCTURAL_CORE (either mode)
     weekly-roster position as of the target week
     (`nflprops.features.historical_positions`) -- applied identically in
     both modes, so equivalent evidence gives identical input.
-    QB candidates are the target team's structural members
-    (`nflprops.features.team_membership`); only the evidence that proves
-    membership differs by mode:
+    Every real player candidate (QB, RB, WR, TE, K, ...) is a structural
+    member of the target team (`nflprops.features.team_membership`); a
+    non-member receives no target-game opportunity. Only the evidence that
+    proves membership differs by mode:
       * HISTORICAL_WALK_FORWARD -- `historical_team_membership` (nflverse
         weekly roster status) for the target week exactly;
       * LIVE_PIT -- each team's latest `roster_snapshots` batch received by
         the cutoff, team identity only (no depth, no injury column).
-    No membership evidence means no QB candidate (the simulator's generic
-    QB fallback), never an inferred one.
+    No membership evidence means no real candidate (the simulator's
+    synthetic `__QB__`/`__OTHER__` fallbacks), never an inferred one.
 
 LIVE_ENHANCED (LIVE_PIT only)
     The existing live behaviour: history gated by `available_at` alone and
     aged by it; roster depth, injuries and game odds by their LIVE_PIT
     rules. Refused under HISTORICAL_WALK_FORWARD: 2022-2025 pregame
     observations have no certified historical availability. The same live
-    roster membership decides QB candidates FIRST; depth and injuries then
-    apply to members only and never restore a non-member QB.
+    roster membership decides player candidates FIRST; depth and injuries
+    then apply to members only and never restore a non-member.
 """
 
 from __future__ import annotations
@@ -72,8 +73,9 @@ class ModelInputs:
     #: pricing provenance reads them, so they must match what was consumed.
     roster: pl.DataFrame
     injuries: pl.DataFrame
-    #: player -> team structural membership that decided QB candidates.
-    qb_membership: dict[str, str] = field(default_factory=dict)
+    #: player -> team structural membership that decided every real
+    #: target-game player candidate.
+    team_membership: dict[str, str] = field(default_factory=dict)
 
 
 def _games_known_at(games: pl.DataFrame, as_of: datetime) -> pl.DataFrame:
@@ -131,12 +133,12 @@ def build_model_inputs(
                 ps, ts, players, as_of=as_of,
                 roster=roster if not roster.is_empty() else None,
                 injuries=injuries if not injuries.is_empty() else None,
-                strict=False, config=player_cfg, qb_membership=membership,
+                strict=False, config=player_cfg, team_membership=membership,
             ),
             game_odds=game_odds,
             roster=roster,
             injuries=injuries,
-            qb_membership=membership,
+            team_membership=membership,
         )
 
     if mode is EvidenceMode.HISTORICAL_WALK_FORWARD:
@@ -185,13 +187,13 @@ def build_model_inputs(
             ps, ts, players, as_of=as_of, roster=None, injuries=None,
             strict=strict, config=player_cfg,
             history_time_col=history_time_col, recency_time_col=PERFORMANCE_EVENT_COL,
-            qb_membership=membership,
+            team_membership=membership,
         ),
         game_odds=None,
-        # Membership is consumed as identity only (`qb_membership`); pricing
+        # Membership is consumed as identity only (`team_membership`); pricing
         # never sees roster depth or injury rows under STRUCTURAL_CORE.
         roster=roster.head(0),
         injuries=injuries.head(0),
-        qb_membership=membership,
+        team_membership=membership,
     )
 

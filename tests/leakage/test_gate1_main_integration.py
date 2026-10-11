@@ -145,8 +145,8 @@ def test_production_requires_pinned_sources_and_this_build_version(
 
 
 @pytest.mark.parametrize(("profile", "science"), [
-    ("STRUCTURAL_CORE", "structural-core.v2-qb-roster-membership"),
-    ("LIVE_ENHANCED", "live-enhanced.v2-qb-roster-membership"),
+    ("STRUCTURAL_CORE", "structural-core.v3-roster-eligible-player-universe"),
+    ("LIVE_ENHANCED", "live-enhanced.v3-roster-eligible-player-universe"),
 ])
 def test_remote_checkpoint_resolves_only_its_profiles_champion(
     tmp_path, monkeypatch: pytest.MonkeyPatch, profile: str, science: str

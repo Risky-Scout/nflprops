@@ -203,6 +203,20 @@ def _build_warehouse(tmp_path: Path, *, target_status: str = "final") -> Warehou
         ),
     )
 
+    # Target-week (2024 week 2) structural membership: every real
+    # candidate needs it (v3 roster-eligible player universe).
+    warehouse.write(
+        "historical_team_membership",
+        pl.DataFrame(
+            [
+                {"canonical_player_id": pid, "season": 2024, "week": 2, "team": team,
+                 "canonical_team_id": team, "roster_status": "ACT", "is_member": True}
+                for pid, team in ((HOME_WR_ID, HOME_TEAM_ID), (HOME_RB_ID, HOME_TEAM_ID),
+                                  (AWAY_WR_ID, AWAY_TEAM_ID))
+            ]
+        ),
+    )
+
     # A real (if minimal) game-odds row for the target game -- real
     # historical games always have this in the production warehouse;
     # `simulate_game_for_prediction`'s market-consensus step needs the

@@ -431,6 +431,13 @@ def _warehouse(root: Path, *, target_scale: int = 1, w1_scale: int = 1) -> Wareh
     warehouse.write("team_game_stats", team_stats)
     warehouse.write("player_game_stats", player_stats)
     warehouse.write("players", PLAYERS)
+    # Target-week (2024 week 2) structural membership: every real candidate
+    # needs it (v3).
+    warehouse.write("historical_team_membership", pl.DataFrame([
+        {"canonical_player_id": pid, "season": 2024, "week": 2, "team": team,
+         "canonical_team_id": team, "roster_status": "ACT", "is_member": True}
+        for pid, team in ((HOME_WR, HOME), (HOME_RB, HOME), (AWAY_WR, AWAY))
+    ]))
     # As in the real warehouse: game odds exist, but only as 2026 receipts.
     warehouse.write(
         "game_odds_snapshots",

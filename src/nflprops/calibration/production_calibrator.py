@@ -13,7 +13,8 @@ and the certified historical data root. Fail-closed sequence:
 1. the data root manifest equals `--expect-data-manifest-sha256`;
 2. every shard carries the certified Round 3 identity (`--shard-execution-sha`,
    model/sim config SHAs, data manifest, n_draws) and the shards account for
-   every final game exactly once;
+   every final game exactly once, and that run's report passed every
+   locked promotion gate with the same identity;
 3. equivalence: the last walk-forward fold is re-fitted here and its theta
    must equal the certified Round 3 fold theta bit-for-bit, proving this
    executor reproduces the certified estimator;
@@ -125,6 +126,40 @@ def _first_kickoff(data_root: Path, season: int) -> datetime:
     return first if first.tzinfo else first.replace(tzinfo=UTC)
 
 
+CERTIFIED_DECISION = "PROMOTION_CERTIFIED"
+
+
+def verify_certification_report(
+    report: dict[str, Any], *, expected_identity: dict[str, Any]
+) -> dict[str, Any]:
+    """The Phase 10C3A report the shards came from must have passed every
+    locked gate -- the overall decision AND every §65 row -- and must be
+    bound to exactly the shards' identity (profile id, science, configs,
+    data manifest). Fail closed otherwise; never assumed."""
+    rows = report.get("full_promotion_gate_spec65", {}).get("rows") or []
+    failed = [r.get("gate") for r in rows if r.get("result") != "PASS"]
+    spec65 = report.get("full_promotion_gate_spec65", {}).get("decision", {})
+    if (
+        report.get("promotion_decision") != "ELIGIBLE_FOR_PROMOTION"
+        or not rows
+        or failed
+        or spec65.get("promote") is not True
+    ):
+        raise ConfigurationError(
+            f"certification run did not pass every locked gate: decision="
+            f"{report.get('promotion_decision')!r} failed_gates={failed}"
+        )
+    identity = report.get("identity") or {}
+    mismatched = sorted(k for k, v in expected_identity.items() if identity.get(k) != v)
+    if mismatched:
+        raise ConfigurationError(f"certification report identity differs on {mismatched}")
+    return {
+        "decision": CERTIFIED_DECISION,
+        "gates_passed": [r["gate"] for r in rows],
+        "model_profile_id": identity["model_profile_id"],
+    }
+
+
 def fit_production_calibrator(args: argparse.Namespace) -> dict[str, Any]:
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -166,6 +201,13 @@ def fit_production_calibrator(args: argparse.Namespace) -> dict[str, Any]:
         r["canonical_game_id"]: int(r["season"]) for r in prepared.games.to_dicts()
     }
     log(f"loaded {len(games)} compact games, {len(skips)} certified skips")
+
+    # ---- the certifying run must itself have passed every locked gate
+    certification = verify_certification_report(
+        json.loads(Path(args.certification_report).read_text()),
+        expected_identity=run_identity(shard_config, prepared.data_manifest_sha256),
+    )
+    log(f"certification: {certification}")
 
     # ---- equivalence with the certified estimator (last walk-forward fold)
     certified = {c["fold_id"]: c for c in json.loads(Path(args.certified_calibrators).read_text())}
@@ -242,7 +284,7 @@ def fit_production_calibrator(args: argparse.Namespace) -> dict[str, Any]:
         metrics={
             "kind": "final_production_fit",
             "architecture_certification_run": args.certification_run_id,
-            "architecture_certification_decision": "PROMOTION_CERTIFIED",
+            "architecture_certification_decision": certification["decision"],
             "objective_value": fit.objective_value,
             "estimator_equivalence_fold": last_fold.fold_id,
         },
@@ -300,6 +342,7 @@ def fit_production_calibrator(args: argparse.Namespace) -> dict[str, Any]:
         "science_base_sha": args.science_base_sha,
         "execution_sha": args.execution_sha,
         "certification_run_id": args.certification_run_id,
+        "certification": certification,
         "cross_profile_refused": [ModelProfile.LIVE_ENHANCED.value],
         "estimator_equivalence": equivalence,
         "weight_health": weight_health,
@@ -331,6 +374,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--execution-sha", required=True)
     p.add_argument("--science-base-sha", required=True)
     p.add_argument("--certification-run-id", required=True)
+    p.add_argument("--certification-report", required=True,
+                   help="The certifying run's phase10c3a_report.json (locked gates).")
     p.add_argument("--evidence-model-version", default="phase10c3a-real-run-v1")
     p.add_argument("--production-model-version", default="2026.1.0")
     p.add_argument("--season-min", type=int, default=2022)

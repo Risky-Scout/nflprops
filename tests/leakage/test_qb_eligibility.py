@@ -129,7 +129,7 @@ def states(membership=None, *, ps=None, ts=None, roster=None, injuries=None, as_
         ps, ts = league()
     return build_player_states(
         ps, ts, PLAYERS, as_of=as_of, strict=False, roster=roster, injuries=injuries,
-        qb_membership=membership,
+        team_membership=membership,
     )
 
 
@@ -250,14 +250,14 @@ def test_live_enhanced_depth_and_injury_never_restore_a_non_member() -> None:
                                                 "position_group": ["QB"]})])
     ps, ts = league()
     s = build_player_states(ps, ts, players, as_of=AS_OF, strict=False, roster=roster,
-                            qb_membership=membership)
+                            team_membership=membership)
     assert STALE not in s and "qb:ghost" not in s
     assert s[STARTER].depth == 1
     # An injured starter is inactive -- the enhancement acts on members only.
     inj = pl.DataFrame([{"canonical_player_id": STARTER, "status": "Out",
                          "available_at": new, "available_at_is_estimated": False}])
     s2 = build_player_states(ps, ts, players, as_of=AS_OF, strict=False, roster=roster,
-                             injuries=inj, qb_membership=membership)
+                             injuries=inj, team_membership=membership)
     assert s2[STARTER].active is False and STALE not in s2
     assert selected(s2, T_A) == BACKUP
 
@@ -391,8 +391,8 @@ def test_gate1_historical_live_structural_inputs_identical(monkeypatch) -> None:
     historical = g1_inputs(EvidenceMode.HISTORICAL_WALK_FORWARD)
     live = g1_inputs(EvidenceMode.LIVE_PIT)
     groups = {HOME_RB: "QB"}
-    assert eligible_qb_ids(historical.qb_membership, groups, HOME) == (
-        eligible_qb_ids(live.qb_membership, groups, HOME)) == (HOME_RB,)
+    assert eligible_qb_ids(historical.team_membership, groups, HOME) == (
+        eligible_qb_ids(live.team_membership, groups, HOME)) == (HOME_RB,)
     assert historical.player_states == live.player_states
     assert historical.team_states == live.team_states
     for team in (HOME, AWAY):
@@ -410,8 +410,11 @@ def test_gate1_historical_live_structural_inputs_identical(monkeypatch) -> None:
 
 def test_gate1_no_membership_evidence_means_generic_qb_in_both_modes() -> None:
     historical = g1_inputs(EvidenceMode.HISTORICAL_WALK_FORWARD, membership=None)
-    live = g1_inputs(EvidenceMode.LIVE_PIT, roster=None)
+    live = g1_inputs(EvidenceMode.LIVE_PIT, roster=None,
+                     world=dict(live_world(), roster=pl.DataFrame()))
     assert HOME_RB not in historical.player_states and HOME_RB not in live.player_states
+    # v3: no membership evidence means no real candidate of any position.
+    assert historical.player_states == live.player_states == {}
     assert _qb_candidates(historical, HOME) == _qb_candidates(live, HOME) == [f"__QB__:{HOME}"]
 
 
@@ -464,7 +467,7 @@ def test_membership_table_is_certified_identity_evidence() -> None:
 def test_science_identity_changed_and_old_calibrator_fails_closed() -> None:
     assert set(PROFILE_SCIENCE_VERSIONS) == set(ModelProfile)
     old, new = "2026.1.0", profile_base_model_version("2026.1.0", "STRUCTURAL_CORE")
-    assert new == "2026.1.0+structural-core.v2-qb-roster-membership"
+    assert new == "2026.1.0+structural-core.v3-roster-eligible-player-universe"
     assert new != profile_base_model_version("2026.1.0", "LIVE_ENHANCED")
     common = dict(model_profile="STRUCTURAL_CORE", simulation_config_version="sim-v1",
                   feature_contract_version="f", prop_contract_version="p",

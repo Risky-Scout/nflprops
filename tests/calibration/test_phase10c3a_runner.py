@@ -126,8 +126,11 @@ def _build_two_season_warehouse(root: Path) -> Warehouse:
         "historical_team_membership",
         pl.DataFrame(
             [
-                {"canonical_player_id": pid, "season": 2023, "week": 1, "team": team,
+                # Every target week: membership is read for that week only,
+                # and it now gates every real player, not only QBs.
+                {"canonical_player_id": pid, "season": season, "week": week, "team": team,
                  "canonical_team_id": team_id, "roster_status": "ACT", "is_member": True}
+                for season, week in ((2023, 1), (2023, 2), (2024, 1))
                 for pid, team, team_id in (
                     (HOME_WR_ID, "HOME", HOME_TEAM_ID), (HOME_RB_ID, "HOME", HOME_TEAM_ID),
                     (AWAY_WR_ID, "AWAY", AWAY_TEAM_ID),
