@@ -78,8 +78,10 @@ jobs:
     # parent + three consecutive real workers on a production-shaped
     # warehouse, inside a transient service with nflprops-runtime.service's
     # exact limits. Gate: every pass prepares one checkpoint in < 180 s,
-    # cgroup memory.peak >= 64 MiB below MemoryHigh, zero memory.high /
-    # max / oom events, parent RSS flat.
+    # sampled non-reclaimable cgroup memory (memory.current - file cache +
+    # shmem) >= 64 MiB below MemoryHigh, raw memory.peak (page cache
+    # included) >= 32 MiB below MemoryHigh, zero memory.high / max / oom
+    # events, parent RSS flat (tools/constrained_worker_probe.py run_prod).
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:

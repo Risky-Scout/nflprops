@@ -511,7 +511,7 @@ def test_mp_legacy_artifact_without_profile_is_never_applied(tmp_path: Path) -> 
 def test_mp4_profile_changes_config_and_science_identity() -> None:
     structural = load(cli_overrides={"model.profile": "STRUCTURAL_CORE"})
     enhanced = load(cli_overrides={"model.profile": "LIVE_ENHANCED"})
-    assert resolve_model_profile(load()) is ModelProfile.LIVE_ENHANCED  # shipped default
+    assert resolve_model_profile(load()) is ModelProfile.STRUCTURAL_CORE  # shipped default
     assert config_sha256(structural) != config_sha256(enhanced)
     run_ids = {
         compute_run_id(game_id="g", checkpoint_name="T30M", scheduled_as_of=AS_OF,

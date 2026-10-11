@@ -174,6 +174,19 @@ def prop_values(
     raise NotImplementedError(f"unsupported prop type {prop.value}")
 
 
+#: The binary products with a defined AT_LEAST (>= 1) hit probability --
+#: the only props a one-sided MILESTONE quote can be priced against
+#: (PHASE 9B §15). Every other milestone is a count-style ladder with no
+#: certified semantics.
+AT_LEAST_HIT_PROPS: frozenset[PropType] = frozenset({
+    PropType.ANYTIME_TD,
+    PropType.ANYTIME_TD_1H,
+    PropType.ANYTIME_TD_1Q,
+    PropType.ANYTIME_TD_2H,
+    PropType.FIRST_TD,
+})
+
+
 def summarize_prop(
     result: GameSimulationResult,
     player_id: str,
@@ -187,13 +200,7 @@ def summarize_prop(
     quantiles = np.quantile(values, [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95])
 
     p_over = p_under = p_push = p_hit = None
-    if prop in {
-        PropType.ANYTIME_TD,
-        PropType.ANYTIME_TD_1H,
-        PropType.ANYTIME_TD_1Q,
-        PropType.ANYTIME_TD_2H,
-        PropType.FIRST_TD,
-    }:
+    if prop in AT_LEAST_HIT_PROPS:
         p_hit = float(np.mean(values >= 1))
     elif line is not None:
         p_over = float(np.mean(values > line))

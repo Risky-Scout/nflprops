@@ -176,7 +176,12 @@ def test_remote_checkpoint_resolves_only_its_profiles_champion(
     run = SimpleNamespace(checkpoint_name="T90M", model_version="2026.1.0")
     gate = evaluate_calibration_gate(warehouse, run, model_profile=ModelProfile(profile))
     assert gate["status"] == CALIBRATION_NO_APPROVED_CHAMPION and gate["approved"] is False
-    assert [c["checkpoint_scope"] for c in calls] == ["T90M", "ALL_PREGAME_CHECKPOINTS"]
-    for call in calls:
+    # The run's own profile is resolved first (and is the only one that can
+    # ever be applied); other profiles are probed afterwards only to label a
+    # cross-profile champion PROFILE_MISMATCH.
+    own = calls[:2]
+    assert [c["checkpoint_scope"] for c in own] == ["T90M", "ALL_PREGAME_CHECKPOINTS"]
+    for call in own:
         assert call["model_profile"] == profile
         assert call["base_model_version"] == f"2026.1.0+{science}"
+    assert all(c["model_profile"] != profile for c in calls[2:])

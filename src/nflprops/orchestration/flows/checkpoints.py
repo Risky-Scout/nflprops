@@ -40,6 +40,7 @@ PHASE 9D §2/§6/§9/§10).
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -54,6 +55,7 @@ from nflprops.data.warehouse import Warehouse
 from nflprops.distributions.build import build_player_prop_distributions
 from nflprops.domain.model_profile import ModelProfile, resolve_model_profile
 from nflprops.errors import LeakageError as CoreLeakageError
+from nflprops.market.current_pricing import partition_supported_quotes
 from nflprops.orchestration.checkpoints import (
     CheckpointAction,
     CheckpointName,
@@ -90,7 +92,9 @@ from nflprops.projections.stats import REGISTRY_SIZE
 from nflprops.thresholds import build_player_game_threshold_events
 
 if TYPE_CHECKING:
-    from nflprops.simulation.game import SimulationConfig
+    from collections.abc import Callable
+
+    from nflprops.simulation.game import GameSimulationResult, SimulationConfig
     from nflprops.state.player import PlayerStateConfig
     from nflprops.state.team import TeamStateConfig
 
@@ -125,6 +129,23 @@ class CheckpointRunContext:
     #: pre-Block-4 caller is unchanged; the GitHub checkpoint executor
     #: turns it on.
     persist_distributions: bool = False
+    #: Production wiring: an optional downstream step run exactly once,
+    #: after EVERY raw canonical artifact persisted, on the SAME simulation
+    #: and the SAME priced rows. It may persist its own separate product but
+    #: never modifies a raw artifact or the run's status; it returns
+    #: (status, detail, rows persisted). The GitHub executor injects the
+    #: certified live calibration here; this module stays agnostic of it.
+    post_pricing_step: (
+        Callable[
+            [CheckpointRunContext, GameSimulationResult, list[dict[str, object]]],
+            tuple[str | None, str | None, int],
+        ]
+        | None
+    ) = None
+
+
+#: Per-quote audit of quotes excluded before pricing (never a failed game).
+QUOTE_EXCLUSIONS_TABLE = "player_prop_quote_exclusions"
 
 
 def _classify_exception(exc: BaseException) -> tuple[str, str]:
@@ -200,6 +221,12 @@ class _CheckpointExecution:
     distribution_rows_persisted: int = 0
     distribution_failed: bool = False
     distribution_failure_detail: str | None = None
+    #: Quotes excluded before pricing (unsupported market semantics).
+    quotes_excluded: int = 0
+    #: `post_pricing_step` outcome (None when no step was supplied).
+    post_pricing_status: str | None = None
+    post_pricing_detail: str | None = None
+    post_pricing_rows_persisted: int = 0
 
 
 @task(
@@ -414,12 +441,23 @@ def _run_game_checkpoint_task(
             legacy_mirror_failure_code=None,
             legacy_mirror_failure_detail=None,
             distribution_rows_persisted=distribution_rows,
+            quotes_excluded=excluded_count,
         )
 
+    excluded_count = 0
+
     # --- PHASE 6/9B: price current sportsbook markets, exactly once -------
-    # (failure -> PARTIAL, no canonical pricing artifact, no legacy mirror)
+    # (failure -> PARTIAL, no canonical pricing artifact, no legacy mirror).
+    # UNSUPPORTED QUOTE != FAILED GAME: quotes with no certified pricing
+    # semantics are excluded, reason-coded and persisted for audit first;
+    # every supported quote of the game still prices.
     try:
-        priced = computation.price_markets()
+        supported, excluded = partition_supported_quotes(
+            computation.latest_quotes.filter(pl.col("canonical_game_id") == ctx.game_id)
+        )
+        excluded_count = excluded.height
+        _persist_quote_exclusions(ctx, excluded)
+        priced = dataclasses.replace(computation, latest_quotes=supported).price_markets()
     except Exception as exc:
         code, detail = _classify_exception(exc)
         return _failed_execution(pricing_failure_code=code, pricing_failure_detail=detail)
@@ -479,7 +517,17 @@ def _run_game_checkpoint_task(
             legacy_mirror_failure_code="LEGACY_PRICING_MIRROR_ERROR",
             legacy_mirror_failure_detail=f"{code}: {detail}",
             distribution_rows_persisted=distribution_rows,
+            quotes_excluded=excluded_count,
         )
+
+    # --- Production wiring: the downstream step on the SAME draws ---------
+    # Only once every raw canonical artifact exists. The step owns its own
+    # failure handling; it can never touch the raw run's artifacts/status.
+    step_status, step_detail, step_rows = (
+        ctx.post_pricing_step(ctx, simulation, list(priced))
+        if ctx.post_pricing_step is not None
+        else (None, None, 0)
+    )
 
     return _CheckpointExecution(
         game_modeled=True,
@@ -498,7 +546,29 @@ def _run_game_checkpoint_task(
         legacy_mirror_failure_code=None,
         legacy_mirror_failure_detail=None,
         distribution_rows_persisted=distribution_rows,
+        quotes_excluded=excluded_count,
+        post_pricing_status=step_status,
+        post_pricing_detail=step_detail,
+        post_pricing_rows_persisted=step_rows,
     )
+
+
+def _persist_quote_exclusions(ctx: CheckpointRunContext, excluded: pl.DataFrame) -> None:
+    """Idempotently persist the per-quote exclusion audit for this run."""
+    if excluded.is_empty():
+        return
+    import hashlib
+
+    columns = [c for c in excluded.columns]
+    rows = excluded.with_columns(
+        pl.concat_str([pl.lit(ctx.run_id), *[pl.col(c).fill_null("") for c in columns]],
+                      separator="|")
+        .map_elements(lambda v: hashlib.sha256(v.encode()).hexdigest(), return_dtype=pl.String)
+        .alias("exclusion_id"),
+        pl.lit(ctx.run_id).alias("run_id"),
+        pl.lit(ctx.scheduled_as_of).alias("as_of"),
+    ).unique("exclusion_id", keep="first", maintain_order=True)
+    ctx.warehouse.append(QUOTE_EXCLUSIONS_TABLE, rows, key=["exclusion_id"], keep="first")
 
 
 _PRICING_ARTIFACT_INVARIANT_CODE = "PRICING_ARTIFACT_INVARIANT_VIOLATION"

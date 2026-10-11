@@ -653,26 +653,51 @@ def _canonical_sha256(value: Any) -> str:
     ).hexdigest()
 
 
-def run_identity(config: RunnerConfig, data_manifest_sha256: str) -> dict[str, Any]:
-    """Every identity a compact game / OOF row / report is bound to."""
+def science_config_identity(
+    *,
+    model_version: str,
+    regularization_lambda: float,
+    player_state_config: PlayerStateConfig,
+    team_state_config: TeamStateConfig,
+    simulation_config: SimulationConfig,
+) -> dict[str, str]:
+    """The model / simulation configuration hashes certified evidence is
+    bound to. The live path recomputes them from the SHIPPED production
+    configuration to prove a calibrator was certified on identical science
+    (`nflprops.calibration.live_application`)."""
     model_config = {
-        "model_version": config.model_version,
+        "model_version": model_version,
         "model_profile": MODEL_PROFILE.value,
         "profile_science_version": PROFILE_SCIENCE_VERSIONS[MODEL_PROFILE],
         "evidence_mode": EVIDENCE_MODE.value,
-        "player_state_config": asdict(PlayerStateConfig()),
-        "team_state_config": asdict(TeamStateConfig()),
+        "player_state_config": asdict(player_state_config),
+        "team_state_config": asdict(team_state_config),
         "feature_contract_version": FEATURE_CONTRACT_VERSION,
         "calibration_algorithm": f"{ALGORITHM_FAMILY}/{ALGORITHM_VERSION}",
-        "regularization_lambda": config.regularization_lambda,
+        "regularization_lambda": regularization_lambda,
     }
+    return {
+        "model_config_sha256": _canonical_sha256(model_config),
+        "sim_config_sha256": _canonical_sha256(asdict(simulation_config)),
+    }
+
+
+def run_identity(config: RunnerConfig, data_manifest_sha256: str) -> dict[str, Any]:
+    """Every identity a compact game / OOF row / report is bound to."""
+    hashes = science_config_identity(
+        model_version=config.model_version,
+        regularization_lambda=config.regularization_lambda,
+        player_state_config=PlayerStateConfig(),
+        team_state_config=TeamStateConfig(),
+        simulation_config=SimulationConfig(n_draws=config.n_draws),
+    )
     return {
         "model_profile": MODEL_PROFILE.value,
         "model_profile_id": profile_base_model_version(config.model_version, MODEL_PROFILE),
         "science_base_sha": config.science_base_sha,
         "execution_sha": config.execution_sha,
-        "model_config_sha256": _canonical_sha256(model_config),
-        "sim_config_sha256": _canonical_sha256(asdict(SimulationConfig(n_draws=config.n_draws))),
+        "model_config_sha256": hashes["model_config_sha256"],
+        "sim_config_sha256": hashes["sim_config_sha256"],
         "data_manifest_sha256": data_manifest_sha256,
     }
 

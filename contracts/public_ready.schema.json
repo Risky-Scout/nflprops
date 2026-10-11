@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nflprops.public_ready/v1",
+  "title": "NFLProps PUBLIC_READY checkpoint publication",
+  "description": "One game's consumer-facing player-prop opportunities at one official checkpoint: one row per actual sportsbook quote, priced with the certified calibrated STRUCTURAL_CORE model. Consumers (wizardofodds.com) fetch, validate and render only; they never recompute a probability. Render nothing once now >= game.expires_at (kickoff). Reference validator: nflprops.publication.consumer.validate_public_ready.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "generated_at", "season", "week", "game", "rows"],
+  "properties": {
+    "schema_version": {"const": "nflprops.public_ready/v1"},
+    "generated_at": {"type": "string", "format": "date-time", "pattern": "Z$"},
+    "season": {"type": "integer"},
+    "week": {"type": "integer"},
+    "game": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["matchup", "home_team", "away_team", "kickoff_utc", "expires_at"],
+      "properties": {
+        "matchup": {"type": "string", "description": "AWAY @ HOME team abbreviations"},
+        "home_team": {"type": "string"},
+        "away_team": {"type": "string"},
+        "kickoff_utc": {"type": "string", "format": "date-time", "pattern": "Z$"},
+        "expires_at": {"type": "string", "format": "date-time", "pattern": "Z$"}
+      }
+    },
+    "rows": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["opportunity_id", "player", "position", "team", "opponent", "matchup",
+                     "kickoff_utc", "prop", "prop_type", "line", "pick", "model_probability",
+                     "fair_odds", "book", "book_odds", "edge", "projection", "updated_at"],
+        "properties": {
+          "opportunity_id": {"type": "string", "description": "Stable id of this book quote (game, player, prop, book, line)"},
+          "player": {"type": "string"},
+          "position": {"type": ["string", "null"]},
+          "team": {"type": "string"},
+          "opponent": {"type": "string"},
+          "matchup": {"type": "string"},
+          "kickoff_utc": {"type": "string", "format": "date-time", "pattern": "Z$"},
+          "prop": {"type": "string", "description": "Display label, e.g. Receiving Yards"},
+          "prop_type": {"type": "string", "description": "Machine prop key, e.g. receiving_yards"},
+          "line": {"type": ["number", "null"], "description": "Book line; null for yes/no props (anytime / first TD)"},
+          "pick": {"enum": ["OVER", "UNDER", "YES"], "description": "The side with the larger model expected value at this book's price"},
+          "model_probability": {"type": "number", "minimum": 0, "maximum": 1, "description": "Calibrated model probability the pick wins"},
+          "fair_odds": {"type": "integer", "description": "Model fair American odds for the pick (push-aware)"},
+          "book": {"type": "string"},
+          "book_odds": {"type": "integer", "description": "The sportsbook's American odds for the pick"},
+          "edge": {"type": "number", "description": "Model expected profit per 1 unit staked at book_odds"},
+          "projection": {"type": ["number", "null"], "description": "Calibrated model mean of the stat; null for yes/no props"},
+          "updated_at": {"type": "string", "format": "date-time", "pattern": "Z$", "description": "When this book quote was last observed"}
+        }
+      }
+    }
+  }
+}

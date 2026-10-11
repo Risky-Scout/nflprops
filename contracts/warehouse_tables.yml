@@ -363,6 +363,49 @@ tables:
         opened_at, collector_received_at, confidence_tier, model_mean,
         model_median, p05, p10, p25, p50, p75, p90, p95, p_model_calibrated,
         quote_age_seconds, created_at]
+    player_prop_quote_exclusions:
+      key: [exclusion_id]
+      foreign_key: {run_id: "prediction_runs.run_id"}
+      pit: true
+      note: >
+        Production wiring. Per-run audit of every sportsbook quote excluded
+        BEFORE pricing because the certified pricer has no semantics for it
+        (UNSUPPORTED_MARKET_TYPE / UNSUPPORTED_PROP_TYPE /
+        UNSUPPORTED_COUNT_MILESTONE, incl. multi-TD "2+" ladders) -- an
+        unsupported quote never fails the game. See
+        nflprops.market.current_pricing.partition_supported_quotes.
+      columns: [exclusion_id, run_id, as_of, canonical_game_id,
+        canonical_player_id, vendor, prop_type, market_type, line_value, reason]
+    player_prop_calibrated_prices:
+      key: [prediction_id]
+      foreign_key: {run_id: "prediction_runs.run_id", prediction_id: "player_prop_prices.prediction_id"}
+      pit: true
+      note: >
+        Production wiring. The certified joint-game calibrator applied to the
+        SAME draws as the raw run: one row per raw player_prop_prices row
+        (same prediction_id, same book quote, same event), carrying raw and
+        calibrated probabilities side by side. The raw canonical artifacts
+        are never modified. See nflprops.calibration.live_application.
+      columns: [prediction_id, run_id, season, week, game_id, player_id,
+        prop_type, market_type, vendor, side, line, american_odds, p_model_raw,
+        p_model_calibrated, p_push_calibrated, model_fair_american_calibrated,
+        model_fair_decimal_calibrated, p_market_fair, edge_calibrated,
+        ev_per_unit_calibrated, model_mean_calibrated, model_mean_raw,
+        quote_available_at, as_of, n_draws, model_version,
+        calibration_artifact_id, calibration_status]
+    player_prop_calibration_applications:
+      key: [run_id]
+      foreign_key: {run_id: "prediction_runs.run_id"}
+      pit: false
+      note: >
+        Production wiring. One row per run the certified calibrator was
+        applied to (or failed to apply to): calibration identity (artifact,
+        payload SHA, profile, certification / fit run) and status. Only
+        APPLIED can make a run PUBLIC_READY.
+      columns: [run_id, calibration_status, calibration_artifact_id,
+        payload_sha256, model_profile, model_profile_id, checkpoint_scope,
+        algorithm, certification_run_id, fit_run_id, effective_sample_size,
+        max_weight, priced_rows, calibrated_rows, detail, created_at]
     player_prop_distribution_artifacts:
       key: [run_id]
       foreign_key: {run_id: "prediction_runs.run_id"}

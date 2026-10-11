@@ -937,8 +937,9 @@ def execute_checkpoint_cmd(
         raise typer.Exit(1) from exc
     result = executed.result
     typer.echo(json.dumps({k: result[k] for k in (
-        "run_id", "run", "row_counts", "calibration_gate", "decision", "decision_reasons",
-    )}, indent=2, sort_keys=True))
+        "run_id", "run", "row_counts", "calibration_gate", "quote_exclusions", "decision",
+        "decision_reasons", "public_ready",
+    )}, indent=2, sort_keys=True, default=str))
 
 
 @app.command("result-ingest")

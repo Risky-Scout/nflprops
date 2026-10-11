@@ -25,8 +25,13 @@ Fail-closed sequence:
 6. the certified `game_checkpoint_flow` runs once (one coherent 20k
    simulation -> projections -> threshold probabilities -> exact PMFs ->
    push-aware prices/EV), writing only to the scratch warehouse;
-7. the calibration gate and the PUBLIC_READY decision are evaluated;
-8. every canonical row the run produced is exported with `result.json`.
+7. the calibration gate and the PUBLIC_READY decision are evaluated: the
+   certified calibrator is resolved and verified BEFORE step 6
+   (`nflprops.calibration.live_application`), the flow reweights the SAME
+   draws and persists the calibrated product separately from the raw one,
+   and only APPLIED may contribute to PUBLIC_READY;
+8. every canonical row the run produced is exported with `result.json`,
+   plus `public_ready.json` (the consumer artifact) when PUBLIC_READY.
 
 Every refusal is classified SCIENTIFIC (deterministic: may be recorded
 NOT_EXECUTABLE) or OPERATIONAL (the request stays pending) -- see
@@ -89,12 +94,17 @@ DECISION_PUBLIC_READY = "PUBLIC_READY"
 DECISION_NOT_PUBLIC_READY = "NOT_PUBLIC_READY"
 
 #: Calibration gate outcomes. Only APPLIED may ever contribute to
-#: PUBLIC_READY; every other value fails the decision closed.
+#: PUBLIC_READY; every other value fails the decision closed (the full set,
+#: including PROFILE_MISMATCH / NOT_CERTIFIED / SCIENCE_MISMATCH /
+#: CONFIG_MISMATCH / PAYLOAD_MISSING / PAYLOAD_CORRUPT / APPLICATION_FAILED,
+#: is in `nflprops.calibration.live_application`).
 CALIBRATION_APPLIED = "APPLIED"
 CALIBRATION_REGISTRY_ABSENT = "REGISTRY_ABSENT"
 CALIBRATION_SCOPE_NOT_APPLICABLE = "SCOPE_NOT_APPLICABLE"
 CALIBRATION_NO_APPROVED_CHAMPION = "NO_APPROVED_CHAMPION"
-CALIBRATION_APPLICATION_UNAVAILABLE = "CHAMPION_RESOLVED_APPLICATION_UNAVAILABLE"
+#: A certified calibrator resolved, but the flow never applied it (e.g. the
+#: run failed before its raw canonical artifacts all persisted).
+CALIBRATION_NOT_APPLIED = "RESOLVED_NOT_APPLIED"
 
 #: The calibration-compatibility versions the live model is built under
 #: (the same literals the Phase-10C3A challenger registers with).
@@ -112,7 +122,17 @@ RESULT_TABLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("player_prop_distribution_artifacts", ("run_id",)),
     ("player_prop_prices", ("prediction_id",)),
     ("player_prop_pricing_artifacts", ("run_id",)),
+    ("player_prop_quote_exclusions", ("exclusion_id",)),
+    ("player_prop_calibrated_prices", ("prediction_id",)),
+    ("player_prop_calibration_applications", ("run_id",)),
 )
+#: Tables a pre-production-wiring result bundle never carried: a bundle
+#: without them (no file, no count) still ingests as zero rows.
+OPTIONAL_RESULT_TABLES = frozenset({
+    "player_prop_quote_exclusions",
+    "player_prop_calibrated_prices",
+    "player_prop_calibration_applications",
+})
 RUN_TABLE_FILE = "prediction_run.parquet"
 RESULT_FILE = "result.json"
 
@@ -385,58 +405,67 @@ def verify_request_against_snapshot(
     return run
 
 
+def resolve_calibration(
+    warehouse: Warehouse,
+    run: PredictionRunRecord,
+    *,
+    model_profile: ModelProfile,
+    config: Config,
+) -> Any:
+    """Pre-simulation, fail-closed resolution of the certified calibrator
+    (`live_application.resolve_live_calibrator`)."""
+    from nflprops.calibration.live_application import resolve_live_calibrator
+
+    return resolve_live_calibrator(warehouse, run, model_profile=model_profile, config=config)
+
+
 def evaluate_calibration_gate(
-    warehouse: Warehouse, run: PredictionRunRecord, *, model_profile: ModelProfile
+    warehouse: Warehouse,
+    run: PredictionRunRecord,
+    *,
+    model_profile: ModelProfile,
+    config: Config | None = None,
+    resolution: Any = None,
 ) -> dict[str, Any]:
-    """Fail-closed calibration applicability for one run. Never a raw-model
+    """Fail-closed calibration outcome for one run. Never a raw-model
     fallback labelled calibrated: anything but APPLIED blocks PUBLIC_READY.
-    Only a champion fitted on `model_profile`'s predictions -- bound to the
-    profile's science contract (`profile_base_model_version`) -- resolves."""
-    from nflprops.calibration.contract import load_calibration_registry_contract
-    from nflprops.calibration.joint_feature_contract import FEATURE_CONTRACT_VERSION
-    from nflprops.calibration.registry import resolve_calibration_champion
-    from nflprops.domain.model_profile import profile_base_model_version
+    Only a certified champion fitted on `model_profile`'s predictions --
+    bound to the profile's science contract and the shipped configuration
+    -- resolves, and it is APPLIED only when the flow persisted its
+    calibrated product for exactly this run and artifact."""
+    from nflprops.calibration.live_application import CALIBRATION_APPLICATIONS_TABLE
 
-    base: dict[str, Any] = {
-        "scope_type": CALIBRATION_SCOPE_TYPE,
-        "model_profile": model_profile.value,
-        "base_model_version": profile_base_model_version(run.model_version, model_profile),
-        "simulation_config_version": SIMULATION_CONFIG_VERSION,
-        "feature_contract_version": FEATURE_CONTRACT_VERSION,
-        "prop_contract_version": PROP_CONTRACT_VERSION,
-        "calibration_contract_version": CALIBRATION_CONTRACT_VERSION,
-    }
-    contract = load_calibration_registry_contract()
-    if run.checkpoint_name not in contract.checkpoint_scopes:
-        return {**base, "status": CALIBRATION_SCOPE_NOT_APPLICABLE, "approved": False,
-                "detail": f"checkpoint {run.checkpoint_name!r} has no calibration scope"}
-    if not warehouse.exists("calibration_champions"):
-        return {**base, "status": CALIBRATION_REGISTRY_ABSENT, "approved": False,
-                "detail": "no calibration registry in the checkpoint snapshot"}
+    if resolution is None:
+        if config is None:
+            from nflprops.config import load
 
-    for scope in (run.checkpoint_name, "ALL_PREGAME_CHECKPOINTS"):
-        artifact = resolve_calibration_champion(
-            as_run_store_backend(warehouse),
-            scope_type=CALIBRATION_SCOPE_TYPE,
-            checkpoint_scope=scope,
-            model_profile=model_profile.value,
-            base_model_version=base["base_model_version"],
-            simulation_config_version=SIMULATION_CONFIG_VERSION,
-            feature_contract_version=FEATURE_CONTRACT_VERSION,
-            prop_contract_version=PROP_CONTRACT_VERSION,
-            calibration_contract_version=CALIBRATION_CONTRACT_VERSION,
-            contract=contract,
+            config = load()
+        resolution = resolve_calibration(
+            warehouse, run, model_profile=model_profile, config=config
         )
-        if artifact is not None:
-            # A champion resolves, but live application of a joint-game
-            # calibrator to checkpoint PMFs/prices is not implemented yet:
-            # fail closed rather than publish raw probabilities.
-            return {**base, "status": CALIBRATION_APPLICATION_UNAVAILABLE, "approved": False,
-                    "checkpoint_scope": scope,
-                    "calibration_artifact_id": artifact.calibration_artifact_id,
-                    "detail": "resolved champion cannot yet be applied in the live path"}
-    return {**base, "status": CALIBRATION_NO_APPROVED_CHAMPION, "approved": False,
-            "detail": "no approved, promoted, compatible champion resolves"}
+    gate: dict[str, Any] = resolution.as_dict()
+    if not resolution.resolved:
+        return gate
+    rows = (
+        warehouse.read(CALIBRATION_APPLICATIONS_TABLE, where=pl.col("run_id") == run.run_id)
+        if warehouse.exists(CALIBRATION_APPLICATIONS_TABLE)
+        else pl.DataFrame()
+    )
+    if rows.height != 1:
+        return {**gate, "status": CALIBRATION_NOT_APPLIED,
+                "detail": "the certified calibrator was not applied to this run"}
+    applied = rows.row(0, named=True)
+    if applied["calibration_artifact_id"] != resolution.calibrator.calibration_artifact_id:
+        return {**gate, "status": CALIBRATION_NOT_APPLIED,
+                "detail": "the persisted application names a different calibrator"}
+    if applied["calibration_status"] != CALIBRATION_APPLIED:
+        return {**gate, "status": applied["calibration_status"],
+                "detail": applied["detail"] or "calibration application failed"}
+    return {**gate, "status": CALIBRATION_APPLIED, "approved": True,
+            "detail": "certified calibrator applied to this run's draws",
+            "calibrated_rows": int(applied["calibrated_rows"]),
+            "priced_rows": int(applied["priced_rows"]),
+            "effective_sample_size": applied["effective_sample_size"]}
 
 
 def public_decision(
@@ -465,6 +494,60 @@ class ExecutionResult:
     run: PredictionRunRecord
     result: dict[str, Any]
     out_dir: Path
+
+
+def _calibration_step(resolution: Any) -> Any:
+    from nflprops.calibration.live_application import LiveCalibrationStep
+
+    return LiveCalibrationStep(resolution.calibrator) if resolution.resolved else None
+
+
+def _exclusion_counts(warehouse: Warehouse, run_id: str) -> list[dict[str, object]]:
+    from nflprops.market.current_pricing import quote_exclusion_counts
+
+    return quote_exclusion_counts(_run_rows(warehouse, "player_prop_quote_exclusions", run_id))
+
+
+def write_public_ready(
+    warehouse: Warehouse,
+    run: PredictionRunRecord,
+    *,
+    calibration: dict[str, Any],
+    out_dir: Path,
+    generated_at: datetime,
+) -> dict[str, Any]:
+    """Build `public_ready.json` from this run's persisted calibrated
+    product. Returns the internal audit (rows, books, exclusion counts,
+    file SHA-256) recorded in `result.json`; raises `PublicReadyError` (no
+    file) when the run is not publishable."""
+    import hashlib
+
+    from nflprops.platform.checkpoint_prepare import OFFICIAL_MAX_EVIDENCE_AGE
+    from nflprops.publication.public_ready import (
+        PUBLIC_READY_FILE,
+        PUBLIC_READY_SCHEMA_VERSION,
+        build_public_ready,
+        public_ready_bytes,
+    )
+
+    document, audit = build_public_ready(
+        run=run,
+        calibration_gate=calibration,
+        production_profile=ModelProfile.STRUCTURAL_CORE.value,
+        production_n_draws=PRODUCTION_N_DRAWS,
+        calibrated=_run_rows(warehouse, "player_prop_calibrated_prices", run.run_id),
+        projections=_run_rows(warehouse, "player_game_projections", run.run_id),
+        exclusions=_run_rows(warehouse, "player_prop_quote_exclusions", run.run_id),
+        games=warehouse.read("games"),
+        teams=warehouse.read("teams"),
+        players=warehouse.read("players"),
+        max_quote_age=OFFICIAL_MAX_EVIDENCE_AGE.get(run.checkpoint_name),
+        generated_at=generated_at,
+    )
+    data = public_ready_bytes(document)
+    (out_dir / PUBLIC_READY_FILE).write_bytes(data)
+    return {**audit, "file": PUBLIC_READY_FILE, "schema_version": PUBLIC_READY_SCHEMA_VERSION,
+            "sha256": hashlib.sha256(data).hexdigest()}
 
 
 def _run_rows(warehouse: Warehouse, table: str, run_id: str) -> pl.DataFrame:
@@ -498,6 +581,7 @@ def execute_checkpoint(
 
     player_state_cfg, team_state_cfg = state_configs_from_app_config(config)
     model_profile = resolve_model_profile(config)
+    resolution = resolve_calibration(warehouse, run, model_profile=model_profile, config=config)
     ctx = CheckpointRunContext(
         warehouse=warehouse,
         season=run.season,
@@ -517,6 +601,7 @@ def execute_checkpoint(
         player_state_config=player_state_cfg,
         team_state_config=team_state_cfg,
         persist_distributions=True,
+        post_pricing_step=_calibration_step(resolution),
     )
     started = datetime.now(UTC)
     final = game_checkpoint_flow(ctx, now=datetime.now(UTC))
@@ -533,10 +618,24 @@ def execute_checkpoint(
             rows.write_parquet(tables_dir / f"{table}.parquet")
     _run_rows(warehouse, "prediction_runs", run.run_id).write_parquet(out_dir / RUN_TABLE_FILE)
 
-    calibration = evaluate_calibration_gate(warehouse, final, model_profile=model_profile)
+    calibration = evaluate_calibration_gate(
+        warehouse, final, model_profile=model_profile, resolution=resolution
+    )
     decision, reasons = public_decision(
         final, calibration=calibration, distribution_count=counts["player_prop_distributions"]
     )
+    public_ready = None
+    if decision == DECISION_PUBLIC_READY:
+        from nflprops.publication.public_ready import PublicReadyError
+
+        try:
+            public_ready = write_public_ready(
+                warehouse, final, calibration=calibration, out_dir=out_dir,
+                generated_at=completed,
+            )
+        except PublicReadyError as exc:
+            decision = DECISION_NOT_PUBLIC_READY
+            reasons = [*reasons, f"PUBLIC_READY_REFUSED: {exc}"]
     result = {
         "schema_version": RESULT_SCHEMA_VERSION,
         "run_id": run.run_id,
@@ -583,8 +682,10 @@ def execute_checkpoint(
         },
         "row_counts": counts,
         "calibration_gate": calibration,
+        "quote_exclusions": _exclusion_counts(warehouse, run.run_id),
         "decision": decision,
         "decision_reasons": reasons,
+        "public_ready": public_ready,
     }
     (out_dir / RESULT_FILE).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
     return ExecutionResult(run=final, result=result, out_dir=out_dir)

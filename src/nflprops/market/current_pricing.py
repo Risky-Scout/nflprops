@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime
+from typing import Any
 
 import polars as pl
 
@@ -39,7 +40,7 @@ from nflprops.backtest.provenance import (
     audit_prediction_inputs,
     latest_entity_available_at,
 )
-from nflprops.domain.enums import DevigConfidence, MarketType
+from nflprops.domain.enums import DevigConfidence, MarketType, PropType
 from nflprops.market.devig import proportional_two_sided
 from nflprops.market.odds import (
     american_to_decimal,
@@ -53,7 +54,11 @@ from nflprops.market.odds import (
 )
 from nflprops.market.timing import quote_knowledge_time, quote_time_source
 from nflprops.simulation.game import GameSimulationResult
-from nflprops.simulation.props import prop_confidence_tier, summarize_prop
+from nflprops.simulation.props import (
+    AT_LEAST_HIT_PROPS,
+    prop_confidence_tier,
+    summarize_prop,
+)
 
 #: PHASE 9B §16: the only two recognized, priceable quote market types. Any
 #: other value must fail closed rather than falling through to the
@@ -83,6 +88,86 @@ class UnsupportedMilestoneMarketError(ValueError):
     phase; this fails closed instead of silently producing zero priced
     rows for the quote (the prior PHASE 9A-audited behavior).
     """
+
+
+#: Reason codes for a quote excluded BEFORE pricing (never a failed game).
+EXCLUDED_UNSUPPORTED_MARKET_TYPE = "UNSUPPORTED_MARKET_TYPE"
+EXCLUDED_UNSUPPORTED_PROP_TYPE = "UNSUPPORTED_PROP_TYPE"
+EXCLUDED_UNSUPPORTED_COUNT_MILESTONE = "UNSUPPORTED_COUNT_MILESTONE"
+
+#: Columns of the per-quote exclusion audit (`partition_supported_quotes`).
+QUOTE_EXCLUSION_COLUMNS: tuple[str, ...] = (
+    "canonical_game_id", "canonical_player_id", "vendor", "prop_type",
+    "market_type", "line_value", "reason",
+)
+_SUPPORTED_MILESTONE_PROPS = sorted(p.value for p in AT_LEAST_HIT_PROPS)
+_KNOWN_PROP_TYPES = sorted(p.value for p in PropType)
+#: A binary-TD milestone's only certified line: "over 0.5" == AT_LEAST 1,
+#: exactly the hit event. Providers also send it with no line at all.
+_BINARY_MILESTONE_LINE = 0.5
+
+
+def partition_supported_quotes(quotes: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """Split `quotes` into those the certified pricer has semantics for and
+    a reason-coded audit of every other quote.
+
+    UNSUPPORTED QUOTE != FAILED GAME: an unknown `market_type`
+    (`UnsupportedMarketTypeError`), a prop type the model does not simulate,
+    or a count-style milestone ladder with no certified AT_LEAST
+    distribution (`UnsupportedMilestoneMarketError`) -- including a
+    binary-TD milestone at a multi-TD line such as "2+ TDs" (line 1.5),
+    which the >= 1 hit event would misprice -- is excluded here: counted,
+    reason-coded, auditable, so the supported quotes of the same game still
+    price. A binary-TD milestone at line 0.5 IS the certified >= 1 event;
+    its line is normalized to null, the canonical milestone-row form. No new
+    probability semantics are invented; `_price_quote` itself still fails
+    closed if handed an unsupported quote."""
+    columns = list(QUOTE_EXCLUSION_COLUMNS[:-1])
+    empty = pl.DataFrame(schema={c: pl.String for c in QUOTE_EXCLUSION_COLUMNS})
+    if quotes.is_empty():
+        return quotes, empty
+    market_type = pl.col("market_type").cast(pl.String)
+    prop_type = pl.col("prop_type").cast(pl.String)
+    line = pl.col("line_value").cast(pl.Float64)
+    milestone = market_type == MarketType.MILESTONE.value
+    reason = (
+        pl.when(~market_type.is_in(sorted(_SUPPORTED_MARKET_TYPES)) | market_type.is_null())
+        .then(pl.lit(EXCLUDED_UNSUPPORTED_MARKET_TYPE))
+        .when(~prop_type.is_in(_KNOWN_PROP_TYPES) | prop_type.is_null())
+        .then(pl.lit(EXCLUDED_UNSUPPORTED_PROP_TYPE))
+        .when(milestone & ~prop_type.is_in(_SUPPORTED_MILESTONE_PROPS))
+        .then(pl.lit(EXCLUDED_UNSUPPORTED_COUNT_MILESTONE))
+        .when(milestone & line.is_not_null() & (line != _BINARY_MILESTONE_LINE))
+        .then(pl.lit(EXCLUDED_UNSUPPORTED_COUNT_MILESTONE))
+        .otherwise(pl.lit(None, dtype=pl.String))
+    )
+    tagged = quotes.with_columns(reason.alias("__exclusion_reason"))
+    excluded = (
+        tagged.filter(pl.col("__exclusion_reason").is_not_null())
+        .select([pl.col(c).cast(pl.String) for c in columns]
+                + [pl.col("__exclusion_reason").alias("reason")])
+    )
+    supported = (
+        tagged.filter(pl.col("__exclusion_reason").is_null())
+        .drop("__exclusion_reason")
+        .with_columns(
+            pl.when(milestone).then(pl.lit(None)).otherwise(pl.col("line_value"))
+            .alias("line_value")
+        )
+    )
+    return supported, excluded
+
+
+def quote_exclusion_counts(excluded: pl.DataFrame) -> list[dict[str, Any]]:
+    """Exclusion counts by book / prop_type / market_type / reason."""
+    if excluded.is_empty():
+        return []
+    return (
+        excluded.group_by("vendor", "prop_type", "market_type", "reason").len("count")
+        .rename({"vendor": "book"})
+        .sort("book", "prop_type", "market_type", "reason")
+        .to_dicts()
+    )
 
 
 def prediction_id(*parts: object) -> str:

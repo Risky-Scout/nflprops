@@ -55,6 +55,10 @@ from nflprops.domain.model_profile import (
     parse_model_profile,
     profile_base_model_version,
 )
+from nflprops.market.current_pricing import (
+    partition_supported_quotes,
+    quote_exclusion_counts,
+)
 from nflprops.market.odds import (
     american_to_decimal,
     expected_value,
@@ -67,7 +71,7 @@ from nflprops.pipelines.pregame import (
     state_configs_from_app_config,
 )
 from nflprops.simulation.game import GameSimulationResult
-from nflprops.simulation.props import prop_values
+from nflprops.simulation.props import AT_LEAST_HIT_PROPS, prop_values
 
 PRODUCTION_N_DRAWS = 20_000
 CHECKPOINT_NAME = "ROUND4_SHADOW_CURRENT"
@@ -82,31 +86,19 @@ NOT_EVALUABLE = "NOT_EVALUABLE"
 #: Every prop the joint calibrator reweights coherently; summaries are kept
 #: for the directly-labeled set plus the anytime-TD product books quote.
 SUMMARY_PROPS: tuple[str, ...] = (*sorted(DIRECTLY_LABELED_PROP_TYPES), PropType.ANYTIME_TD.value)
-_HIT_PROPS = frozenset({PropType.ANYTIME_TD, PropType.ANYTIME_TD_1H, PropType.ANYTIME_TD_1Q,
-                        PropType.ANYTIME_TD_2H, PropType.FIRST_TD})
-
-
-#: Milestone markets the certified pricer can price (an AT_LEAST hit
-#: distribution exists). It raises -- failing the whole game closed -- on any
-#: other milestone (count-style ladders such as `receiving_yards 60+`).
-PRICEABLE_MILESTONE_PROPS = frozenset(p.value for p in _HIT_PROPS)
-EXCLUDED_COUNT_MILESTONE = "EXCLUDED_UNSUPPORTED_COUNT_MILESTONE"
+_HIT_PROPS = AT_LEAST_HIT_PROPS
 
 
 def split_priceable_quotes(quotes: pl.DataFrame) -> tuple[pl.DataFrame, dict[str, int]]:
     """Quotes the certified pricer supports, and an explicit count of every
-    excluded quote by reason (never a silent drop)."""
-    if quotes.is_empty():
-        return quotes, {}
-    unsupported = (pl.col("market_type") == "milestone") & ~pl.col("prop_type").is_in(
-        sorted(PRICEABLE_MILESTONE_PROPS))
-    excluded = quotes.filter(unsupported)
-    counts = (
-        {f"{EXCLUDED_COUNT_MILESTONE}:{r['vendor']}:{r['prop_type']}": int(r["len"])
-         for r in excluded.group_by("vendor", "prop_type").len().iter_rows(named=True)}
-        if not excluded.is_empty() else {}
-    )
-    return quotes.filter(~unsupported), counts
+    excluded quote by reason / book / prop (never a silent drop) -- the same
+    partition the official checkpoint flow applies."""
+    supported, excluded = partition_supported_quotes(quotes)
+    counts = {
+        f"{r['reason']}:{r['book']}:{r['prop_type']}:{r['market_type']}": int(r["count"])
+        for r in quote_exclusion_counts(excluded)
+    }
+    return supported, counts
 
 
 class ForecastError(Exception):
