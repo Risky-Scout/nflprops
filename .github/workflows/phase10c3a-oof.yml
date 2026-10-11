@@ -45,6 +45,14 @@ env:
   MODE: production
   # Same numerical stack the runner-equivalence proof ran on.
   PINNED_STACK: "polars==1.44.2 numpy==2.4.6 scipy==1.18.1"
+  # Hardware-independent numerics: OpenBLAS otherwise picks kernels per
+  # host CPU (the ubuntu-24.04 pool mixes Intel and AMD), and the certified
+  # fold theta then differs from a re-fit on another host in the last bits
+  # (~1e-7; run 38106176358 vs 38115470789). One fixed AVX2 kernel set and
+  # one thread on every job makes the estimator bit-reproducible.
+  OPENBLAS_CORETYPE: Haswell
+  OPENBLAS_NUM_THREADS: "1"
+  OMP_NUM_THREADS: "1"
 
 jobs:
   data-root:
@@ -60,6 +68,12 @@ jobs:
 
       - name: Install project
         run: pip install -e ".[dev]" $PINNED_STACK
+
+      - name: Record host CPU and BLAS
+        run: |
+          lscpu | grep -E "Model name|Vendor ID|Flags" | cut -c1-120
+          python -c "import numpy; numpy.show_config()" | grep -iA3 "blas" | head -20
+
 
       - name: Download public canonical snapshot
         env:
@@ -148,6 +162,12 @@ jobs:
       - name: Install project
         run: pip install -e ".[dev]" $PINNED_STACK
 
+      - name: Record host CPU and BLAS
+        run: |
+          lscpu | grep -E "Model name|Vendor ID|Flags" | cut -c1-120
+          python -c "import numpy; numpy.show_config()" | grep -iA3 "blas" | head -20
+
+
       - name: Download verified data root
         uses: actions/download-artifact@v4
         with:
@@ -191,6 +211,12 @@ jobs:
 
       - name: Install project
         run: pip install -e ".[dev]" $PINNED_STACK
+
+      - name: Record host CPU and BLAS
+        run: |
+          lscpu | grep -E "Model name|Vendor ID|Flags" | cut -c1-120
+          python -c "import numpy; numpy.show_config()" | grep -iA3 "blas" | head -20
+
 
       - name: Download verified data root
         uses: actions/download-artifact@v4
