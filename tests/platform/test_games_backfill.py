@@ -289,3 +289,49 @@ def test_ops_exposes_a_guarded_dry_run_by_default_operation() -> None:
     assert "4th argument must be the literal 'apply'" in block
     assert block.count("--apply") == 1
     assert "^[0-9a-f-]{36}(,[0-9a-f-]{36})*$" in block
+
+
+def test_multi_season_type_request_echo_does_not_mistype_regular_games(tmp_path: Path) -> None:
+    """Runtime/ingest fetches request `season_type=[2, 3]`; the raw store
+    records `dict(params)`, i.e. the scalar 3. The record's own
+    `postseason` flag decides the season type, so the regular-season games
+    of such a receipt are still restored (and its postseason game is not)."""
+    raw_root = tmp_path / "raw"
+    page = [_game(gid, wk) for gid, wk in W1_W2.items()]
+    page.append(dict(_game(999, 1), postseason=True))
+    _write_receipt(raw_root, page, FIRST, season_type=3)
+    warehouse = Warehouse(tmp_path / "canonical")
+    warehouse.write("games", pl.DataFrame({
+        "canonical_game_id": [_cid(W3)], "season": [SEASON], "week": [3],
+        "available_at": [AS_OF], "ingested_at": [AS_OF], "available_at_is_estimated": [False],
+        "date": [datetime(2026, 9, 27, 17, tzinfo=UTC)],
+    }))
+    expected = tuple(sorted(_cid(g) for g in W1_W2))
+    plan = plan_games_backfill(warehouse, raw_root, season=SEASON, weeks=(1, 2),
+                               expected_game_ids=expected)
+    assert plan.rows_to_write == 4
+    assert set(plan.rows["season_type"].to_list()) == {2}
+
+
+def test_postseason_mode_restores_only_postseason_games(tmp_path: Path) -> None:
+    """Prior-season outcome history includes postseason games; their metadata
+    is restored by an explicit postseason plan (postseason week numbers
+    overlap regular-season ones), never mixed into a regular-season plan."""
+    raw_root = tmp_path / "raw"
+    playoff = dict(_game(901, 1), postseason=True)
+    _write_receipt(raw_root, [_game(101, 1), playoff], FIRST, season_type=3)
+    warehouse = Warehouse(tmp_path / "canonical")
+    lock = tmp_path / "writer.lock"
+    regular = apply_games_backfill(warehouse, raw_root, season=SEASON, weeks=(1,),
+                                   expected_game_ids=(_cid(101),), lock_path=lock, now=NOW)
+    post = apply_games_backfill(warehouse, raw_root, season=SEASON, weeks=(1,),
+                                expected_game_ids=(_cid(901),), lock_path=lock, now=NOW,
+                                postseason=True)
+    assert regular["rows_to_write"] == 1 and post["rows_to_write"] == 1
+    games = warehouse.read("games").sort("canonical_game_id")
+    assert dict(zip(games["canonical_game_id"], games["season_type"], strict=True)) == {
+        _cid(101): 2, _cid(901): 3}
+    assert not games["available_at_is_estimated"].any()
+    with pytest.raises(GamesBackfillError):  # a playoff id is never in a regular plan
+        plan_games_backfill(warehouse, raw_root, season=SEASON, weeks=(1,),
+                            expected_game_ids=(_cid(101), _cid(901)))

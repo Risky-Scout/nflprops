@@ -823,6 +823,9 @@ def games_backfill(
     apply: bool = typer.Option(
         False, "--apply", help="Write (writer lock). Default: dry-run, read-only."
     ),
+    postseason: bool = typer.Option(
+        False, "--postseason", help="Restore postseason games (postseason week numbers)."
+    ),
 ) -> None:
     """PR #21: restore missing `games` rows from GENUINE stored BDL
     BDL games-endpoint receipts (`platform.games_backfill`): receipt-time
@@ -847,11 +850,12 @@ def games_backfill(
             summary = apply_games_backfill(
                 warehouse, layout.raw_root, season=season, weeks=week_tuple,
                 expected_game_ids=ids, lock_path=layout.writer_lock, now=datetime.now(UTC),
+                postseason=postseason,
             )
         else:
             plan = plan_games_backfill(
                 warehouse, layout.raw_root, season=season, weeks=week_tuple,
-                expected_game_ids=ids,
+                expected_game_ids=ids, postseason=postseason,
             )
             summary = {"applied": False, "dry_run": True, **plan.summary()}
     except (GamesBackfillError, WriterLockError) as exc:

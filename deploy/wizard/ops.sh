@@ -60,7 +60,7 @@
 #   ingest-stats SEASON [WEEKS]
 #                          BLOCK 4: append final-game outcome versions
 #                          (genuine receipt time; never fabricated PIT)
-#   games-backfill SEASON WEEKS EXPECTED_IDS [apply]
+#   games-backfill SEASON WEEKS EXPECTED_IDS [apply] [postseason]
 #                          PR #21: restore missing games rows from genuine
 #                          stored BDL games-endpoint receipts (receipt-time PIT
 #                          only, exact expected-ID guard, idempotent).
@@ -576,18 +576,25 @@ main() {
       fi
       ;;
     games-backfill)
-      { [ "$#" -eq 3 ] || [ "$#" -eq 4 ]; } || die "games-backfill needs SEASON WEEKS EXPECTED_IDS [apply]"
+      { [ "$#" -ge 3 ] && [ "$#" -le 5 ]; } || die "games-backfill needs SEASON WEEKS EXPECTED_IDS [apply] [postseason]"
       [[ "$1" =~ ^20[0-9]{2}$ ]] || die "season format"
       [[ "$2" =~ ^[0-9]{1,2}(,[0-9]{1,2})*$ ]] || die "weeks format"
       [[ "$3" =~ ^[0-9a-f-]{36}(,[0-9a-f-]{36})*$ ]] || die "expected ids format"
-      if [ "$#" -eq 4 ]; then
-        [ "$4" = "apply" ] || die "4th argument must be the literal 'apply'"
-        runtime_python -m nflprops.platform.wizard_runtime games-backfill \
-          --season "$1" --weeks "$2" --expected-ids "$3" --apply || die "games-backfill failed"
-      else
-        runtime_python -m nflprops.platform.wizard_runtime games-backfill \
-          --season "$1" --weeks "$2" --expected-ids "$3" || die "games-backfill dry-run failed"
-      fi
+      backfill_flags=()
+      backfill_apply=""
+      for token in "${@:4}"; do
+        if [ "$token" = "apply" ]; then
+          backfill_apply=1
+        elif [ "$token" = "postseason" ]; then
+          backfill_flags+=(--postseason)
+        else
+          die "4th argument must be the literal 'apply' (or 'postseason')"
+        fi
+      done
+      [ -n "$backfill_apply" ] && backfill_flags+=(--apply)
+      runtime_python -m nflprops.platform.wizard_runtime games-backfill \
+        --season "$1" --weeks "$2" --expected-ids "$3" "${backfill_flags[@]}" \
+        || die "games-backfill failed"
       ;;
     *) die "unknown operation $op" ;;
   esac

@@ -61,6 +61,7 @@ GAMES_RECEIPT_DIR = "balldontlie/nfl__v1__games"
 GAMES_KEY = ("canonical_game_id", "available_at")
 GAMES_SORT = ("date", "available_at")
 REGULAR_SEASON_TYPE = 2
+POSTSEASON_TYPE = 3
 
 
 class GamesBackfillError(NflpropsError):
@@ -182,13 +183,6 @@ def iter_game_receipts(raw_root: Path) -> Iterator[GameReceipt]:
         )
 
 
-def _season_type_hint(params: dict[str, Any]) -> int | None:
-    value = params.get("season_type", params.get("season_type[]"))
-    if isinstance(value, list):
-        return int(value[0]) if len(value) == 1 else None
-    return int(value) if value is not None else None
-
-
 def _existing_games(warehouse: Warehouse, ids: tuple[str, ...]) -> pl.DataFrame:
     if not warehouse.exists("games"):
         return pl.DataFrame()
@@ -202,8 +196,15 @@ def plan_games_backfill(
     season: int,
     weeks: tuple[int, ...],
     expected_game_ids: tuple[str, ...],
+    postseason: bool = False,
 ) -> GamesBackfillPlan:
-    """Read-only. The exact rows `apply_games_backfill` would append."""
+    """Read-only. The exact rows `apply_games_backfill` would append.
+
+    Regular-season games by default; `postseason=True` restores ONLY
+    postseason games instead (BDL postseason week numbers overlap the
+    regular-season ones, so a plan is always one season type). Prior-season
+    outcome history includes postseason games, whose metadata the state
+    chronology needs just the same."""
     expected = tuple(sorted(set(expected_game_ids)))
     if not expected or len(expected) != len(expected_game_ids):
         raise GamesBackfillError("expected_game_ids must be a non-empty list of distinct ids")
@@ -216,7 +217,11 @@ def plan_games_backfill(
     games = []
     for receipt in iter_game_receipts(raw_root):
         scanned += 1
-        hint = _season_type_hint(receipt.request_params)
+        # The season type comes from each record's own `postseason` flag
+        # (the mapper's default), never from the stored request echo: the
+        # raw store records `dict(params)`, so a multi-valued
+        # `season_type=[2, 3]` request is stored as the scalar 3 and would
+        # mistype every regular-season game.
         ctx = MappingContext(
             ingested_at=receipt.received_at,
             available_at=receipt.received_at,
@@ -225,10 +230,11 @@ def plan_games_backfill(
         hit = False
         for record in receipt.records:
             raw = RawNFLGame.model_validate(record)
-            if raw.season != season or raw.week not in week_set or raw.postseason:
+            if (raw.season != season or raw.week not in week_set
+                    or bool(raw.postseason) is not postseason):
                 continue
-            game = map_game(raw, ctx=ctx, season_type_hint=hint)
-            if int(game.season_type) != REGULAR_SEASON_TYPE:
+            game = map_game(raw, ctx=ctx)
+            if int(game.season_type) != (POSTSEASON_TYPE if postseason else REGULAR_SEASON_TYPE):
                 continue
             games.append(game)
             hit = True
@@ -285,13 +291,14 @@ def apply_games_backfill(
     lock_path: Path,
     now: datetime,
     lock_timeout_seconds: float = 60.0,
+    postseason: bool = False,
 ) -> dict[str, Any]:
     """Re-plan under the writer lock (so the guard sees the table it
     writes), then append only the rows not already present."""
     with WriterLock(lock_path, timeout_seconds=lock_timeout_seconds):
         plan = plan_games_backfill(
             warehouse, raw_root, season=season, weeks=weeks,
-            expected_game_ids=expected_game_ids,
+            expected_game_ids=expected_game_ids, postseason=postseason,
         )
         latest = plan.rows["available_at"].max()
         if not isinstance(latest, datetime) or latest > now:
