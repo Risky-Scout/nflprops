@@ -813,6 +813,53 @@ def outcome_report_cmd(
     typer.echo(json.dumps(report, indent=2, sort_keys=True, default=str))
 
 
+@app.command("games-backfill")
+def games_backfill(
+    season: int = typer.Option(..., help="Season, e.g. 2026."),
+    weeks: str = typer.Option(..., help="Comma-separated weeks, e.g. 1,2."),
+    expected_ids: str = typer.Option(
+        ..., help="Comma-separated EXACT canonical game ids the receipts must restore."
+    ),
+    apply: bool = typer.Option(
+        False, "--apply", help="Write (writer lock). Default: dry-run, read-only."
+    ),
+) -> None:
+    """PR #21: restore missing `games` rows from GENUINE stored BDL
+    BDL games-endpoint receipts (`platform.games_backfill`): receipt-time
+    availability only, exact expected-ID guard, idempotent, never replaces
+    a row, never touches an immutable snapshot. DRY-RUN unless --apply."""
+    import json
+    from datetime import UTC, datetime
+
+    from nflprops.data.warehouse import Warehouse
+    from nflprops.platform.games_backfill import (
+        GamesBackfillError,
+        apply_games_backfill,
+        plan_games_backfill,
+    )
+
+    ids = tuple(part.strip() for part in expected_ids.split(",") if part.strip())
+    week_tuple = tuple(int(part) for part in weeks.split(",") if part.strip())
+    layout = _layout()
+    warehouse = Warehouse(layout.warehouse_root)
+    try:
+        if apply:
+            summary = apply_games_backfill(
+                warehouse, layout.raw_root, season=season, weeks=week_tuple,
+                expected_game_ids=ids, lock_path=layout.writer_lock, now=datetime.now(UTC),
+            )
+        else:
+            plan = plan_games_backfill(
+                warehouse, layout.raw_root, season=season, weeks=week_tuple,
+                expected_game_ids=ids,
+            )
+            summary = {"applied": False, "dry_run": True, **plan.summary()}
+    except (GamesBackfillError, WriterLockError) as exc:
+        typer.echo(f"FAILED: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(summary, indent=2, sort_keys=True))
+
+
 @app.command("ingest-stats")
 def ingest_stats(
     seasons: str = typer.Option(..., help="Comma-separated seasons, e.g. 2024,2025,2026."),
