@@ -64,6 +64,13 @@ def _props(cycle: int, *, legacy: bool) -> pl.DataFrame:
     return frame
 
 
+@pytest.fixture(autouse=True)
+def _fresh_manifest_cache() -> None:
+    """These tests observe the manifest's own reads/page-cache calls, so
+    every build must really compute (not hit the per-process memo)."""
+    manifest_module._manifest_cache.clear()
+
+
 @pytest.fixture(scope="module")
 def warehouse(tmp_path_factory: pytest.TempPathFactory) -> Warehouse:
     wh = Warehouse(tmp_path_factory.mktemp("bounded") / "canonical")
@@ -225,3 +232,25 @@ def test_page_cache_release_is_advisory_only(
         refused = build_checkpoint_manifest(warehouse, game_id="g-beta", scheduled_as_of=cutoff)
     assert released.as_dict() == plain.as_dict() == refused.as_dict()
     page_cache.drop_file_pages(warehouse.root / "does-not-exist.parquet")  # ignored
+
+
+def test_manifest_memo_reuses_only_while_every_input_file_is_unchanged(
+    warehouse: Warehouse, tmp_path: Path
+) -> None:
+    """A preparation pass builds a slot's manifest at claim and re-checks it
+    before publishing: unchanged inputs reuse the identical manifest; any
+    appended or rewritten input file recomputes from the data as it is now."""
+    import shutil
+
+    copy = Warehouse(tmp_path / "copy")
+    shutil.copytree(warehouse.root, copy.root, dirs_exist_ok=True)
+    cutoff = T0 + timedelta(minutes=37 * 7 + 1)
+    first = build_checkpoint_manifest(copy, game_id="g-beta", scheduled_as_of=cutoff)
+    assert build_checkpoint_manifest(copy, game_id="g-beta", scheduled_as_of=cutoff) is first
+    games = copy.read("games")
+    copy.write("games", games.with_columns(pl.lit("changed").alias("venue")))
+    again = build_checkpoint_manifest(copy, game_id="g-beta", scheduled_as_of=cutoff)
+    assert again is not first
+    manifest_module._manifest_cache.clear()
+    assert build_checkpoint_manifest(
+        copy, game_id="g-beta", scheduled_as_of=cutoff).as_dict() == again.as_dict()

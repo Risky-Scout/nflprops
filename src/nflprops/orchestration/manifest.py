@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -43,7 +44,15 @@ import polars as pl
 from nflprops.collection.models import RESOURCE_RUNS_TABLE
 from nflprops.data.injury_availability import injury_feed_available_at
 from nflprops.data.outcome_versions import as_known_at
-from nflprops.data.warehouse import Warehouse, read_table_scoped
+from nflprops.data.page_cache import drop_file_pages
+from nflprops.data.warehouse import (
+    Warehouse,
+    _owning_strings,
+    _part_name,
+    _parts_dir,
+    read_table_scoped,
+    table_files,
+)
 from nflprops.domain.hashing import hash_payload
 from nflprops.features.asof import filter_pit
 
@@ -275,6 +284,33 @@ def _streamed_player_props_component(
     if root is None:
         return None
     where = (pl.col("canonical_game_id") == game_id) & (pl.col("available_at") <= scheduled_as_of)
+    with tempfile.TemporaryDirectory(dir=root.parent, prefix=".manifest-scratch-") as scratch:
+        spool = Path(scratch)
+        try:
+            _spool_scoped_files(root, spool, _PLAYER_PROPS_TABLE, where)
+        except (TypeError, pl.exceptions.ColumnNotFoundError, pl.exceptions.SchemaError):
+            return None
+        return _player_props_component_from(spool, where)
+
+
+def _spool_scoped_files(root: Path, spool: Path, table: str, where: pl.Expr) -> None:
+    """ONE pass over `table`'s live files: each file's rows matching `where`
+    (exactly `read_table_scoped`'s per-file step, empty results included so
+    every file's schema still joins the union) written to `spool` as one
+    part per source file, in the same logical order. Every later scoped
+    read of `spool` equals the same scoped read of `root` restricted to
+    `where`, but scans only the game's rows instead of the whole history."""
+    parts = _parts_dir(spool, table)
+    parts.mkdir(parents=True)
+    for seq, path in enumerate(table_files(root, table), start=1):
+        lazy = pl.scan_parquet(path, low_memory=True).filter(where)
+        frame = _owning_strings(lazy).collect(engine="streaming")
+        drop_file_pages(path)
+        frame.write_parquet(parts / _part_name(seq, seq), compression="zstd", statistics=True)
+        del frame
+
+
+def _player_props_component_from(root: Path, where: pl.Expr) -> ManifestComponent | None:
     try:
         players = read_table_scoped(
             root, _PLAYER_PROPS_TABLE, where=where, columns=["canonical_player_id"]
@@ -328,7 +364,149 @@ def _streamed_player_props_component(
     )
 
 
+_ROSTER_TABLE = "roster_snapshots"
+_ROSTER_SORT_KEYS = ["canonical_team_id", "canonical_player_id", "available_at"]
+
+
+def _streamed_roster_component(
+    warehouse: Warehouse, *, team_ids: list[str], scheduled_as_of: datetime
+) -> tuple[ManifestComponent, set[str]] | None:
+    """The `rosters` component -- byte-identical to `_content_component` over
+    both teams' whole pre-cutoff roster history -- and that history's
+    distinct player ids, without holding it at once (two teams' versioned
+    snapshots of every collection cycle: ~195k rows at Wizard's volume).
+
+    One pass spools the two teams' rows; they are then hashed in ascending
+    (team, player) batches of at most `_PLAYER_PROPS_BATCH_ROWS` rows (a
+    batch never spans a team), each sorted by the component's own keys,
+    into one running digest -- the concatenation of the batches IS the
+    single sort's order. Returns None (the caller takes the original
+    whole-frame path) whenever that is not certain: not a Parquet
+    `Warehouse`, no rows, a missing filtered column, a null team/player
+    id, or a tie on the sort keys."""
+    root = _parquet_root(warehouse)
+    if root is None:
+        return None
+    where = pl.col("canonical_team_id").is_in(team_ids) & (
+        pl.col("available_at") <= scheduled_as_of
+    )
+    with tempfile.TemporaryDirectory(dir=root.parent, prefix=".manifest-scratch-") as scratch:
+        spool = Path(scratch)
+        try:
+            _spool_scoped_files(root, spool, _ROSTER_TABLE, where)
+            keys = read_table_scoped(
+                spool, _ROSTER_TABLE, where=where,
+                columns=["canonical_team_id", "canonical_player_id"],
+            )
+            if keys.is_empty() or keys.null_count().sum_horizontal().item():
+                return None
+            counts = (
+                keys.group_by("canonical_team_id", "canonical_player_id").len()
+                .sort("canonical_team_id", "canonical_player_id")
+            )
+            player_ids = {str(p) for p in keys["canonical_player_id"].unique().to_list()}
+            expected_rows = keys.height
+            del keys
+            batches: list[tuple[str, list[str]]] = []
+            batch_rows = 0
+            for team, player, count in counts.iter_rows():
+                if not batches or batches[-1][0] != team or (
+                    batch_rows + count > _PLAYER_PROPS_BATCH_ROWS
+                ):
+                    batches.append((team, []))
+                    batch_rows = 0
+                batches[-1][1].append(player)
+                batch_rows += count
+            del counts
+
+            rows = _RowsDigest()
+            row_count = 0
+            bounds: list[pl.DataFrame] = []
+            for team, players in batches:
+                frame = read_table_scoped(
+                    spool, _ROSTER_TABLE,
+                    where=where & (pl.col("canonical_team_id") == team)
+                    & pl.col("canonical_player_id").is_in(players),
+                )
+                if frame.select(_ROSTER_SORT_KEYS).is_duplicated().any():
+                    return None
+                rows.update(frame.sort(_ROSTER_SORT_KEYS))
+                row_count += frame.height
+                bounds.append(frame.select(pl.col("available_at").min().alias("low"),
+                                           pl.col("available_at").max().alias("high")))
+                del frame
+        except (TypeError, pl.exceptions.ColumnNotFoundError, pl.exceptions.SchemaError):
+            return None
+    if row_count != expected_rows:
+        return None
+    combined = pl.concat(bounds)
+    return (
+        ManifestComponent(
+            row_count=row_count,
+            content_sha256=rows.hexdigest(),
+            min_available_at=_iso_or_none(combined["low"].min()),
+            max_available_at=_iso_or_none(combined["high"].max()),
+        ),
+        player_ids,
+    )
+
+
+#: Every table `build_checkpoint_manifest` reads.
+_MANIFEST_INPUT_TABLES = (
+    "games", RESOURCE_RUNS_TABLE, "player_game_stats", "team_game_stats", "roster_snapshots",
+    "injury_snapshots", "game_odds_snapshots", _PLAYER_PROPS_TABLE, "players",
+)
+_MANIFEST_CACHE_SIZE = 16
+_manifest_cache: dict[tuple[object, ...], CheckpointManifest] = {}
+
+
+def _input_fingerprint(root: Path) -> tuple[tuple[str, int, int, int], ...]:
+    """Every input file's (path, inode, size, mtime_ns): any append, rewrite
+    or replacement of a manifest input changes it."""
+    entries = []
+    for table in _MANIFEST_INPUT_TABLES:
+        for path in table_files(root, table):
+            stat = path.stat()
+            entries.append((str(path.relative_to(root)), stat.st_ino, stat.st_size,
+                            stat.st_mtime_ns))
+    return tuple(entries)
+
+
 def build_checkpoint_manifest(
+    warehouse: Warehouse,
+    *,
+    game_id: str,
+    scheduled_as_of: datetime,
+    market_mode: str = "live",
+) -> CheckpointManifest:
+    """The real PIT data manifest for one official checkpoint
+    (`_build_checkpoint_manifest`), memoized per process on the exact state
+    of every input file: a preparation pass computes a slot's manifest at
+    claim and again to re-check it before publishing; when no input file
+    changed in between, the second is the identical result, not a second
+    full scan of the live history. Any change to any input file (append,
+    rewrite, replacement) misses the cache and recomputes, so the re-check
+    still compares against the data as it is now."""
+    root = _parquet_root(warehouse)
+    if root is None:
+        return _build_checkpoint_manifest(
+            warehouse, game_id=game_id, scheduled_as_of=scheduled_as_of, market_mode=market_mode
+        )
+    key = (str(root.resolve()), game_id, scheduled_as_of, market_mode, _input_fingerprint(root))
+    cached = _manifest_cache.get(key)
+    if cached is not None:
+        return cached
+    manifest = _build_checkpoint_manifest(
+        warehouse, game_id=game_id, scheduled_as_of=scheduled_as_of, market_mode=market_mode
+    )
+    if _input_fingerprint(root) == key[-1]:  # nothing changed while it was computed
+        if len(_manifest_cache) >= _MANIFEST_CACHE_SIZE:
+            _manifest_cache.pop(next(iter(_manifest_cache)))
+        _manifest_cache[key] = manifest
+    return manifest
+
+
+def _build_checkpoint_manifest(
     warehouse: Warehouse,
     *,
     game_id: str,
@@ -393,8 +571,13 @@ def build_checkpoint_manifest(
         "team_game_stats",
         scheduled_as_of,
     )
-    roster = _read_team_scoped("roster_snapshots")
-    roster_scoped = _scoped_by_team(roster)
+    streamed_roster = (
+        _streamed_roster_component(
+            warehouse, team_ids=sorted(team_ids), scheduled_as_of=scheduled_as_of
+        )
+        if team_ids
+        else None
+    )
 
     player_stats_component = _content_component(
         player_stats_scoped, sort_keys=["canonical_game_id", "canonical_player_id"]
@@ -402,12 +585,16 @@ def build_checkpoint_manifest(
     team_stats_component = _content_component(
         team_stats_scoped, sort_keys=["canonical_game_id", "canonical_team_id"]
     )
-    roster_component = _content_component(
-        roster_scoped, sort_keys=["canonical_team_id", "canonical_player_id", "available_at"]
-    )
+    if streamed_roster is None:
+        roster_scoped = _scoped_by_team(_read_team_scoped("roster_snapshots"))
+        roster_component = _content_component(roster_scoped, sort_keys=_ROSTER_SORT_KEYS)
+        roster_player_ids = _relevant_player_ids(roster_scoped)
+        del roster_scoped
+    else:
+        roster_component, roster_player_ids = streamed_roster
 
-    player_ids = _relevant_player_ids(player_stats_scoped, roster_scoped)
-    del player_stats_scoped, team_stats_scoped, roster, roster_scoped
+    player_ids = _relevant_player_ids(player_stats_scoped) | roster_player_ids
+    del player_stats_scoped, team_stats_scoped
 
     injuries = (
         _read_scoped(
