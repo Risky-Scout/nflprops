@@ -254,3 +254,56 @@ def test_manifest_memo_reuses_only_while_every_input_file_is_unchanged(
     manifest_module._manifest_cache.clear()
     assert build_checkpoint_manifest(
         copy, game_id="g-beta", scheduled_as_of=cutoff).as_dict() == again.as_dict()
+
+
+def test_game_index_skips_files_without_the_game_exactly(tmp_path: Path) -> None:
+    """Production: prop history is stored by receipt time, so most files hold
+    other games' quotes only. Files whose per-file game index lacks the
+    target game are not scanned; the component still equals the original
+    whole-frame definition -- including a column that only a skipped file
+    carries (its schema joins the union exactly as its empty scoped read
+    did)."""
+    from nflprops.data.warehouse import scan_index_root, table_files
+
+    wh = Warehouse(tmp_path / "state" / "canonical")
+    table = "player_prop_snapshots"
+    wh.append(table, _props(1, legacy=False), key=PROP_KEY, sort_by=["collector_received_at"])
+    others = _props(2, legacy=False).filter(pl.col("canonical_game_id") != "g-beta").with_columns(
+        pl.lit("x").alias("only_in_other_games"))
+    wh.append(table, others, key=PROP_KEY, sort_by=["collector_received_at"])
+    wh.append(table, _props(3, legacy=False), key=PROP_KEY, sort_by=["collector_received_at"])
+    cutoff = T0 + timedelta(days=2)
+    where = (pl.col("canonical_game_id") == "g-beta") & (pl.col("available_at") <= cutoff)
+    reference = read_table(wh.root, table, where=where)
+    assert "only_in_other_games" in reference.columns  # the skipped file's column
+    expected = manifest_module._content_component(
+        reference, sort_keys=manifest_module._PLAYER_PROPS_SORT_KEYS)
+    got = manifest_module._streamed_player_props_component(
+        wh, game_id="g-beta", scheduled_as_of=cutoff)
+    assert got == expected
+
+    index_dir = scan_index_root(wh.root) / table
+    files = table_files(wh.root, table)
+    assert len(list(index_dir.glob("*.json"))) == len(files)
+    assert not (wh.root / ".scan-index").exists()  # never inside the warehouse/snapshots
+
+    # compaction/replacement: entries of files that no longer exist are pruned
+    wh.write(table, read_table(wh.root, table))
+    again = manifest_module._streamed_player_props_component(
+        wh, game_id="g-beta", scheduled_as_of=cutoff)
+    assert again == expected
+    assert len(list(index_dir.glob("*.json"))) == len(table_files(wh.root, table)) == 1
+
+
+def test_file_game_index_recomputes_for_a_rewritten_file(tmp_path: Path) -> None:
+    from nflprops.data.warehouse import file_game_ids
+
+    path = tmp_path / "f.parquet"
+    pl.DataFrame({"canonical_game_id": ["a", None]}).write_parquet(path)
+    index = tmp_path / "index"
+    assert file_game_ids(path, index_dir=index) == {"a"}
+    assert file_game_ids(path, index_dir=index) == {"a"}  # cached
+    pl.DataFrame({"canonical_game_id": ["b"]}).write_parquet(path)
+    os.utime(path, ns=(1, 1))  # a rewrite changes the (inode/size/mtime) key
+    assert file_game_ids(path, index_dir=index) == {"b"}
+    assert file_game_ids(path, index_dir=None) == {"b"}  # no index dir: computed

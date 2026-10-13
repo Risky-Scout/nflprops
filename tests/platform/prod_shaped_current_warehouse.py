@@ -7,7 +7,8 @@ injury_snapshots ~1.19M, game_odds_snapshots ~188k, collector_resource_runs
 ~31k -- roughly 2.8x the 4.46M-row shape the BLOCK 3 memory gate was built
 on. This reuses that fixture (legacy file + compacted parts + per-cycle
 tail, receipt-time order, 11 simultaneously due T48H slots) at the current
-volume, each due game carrying ~300k pre-cutoff quotes, and inflates the
+volume, each due game carrying ~150k pre-cutoff quotes inside its own
+collection window (the tail of the history), and inflates the
 other per-cycle tables the preparation pass reads the same way
 `prod_shaped_report_warehouse` does. `games` is not inflated: synthetic
 games of the target week would be due checkpoints themselves.
@@ -29,8 +30,10 @@ import prod_shaped_report_warehouse as report_fixture
 import prod_shaped_warehouse
 
 CURRENT_PROP_ROWS = 12_291_130
-#: ~300k pre-cutoff quotes per due game (11 due games).
-CURRENT_DUE_SHARE = 11 * 300_000 / CURRENT_PROP_ROWS
+#: ~150k pre-cutoff quotes per due game (11 due games), all inside the games'
+#: own collection window -- the tail of the history -- as in production
+#: (12.29M rows over ~90 games so far: ~136k per game).
+CURRENT_DUE_SHARE = 11 * 150_000 / CURRENT_PROP_ROWS
 CURRENT_TABLES: dict[str, tuple[int, tuple[str, ...]]] = {
     "roster_snapshots": (3_128_000, ("canonical_player_id",)),
     "injury_snapshots": (1_195_000, ("canonical_player_id", "raw_record_hash")),
@@ -70,7 +73,7 @@ def _spread_like_production(warehouse_root: Path, table: str, real_teams: list[s
 def build(root: Path) -> dict[str, Any]:
     info = prod_shaped_warehouse.build(
         root, prop_rows=CURRENT_PROP_ROWS, extra_seed=report_fixture._seed_injuries_and_odds,
-        due_share=CURRENT_DUE_SHARE,
+        due_share=CURRENT_DUE_SHARE, due_at_tail=True,
     )
     warehouse_root = root / "state" / "canonical"
     now = datetime.fromisoformat(info["now"])

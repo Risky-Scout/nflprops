@@ -187,11 +187,16 @@ def test_sweeper_removes_only_old_abandoned_artifacts(tmp_path: Path) -> None:
     incoming_old.mkdir(parents=True)
     incoming_new = layout.publications / "_incoming" / "bundle-new"
     incoming_new.mkdir(parents=True)
+    spool = warehouse.root.parent / ".manifest-scratch-abc"
+    (spool / "player_prop_snapshots.parts").mkdir(parents=True)
+    index = warehouse.root.parent / ".scan-index" / "player_prop_snapshots"
+    index.mkdir(parents=True)
+    (index / "f.parquet.1.2.3.json").write_text("[]")
     published = layout.checkpoint_requests / "run1"
     published.mkdir()
     (published / "request.json").write_text("{}")
     _age(published / "request.json", timedelta(days=30))
-    for path in (old_tmp, replaced, raw_tmp, pending, staging):
+    for path in (old_tmp, replaced, raw_tmp, pending, staging, spool):
         _age(path, timedelta(hours=2))
     _age(young_tmp, timedelta(minutes=5))
     _age(incoming_old, timedelta(hours=30))
@@ -200,7 +205,8 @@ def test_sweeper_removes_only_old_abandoned_artifacts(tmp_path: Path) -> None:
     result = sweep_orphans(layout, now=NOW)
     removed = set(result.removed)
     assert {str(old_tmp), str(replaced), str(raw_tmp), str(pending), str(staging),
-            str(incoming_old)} == removed
+            str(incoming_old), str(spool)} == removed
+    assert index.exists()  # the regenerable scan index is not an orphan
     assert young_tmp.exists() and incoming_new.exists()
     assert (warehouse.root / "games.parquet").exists() and published.exists()
 

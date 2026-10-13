@@ -101,6 +101,9 @@ def _orphan_candidates(layout: RuntimeLayout) -> Iterator[tuple[Path, timedelta]
             yield path, ORPHAN_MIN_AGE
         for path in warehouse.glob("*.parts.replaced"):
             yield path, ORPHAN_MIN_AGE
+        # Manifest spools (`orchestration.manifest`) of a killed worker.
+        for path in warehouse.parent.glob(".manifest-scratch-*"):
+            yield path, ORPHAN_MIN_AGE
     raw = layout.raw_root
     if raw.exists():
         for path in raw.rglob("*.tmp"):
