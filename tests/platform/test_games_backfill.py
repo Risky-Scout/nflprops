@@ -335,3 +335,18 @@ def test_postseason_mode_restores_only_postseason_games(tmp_path: Path) -> None:
     with pytest.raises(GamesBackfillError):  # a playoff id is never in a regular plan
         plan_games_backfill(warehouse, raw_root, season=SEASON, weeks=(1,),
                             expected_game_ids=(_cid(101), _cid(901)))
+
+
+def test_metadata_report_lists_exact_backfill_arguments(env: dict) -> None:
+    from nflprops.platform.games_backfill import missing_state_game_metadata
+
+    report = missing_state_game_metadata(env["warehouse"], env["raw"], as_of=AS_OF)
+    assert report["missing_state_game_metadata"] == 4 and report["unrestorable"] == []
+    [group] = report["groups"]
+    assert (group["season"], group["postseason"], group["weeks"]) == (SEASON, False, [1, 2])
+    apply_games_backfill(env["warehouse"], env["raw"], season=SEASON,
+                         weeks=tuple(group["weeks"]),
+                         expected_game_ids=tuple(group["expected_ids"].split(",")),
+                         lock_path=env["lock"], now=NOW)
+    after = missing_state_game_metadata(env["warehouse"], env["raw"], as_of=NOW)
+    assert after["missing_state_game_metadata"] == 0 and after["groups"] == []

@@ -308,3 +308,48 @@ def apply_games_backfill(
                 "games", plan.rows, key=list(GAMES_KEY), keep="first", sort_by=list(GAMES_SORT)
             )
     return {"applied": True, **plan.summary()}
+
+
+def missing_state_game_metadata(
+    warehouse: Warehouse, raw_root: Path, *, as_of: datetime
+) -> dict[str, Any]:
+    """READ-ONLY: every game in the PIT-visible outcome history (the state
+    universe the state build reads) with no `games` row visible at `as_of`,
+    grouped as `games-backfill` arguments (season, regular/postseason,
+    weeks, exact ids) from the stored genuine receipts. Ids no receipt
+    describes are listed separately (`unrestorable`)."""
+    def visible(table: str) -> set[str]:
+        if not warehouse.exists(table):
+            return set()
+        frame = warehouse.read(table, where=pl.col("available_at") <= as_of)
+        return set(frame["canonical_game_id"].cast(pl.Utf8).to_list())
+
+    missing = visible("team_game_stats") - visible("games")
+    located: dict[str, tuple[int, bool, int]] = {}
+    if missing:
+        for receipt in iter_game_receipts(raw_root):
+            ctx = MappingContext(ingested_at=receipt.received_at,
+                                 available_at=receipt.received_at,
+                                 available_at_is_estimated=False)
+            for record in receipt.records:
+                raw = RawNFLGame.model_validate(record)
+                if raw.season is None or raw.week is None:
+                    continue
+                cid = str(map_game(raw, ctx=ctx).canonical_game_id)
+                if cid in missing:
+                    located[cid] = (int(raw.season), bool(raw.postseason), int(raw.week))
+    groups: dict[tuple[int, bool], dict[str, set[Any]]] = {}
+    for cid, (season, post, week) in located.items():
+        group = groups.setdefault((season, post), {"weeks": set(), "ids": set()})
+        group["weeks"].add(week)
+        group["ids"].add(cid)
+    return {
+        "as_of": as_of.isoformat(),
+        "missing_state_game_metadata": len(missing),
+        "groups": [
+            {"season": season, "postseason": post, "weeks": sorted(g["weeks"]),
+             "expected_ids": ",".join(sorted(g["ids"])), "count": len(g["ids"])}
+            for (season, post), g in sorted(groups.items())
+        ],
+        "unrestorable": sorted(missing - set(located)),
+    }

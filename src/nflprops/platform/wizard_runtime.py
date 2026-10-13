@@ -864,6 +864,64 @@ def games_backfill(
     typer.echo(json.dumps(summary, indent=2, sort_keys=True))
 
 
+@app.command("games-metadata-report")
+def games_metadata_report() -> None:
+    """READ-ONLY: state games (PIT-visible outcome history) with no `games`
+    metadata row, grouped as exact `games-backfill` arguments."""
+    import json
+    from datetime import UTC, datetime
+
+    from nflprops.data.warehouse import Warehouse
+    from nflprops.platform.games_backfill import (
+        GamesBackfillError,
+        missing_state_game_metadata,
+    )
+
+    layout = _layout()
+    try:
+        report = missing_state_game_metadata(
+            Warehouse(layout.warehouse_root), layout.raw_root, as_of=datetime.now(UTC))
+    except GamesBackfillError as exc:
+        typer.echo(f"FAILED: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(report, indent=2, sort_keys=True))
+
+
+@app.command("champion-install")
+def champion_install(
+    artifact_id: str = typer.Option(..., help="The certified production calibrator id."),
+    apply: bool = typer.Option(
+        False, "--apply", help="Write (writer lock). Default: verify only, read-only."
+    ),
+) -> None:
+    """Install the CERTIFIED production calibrator (a pin in
+    contracts/production_calibrators/certified.json, shipped with this
+    release) into the live registry and promote it to the STRUCTURAL_CORE
+    champion (`calibration.production_install`). Verify-only unless
+    --apply; idempotent; refuses any id that is not certified."""
+    import json
+    from datetime import UTC, datetime
+
+    from nflprops.calibration.production_install import (
+        CalibratorInstallError,
+        install_and_promote,
+    )
+    from nflprops.config import load
+    from nflprops.data.warehouse import Warehouse
+
+    layout = _layout()
+    try:
+        summary = install_and_promote(
+            Warehouse(layout.warehouse_root), calibrator_id=artifact_id,
+            lock_path=layout.writer_lock, now=datetime.now(UTC), apply=apply,
+            model_version=str(load().get_path("model.version")),
+        )
+    except (CalibratorInstallError, WriterLockError, ValueError) as exc:
+        typer.echo(f"FAILED: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(summary, indent=2, sort_keys=True, default=str))
+
+
 @app.command("ingest-stats")
 def ingest_stats(
     seasons: str = typer.Option(..., help="Comma-separated seasons, e.g. 2024,2025,2026."),

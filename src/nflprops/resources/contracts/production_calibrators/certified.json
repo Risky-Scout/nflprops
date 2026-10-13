@@ -24,7 +24,14 @@
       "science_base_sha": "c7e955197bd175cec6c69f25d4a4cb5b9c198753",
       "certification_run_id": "38119578780",
       "fit_run_id": "38127194420",
-      "training_cutoff": "2026-05-26T11:55:00+00:00"
+      "training_cutoff": "2026-05-26T11:55:00+00:00",
+      "registry_rows": {
+        "source": "GitHub Actions run 38127194420 artifact production-calibrator (registry_warehouse/)",
+        "calibration_artifacts.parquet": "c6fc2f405c8ab8545eddaa9584207f95961074a87e571ecce89805f12c872dbd",
+        "calibration_validations.parquet": "c1c42681a9dd793c9fd45f1bfb21a80e597358a7267d4ed01abe0a33031916df",
+        "calibration_lifecycle_events.parquet": "afc1ef1b987ed030f08195e88546f08d68c16cc198d58a49c672f66a01844dfc"
+      },
+      "fit_manifest_sha256": "3e03716ba7e9ca9c8a0c612afd387ece3eeb89d8f984ee7da3b1928c8955f301"
     }
   ]
 }
