@@ -573,7 +573,8 @@ def _build_checkpoint_manifest(
     )
     streamed_roster = (
         _streamed_roster_component(
-            warehouse, team_ids=sorted(team_ids), scheduled_as_of=scheduled_as_of
+            warehouse, team_ids=sorted(t for t in team_ids if t is not None),
+            scheduled_as_of=scheduled_as_of,
         )
         if team_ids
         else None
