@@ -61,14 +61,14 @@ def env_for(root: Path) -> dict[str, Any]:
 
 def _synthetic_props(
     *, due_games: list[str], players: list[str], start: datetime, end: datetime, rows: int,
-    first: int, last: int,
+    first: int, last: int, due_share: float = DUE_GAME_SHARE,
 ) -> pl.LazyFrame:
     """Rows [first, last) of `rows` prop quotes in receipt-time order (row
     index order IS receipt order), games interleaved (one collection cycle
     covers every live game), canonical column schema. Lazy, so the 4.46M-row
     history is streamed to disk, never held at once."""
     older = [f"bdl:game:older{i:03d}" for i in range(OLDER_GAMES)]
-    n_due = int(rows * DUE_GAME_SHARE)
+    n_due = int(rows * due_share)
     span_us = int((end - start).total_seconds() * 1_000_000)
     prop_types = ["passing_yards", "rushing_yards", "receiving_yards", "receptions",
                   "anytime_td", "rushing_attempts", "passing_tds", "interceptions"]
@@ -147,7 +147,8 @@ def _store_like_production(warehouse: Warehouse, synthetic: Any, rows: int) -> d
 
 
 def build(
-    root: Path, *, prop_rows: int = PROD_PROP_ROWS, extra_seed: Any = None
+    root: Path, *, prop_rows: int = PROD_PROP_ROWS, extra_seed: Any = None,
+    due_share: float = DUE_GAME_SHARE,
 ) -> dict[str, Any]:
     """Build the warehouse under `root`; returns (and writes to
     `root/fixture.json`) the `now` at which all 11 T48H slots are due.
@@ -185,7 +186,8 @@ def build(
     players = warehouse.read("roster_snapshots")["canonical_player_id"].unique().sort().to_list()
     def synthetic(first: int, last: int) -> pl.LazyFrame:
         return _synthetic_props(due_games=games, players=players, start=base - 25 * 24 * H,
-                                end=base - M, rows=prop_rows, first=first, last=last)
+                                end=base - M, rows=prop_rows, first=first, last=last,
+                                due_share=due_share)
 
     stored = _store_like_production(warehouse, synthetic, prop_rows)
     info = {"now": (base + 6 * M).isoformat(), "season": SEASON, "week": WEEK, **stored}

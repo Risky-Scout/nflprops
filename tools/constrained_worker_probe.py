@@ -8,6 +8,8 @@ systemd limits (CI only -- `.github/workflows/constrained-worker.yml`).
                                the production thread count, run
                                `prepare_due_checkpoints_in_worker`, and report
                                exit, result, manifest hashes, peak tasks/memory
+    prepare-prod-current <dir> the same at Wizard's 2026-10-13 volume
+                               (12.29M props, 3.13M roster, 1.19M injuries)
     prepare-prod <dir>         build the PRODUCTION-SHAPED warehouse (4.46M
                                player_prop_snapshots rows, legacy file + parts,
                                11 simultaneously due T48H slots)
@@ -202,10 +204,12 @@ RAW_PEAK_CACHE_HEADROOM_BYTES = 32 * 2**20
 PROD_PASSES = 3
 
 
-def prepare_prod(out: Path) -> None:
+def prepare_prod(out: Path, *, current: bool = False) -> None:
+    import prod_shaped_current_warehouse
     import prod_shaped_warehouse
 
-    print(json.dumps(prod_shaped_warehouse.build(out / "prod")))
+    builder = prod_shaped_current_warehouse if current else prod_shaped_warehouse
+    print(json.dumps(builder.build(out / "prod")))
 
 
 def _status_kib(pid: int, field: str) -> int:
@@ -367,8 +371,8 @@ if __name__ == "__main__":
     if command == "prepare":
         prepare(directory)
         raise SystemExit(0)
-    if command == "prepare-prod":
-        prepare_prod(directory)
+    if command in ("prepare-prod", "prepare-prod-current"):
+        prepare_prod(directory, current=command == "prepare-prod-current")
         raise SystemExit(0)
     if command == "run-prod":
         raise SystemExit(run_prod(directory, *(int(a) for a in sys.argv[3:4])))
