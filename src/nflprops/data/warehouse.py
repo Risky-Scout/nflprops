@@ -6,6 +6,7 @@ ordinary Parquet files under data/canonical and DuckDB is used as a query layer.
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 from collections.abc import Iterable, Sequence
@@ -232,6 +233,61 @@ def _owning_strings(lazy: pl.LazyFrame) -> pl.LazyFrame:
     return lazy.with_columns(
         pl.concat_str([pl.col(name), pl.lit("")]).alias(name) for name in strings
     )
+
+
+#: Sidecar per-file game index (CACHE / REGENERABLE): beside -- never inside
+#: -- the warehouse root, so snapshots never carry it.
+SCAN_INDEX_DIR = ".scan-index"
+_GAME_INDEX_COLUMN = "canonical_game_id"
+
+
+def scan_index_root(root: Path) -> Path:
+    return root.parent / SCAN_INDEX_DIR
+
+
+def file_game_ids(path: Path, *, index_dir: Path | None) -> frozenset[str]:
+    """The distinct `canonical_game_id` values stored in ONE immutable
+    Parquet file. Warehouse files are never modified in place (appends add
+    parts; compaction and `write` publish new files), so the answer is cached
+    on disk keyed by the file's (name, inode, size, mtime_ns) and computed at
+    most once per file, from that one column alone (projection pushdown).
+    Nulls are not recorded (an equality filter on a game id never selects
+    them). The cache is advisory: an unreadable or unwritable index just
+    recomputes. Raises like `scan_parquet` when the column is absent."""
+    stat = path.stat()
+    key = f"{path.name}.{stat.st_ino}.{stat.st_size}.{stat.st_mtime_ns}.json"
+    entry = None if index_dir is None else index_dir / key
+    if entry is not None:
+        try:
+            return frozenset(json.loads(entry.read_text()))
+        except (OSError, ValueError):
+            pass
+    ids = (
+        pl.scan_parquet(path, low_memory=True)
+        .select(pl.col(_GAME_INDEX_COLUMN).unique())
+        .collect(engine="streaming")[_GAME_INDEX_COLUMN]
+    )
+    drop_file_pages(path)
+    found = frozenset(str(v) for v in ids.drop_nulls().to_list())
+    if entry is not None:
+        try:
+            entry.parent.mkdir(parents=True, exist_ok=True)
+            tmp = entry.with_suffix(".tmp")
+            tmp.write_text(json.dumps(sorted(found)))
+            tmp.replace(entry)
+        except OSError:
+            pass
+    return found
+
+
+def prune_scan_index(index_dir: Path, live: Iterable[Path]) -> None:
+    """Drop index entries of files that no longer exist (compacted away)."""
+    names = {p.name for p in live}
+    if not index_dir.is_dir():
+        return
+    for entry in index_dir.glob("*.json"):
+        if entry.name.split(".parquet.", 1)[0] + ".parquet" not in names:
+            entry.unlink(missing_ok=True)
 
 
 def read_table_scoped(

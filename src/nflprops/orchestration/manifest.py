@@ -50,7 +50,10 @@ from nflprops.data.warehouse import (
     _owning_strings,
     _part_name,
     _parts_dir,
+    file_game_ids,
+    prune_scan_index,
     read_table_scoped,
+    scan_index_root,
     table_files,
 )
 from nflprops.domain.hashing import hash_payload
@@ -287,14 +290,18 @@ def _streamed_player_props_component(
     with tempfile.TemporaryDirectory(dir=root.parent, prefix=".manifest-scratch-") as scratch:
         spool = Path(scratch)
         try:
-            _spool_scoped_files(root, spool, _PLAYER_PROPS_TABLE, where)
+            _spool_scoped_files(root, spool, _PLAYER_PROPS_TABLE, where, game_id=game_id)
         except (TypeError, pl.exceptions.ColumnNotFoundError, pl.exceptions.SchemaError):
             return None
         return _player_props_component_from(spool, where)
 
 
-def _spool_scoped_files(root: Path, spool: Path, table: str, where: pl.Expr) -> None:
+def _spool_scoped_files(
+    root: Path, spool: Path, table: str, where: pl.Expr, *, game_id: str | None = None
+) -> None:
     """ONE pass over `table`'s live files: each file's rows matching `where`
+    (with `game_id`, which `where` must require: files whose per-file game
+    index does not hold the game are not scanned at all)
     (exactly `read_table_scoped`'s per-file step, empty results included so
     every file's schema still joins the union) written to `spool` as one
     part per source file, in the same logical order. Every later scoped
@@ -302,12 +309,43 @@ def _spool_scoped_files(root: Path, spool: Path, table: str, where: pl.Expr) -> 
     `where`, but scans only the game's rows instead of the whole history."""
     parts = _parts_dir(spool, table)
     parts.mkdir(parents=True)
-    for seq, path in enumerate(table_files(root, table), start=1):
-        lazy = pl.scan_parquet(path, low_memory=True).filter(where)
-        frame = _owning_strings(lazy).collect(engine="streaming")
-        drop_file_pages(path)
-        frame.write_parquet(parts / _part_name(seq, seq), compression="zstd", statistics=True)
+    files = table_files(root, table)
+    index_dir = scan_index_root(root) / table if game_id is not None else None
+    buffered: list[pl.DataFrame] = []
+    buffered_rows = 0
+    seq = 0
+
+    def flush() -> None:
+        nonlocal buffered, buffered_rows, seq
+        if not buffered:
+            return
+        seq += 1
+        # `diagonal_relaxed` concatenation is associative and keeps first-
+        # appearance column order, so consecutive files merged here union
+        # exactly as they would one by one in a later scoped read.
+        merged = buffered[0] if len(buffered) == 1 else pl.concat(buffered,
+                                                                  how="diagonal_relaxed")
+        merged.write_parquet(parts / _part_name(seq, seq), compression="zstd", statistics=True)
+        buffered, buffered_rows = [], 0
+
+    for path in files:
+        if index_dir is not None and game_id not in file_game_ids(path, index_dir=index_dir):
+            # `where` requires this game, which the file does not hold: its
+            # scoped read is exactly an empty frame of the file's schema --
+            # kept (no scan) so the column union is unchanged.
+            frame = pl.DataFrame(schema=pl.read_parquet_schema(path))
+        else:
+            lazy = pl.scan_parquet(path, low_memory=True).filter(where)
+            frame = _owning_strings(lazy).collect(engine="streaming")
+            drop_file_pages(path)
+        buffered.append(frame)
+        buffered_rows += frame.height
         del frame
+        if buffered_rows >= _PLAYER_PROPS_BATCH_ROWS:
+            flush()
+    flush()
+    if index_dir is not None:
+        prune_scan_index(index_dir, files)
 
 
 def _player_props_component_from(root: Path, where: pl.Expr) -> ManifestComponent | None:

@@ -61,7 +61,7 @@ def env_for(root: Path) -> dict[str, Any]:
 
 def _synthetic_props(
     *, due_games: list[str], players: list[str], start: datetime, end: datetime, rows: int,
-    first: int, last: int, due_share: float = DUE_GAME_SHARE,
+    first: int, last: int, due_share: float = DUE_GAME_SHARE, due_at_tail: bool = False,
 ) -> pl.LazyFrame:
     """Rows [first, last) of `rows` prop quotes in receipt-time order (row
     index order IS receipt order), games interleaved (one collection cycle
@@ -74,9 +74,13 @@ def _synthetic_props(
                   "anytime_td", "rushing_attempts", "passing_tds", "interceptions"]
     vendors = ["draftkings", "fanduel", "betmgm", "caesars", "bet365", "espnbet"]
     i = pl.col("i")
+    # `due_at_tail`: the due games' quotes are the most recent ones (their
+    # collection window right before kickoff), as in production; otherwise
+    # the original BLOCK 3 placement at the start of the history.
+    in_due_window = i >= rows - 2 * n_due if due_at_tail else i // 2 < n_due
     frame = pl.LazyFrame({"i": pl.int_range(first, last, eager=True)}).with_columns(
         # every other row a due game (receipt-time interleaving), the rest older games
-        pl.when((i % 2 == 0) & (i // 2 < n_due))
+        pl.when((i % 2 == 0) & in_due_window)
         .then(pl.lit(pl.Series(due_games)).gather(i // 2 % len(due_games)))
         .otherwise(pl.lit(pl.Series(older)).gather(i % len(older)))
         .alias("canonical_game_id"),
@@ -148,7 +152,7 @@ def _store_like_production(warehouse: Warehouse, synthetic: Any, rows: int) -> d
 
 def build(
     root: Path, *, prop_rows: int = PROD_PROP_ROWS, extra_seed: Any = None,
-    due_share: float = DUE_GAME_SHARE,
+    due_share: float = DUE_GAME_SHARE, due_at_tail: bool = False,
 ) -> dict[str, Any]:
     """Build the warehouse under `root`; returns (and writes to
     `root/fixture.json`) the `now` at which all 11 T48H slots are due.
@@ -187,7 +191,7 @@ def build(
     def synthetic(first: int, last: int) -> pl.LazyFrame:
         return _synthetic_props(due_games=games, players=players, start=base - 25 * 24 * H,
                                 end=base - M, rows=prop_rows, first=first, last=last,
-                                due_share=due_share)
+                                due_share=due_share, due_at_tail=due_at_tail)
 
     stored = _store_like_production(warehouse, synthetic, prop_rows)
     info = {"now": (base + 6 * M).isoformat(), "season": SEASON, "week": WEEK, **stored}
