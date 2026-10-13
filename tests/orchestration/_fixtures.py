@@ -106,6 +106,9 @@ def build_pit_fixture_warehouse(
                 "week": 1,
                 "home_canonical_team_id": HOME_TEAM_ID,
                 "visitor_canonical_team_id": AWAY_TEAM_ID,
+                # STRUCTURAL_CORE (the shipped profile) orders history by
+                # slate chronology, which needs each game's status.
+                "status_state": "final",
             },
             {
                 "canonical_game_id": TARGET_GAME_ID,
@@ -115,6 +118,7 @@ def build_pit_fixture_warehouse(
                 "week": 2,
                 "home_canonical_team_id": HOME_TEAM_ID,
                 "visitor_canonical_team_id": AWAY_TEAM_ID,
+                "status_state": "scheduled",
             },
         ]
     )
@@ -157,6 +161,17 @@ def build_pit_fixture_warehouse(
         ]
     )
     warehouse.write("players", players)
+
+    # Each team's roster batch (identity only, no depth), received long
+    # before any cutoff: every real candidate is a structural member.
+    warehouse.write("roster_snapshots", pl.DataFrame(
+        [
+            {"canonical_player_id": pid, "canonical_team_id": team, "depth": None,
+             "available_at": HIST_KICKOFF, "available_at_is_estimated": False}
+            for pid, team in ((HOME_PLAYER_ID, HOME_TEAM_ID), (AWAY_PLAYER_ID, AWAY_TEAM_ID))
+        ],
+        schema_overrides={"depth": pl.Int64},
+    ))
 
     props = pl.DataFrame(
         [

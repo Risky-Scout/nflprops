@@ -25,6 +25,7 @@ from _fixtures import (
     build_pit_fixture_warehouse,
 )
 
+from nflprops.domain.model_profile import ModelProfile
 from nflprops.pipelines.pregame import predict_game, predict_week
 
 AS_OF = datetime(2025, 9, 15, 12, 0, 0, tzinfo=UTC)
@@ -133,6 +134,7 @@ def test_official_run_id_and_checkpoint_name_are_additive_and_nullable(
         persist=False,
         official_run_id="deadbeef",
         checkpoint_name="T30M",
+        model_profile=ModelProfile.LIVE_ENHANCED,
     )
     assert set(official["run_id"].to_list()) == {"deadbeef"}
     assert set(official["checkpoint_name"].to_list()) == {"T30M"}

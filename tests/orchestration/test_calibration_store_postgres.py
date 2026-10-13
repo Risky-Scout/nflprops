@@ -59,6 +59,7 @@ def _artifact(*, suffix: str, **overrides: object):
         algorithm_version="v1",
         scope_type="JOINT_GAME",
         checkpoint_scope="ALL_PREGAME_CHECKPOINTS",
+        model_profile="STRUCTURAL_CORE",
         base_model_version="2026.1.0",
         simulation_config_version="sim-v1",
         feature_contract_version="2026.1.0",
@@ -295,6 +296,7 @@ def test_full_lifecycle_round_trips_through_postgres(postgres_dsn: str) -> None:
         resolved = resolve_calibration_champion(
             backend,
             scope_type="JOINT_GAME", checkpoint_scope="ALL_PREGAME_CHECKPOINTS",
+            model_profile="STRUCTURAL_CORE",
             base_model_version="2026.1.0", simulation_config_version="sim-v1",
             feature_contract_version="2026.1.0", prop_contract_version="2026.1.0",
             calibration_contract_version="2026.1.0",
@@ -308,6 +310,7 @@ def test_full_lifecycle_round_trips_through_postgres(postgres_dsn: str) -> None:
         resolved_after = resolve_calibration_champion(
             backend,
             scope_type="JOINT_GAME", checkpoint_scope="ALL_PREGAME_CHECKPOINTS",
+            model_profile="STRUCTURAL_CORE",
             base_model_version="2026.1.0", simulation_config_version="sim-v1",
             feature_contract_version="2026.1.0", prop_contract_version="2026.1.0",
             calibration_contract_version="2026.1.0",

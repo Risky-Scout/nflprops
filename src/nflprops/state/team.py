@@ -156,16 +156,33 @@ def build_team_states(
     as_of: datetime,
     strict: bool = True,
     config: TeamStateConfig | None = None,
+    history_time_col: str = "available_at",
+    recency_time_col: str | None = None,
 ) -> dict[str, TeamState]:
-    """Build offense + reversed-opponent defense states using pre-as-of data."""
+    """Build offense + reversed-opponent defense states using pre-as-of data.
+
+    `history_time_col` is the ELIGIBILITY clock of the game-stat history:
+    genuine `available_at` (LIVE_PIT, the default) or, for historical
+    walk-forward, the event-chronology column of a frame
+    `certify_event_derived` certified. `recency_time_col` (default: the
+    same column) is the clock recency weights age the performance by --
+    STRUCTURAL_CORE passes the source-game kickoff in both modes."""
     if config is None:
         config = TeamStateConfig()
+    weight_col = recency_time_col or history_time_col
 
     # One version per outcome: the latest genuinely known at as_of.
-    ts = as_known_at(team_stats, "team_game_stats", as_of, strict=strict)
-    ps = as_known_at(player_stats, "player_game_stats", as_of, strict=strict)
+    ts = as_known_at(
+        team_stats, "team_game_stats", as_of, strict=strict, time_col=history_time_col
+    )
+    ps = as_known_at(
+        player_stats, "player_game_stats", as_of, strict=strict, time_col=history_time_col
+    )
     if ts.is_empty():
         return {}
+    # Canonical chronological row order: weighted sums never depend on
+    # storage/ingest order (not even in the last floating-point digit).
+    ts = ts.sort([weight_col, "canonical_game_id", "canonical_team_id"])
     ts = _with_derived(ts)
 
     # Player totals needed for directed targets and offensive TDs.
@@ -216,7 +233,7 @@ def build_team_states(
 
     # Population priors are themselves recency weighted. This matters around
     # league-wide rule/environment changes and avoids hard-coded era assumptions.
-    pop_w = _time_weights(ts["available_at"].to_list(), as_of, config.half_life_days)
+    pop_w = _time_weights(ts[weight_col].to_list(), as_of, config.half_life_days)
     pop_plays, pop_plays_var = _weighted_mean_var(
         ts, "_plays", pop_w, 62.0, 62.0 * 1.2
     )
@@ -264,12 +281,16 @@ def build_team_states(
 
     out: dict[str, TeamState] = {}
     for team_id in ts["canonical_team_id"].unique().to_list():
-        sub = ts.filter(pl.col("canonical_team_id") == team_id).sort("available_at")
-        dsub = paired.filter(pl.col("canonical_team_id") == team_id).sort("available_at")
+        sub = ts.filter(pl.col("canonical_team_id") == team_id).sort(
+            [weight_col, "canonical_game_id"]
+        )
+        dsub = paired.filter(pl.col("canonical_team_id") == team_id).sort(
+            [weight_col, "canonical_game_id"]
+        )
         games = sub.height
 
         w_off = _time_weights(
-            sub["available_at"].to_list(), as_of, config.half_life_days
+            sub[weight_col].to_list(), as_of, config.half_life_days
         )
         effective_games = float(w_off.sum())
         sample_mean, sample_var = _weighted_mean_var(
@@ -333,7 +354,7 @@ def build_team_states(
             rush_allowed = pop_rush_ypa
         else:
             w_def = _time_weights(
-                dsub["available_at"].to_list(), as_of, config.half_life_days
+                dsub[weight_col].to_list(), as_of, config.half_life_days
             )
             d_eff_games = float(w_def.sum())
             plays_allowed_raw, _ = _weighted_mean_var(

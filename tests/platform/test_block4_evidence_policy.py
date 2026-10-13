@@ -3,8 +3,12 @@
 * 2026+ never gets estimated (reconstructed) availability -- not from the
   lean historical backfill, not from a versioned append, not for a
   correction.
-* Older-season estimates are RESEARCH_ONLY: dropped from every official
-  view, and a run that uses them can never be promotion evidence.
+* Older-season estimates are RESEARCH_ONLY under LIVE_PIT: dropped from
+  every official view, never live promotion evidence.
+* Phase 10C3A (HISTORICAL_WALK_FORWARD, Gate 1): estimated completed-event
+  rows are certified by event chronology -- a distinct class that only
+  historical promotion accepts -- and `--evidence research` is never
+  promotion evidence.
 """
 
 from __future__ import annotations
@@ -24,7 +28,6 @@ from test_phase10c3a_runner import _build_two_season_warehouse
 from nflprops.calibration.historical_runner import WarehouseTables, official_tables
 from nflprops.calibration.phase10c3a_runner import (
     ConfigurationError,
-    InsufficientDataError,
     RunnerConfig,
     parse_args,
     run,
@@ -147,6 +150,7 @@ def test_official_tables_drop_every_estimated_row() -> None:
     tables = WarehouseTables(
         games=mixed, player_stats=mixed, team_stats=mixed, players=unflagged,
         roster=mixed, injuries=mixed, injury_runs=unflagged, game_odds=unflagged,
+        historical_positions=unflagged, historical_team_membership=unflagged,
     )
     official = official_tables(tables)
     for name, frame in official.as_mapping().items():
@@ -183,20 +187,24 @@ def test_runner_defaults_to_official_and_validates_evidence(tmp_path: Path) -> N
         _config(tmp_path, tmp_path, evidence="lenient")
 
 
-def test_official_run_on_clean_data_is_official_evidence(tmp_path: Path) -> None:
+def test_official_run_on_clean_data_is_historical_chronology_evidence(tmp_path: Path) -> None:
     wh = _build_two_season_warehouse(tmp_path)
     report = run(_config(wh.root, tmp_path / "out"))
-    assert report["evidence_class"] == "OFFICIAL_PIT_FAITHFUL"
+    assert report["evidence_mode"] == "HISTORICAL_WALK_FORWARD"
+    assert report["evidence_class"] == "CERTIFIED_HISTORICAL_EVENT_CHRONOLOGY"
     assert report["evidence_policy"]["estimated_rows_in_source"] == {}
 
 
-def test_official_run_never_uses_research_only_estimates(tmp_path: Path) -> None:
+def test_official_run_certifies_estimated_outcomes_by_event_chronology(tmp_path: Path) -> None:
     wh = _build_two_season_warehouse(tmp_path)
     _mark_outcomes_estimated(wh)
-    # Every outcome row is RESEARCH_ONLY: official replay has no evidence
-    # left at all, and fails closed instead of using any of it.
-    with pytest.raises(InsufficientDataError):
-        run(_config(wh.root, tmp_path / "out"))
+    # Estimated RECEIPT time on completed-event rows: certified by event
+    # chronology (Gate 1), never LIVE_PIT evidence.
+    report = run(_config(wh.root, tmp_path / "out"))
+    assert report["evidence_class"] == "CERTIFIED_HISTORICAL_EVENT_CHRONOLOGY"
+    assert report["evidence_class"] != "OFFICIAL_PIT_FAITHFUL"
+    assert set(report["evidence_policy"]["estimated_rows_in_source"]) == {
+        "player_game_stats", "team_game_stats"}
 
 
 def test_research_run_uses_estimates_but_is_never_promotable(tmp_path: Path) -> None:
@@ -204,15 +212,25 @@ def test_research_run_uses_estimates_but_is_never_promotable(tmp_path: Path) -> 
     _mark_outcomes_estimated(wh)
     report = run(_config(wh.root, tmp_path / "out", evidence="research"))
     assert report["evidence_class"] == "RESEARCH_ONLY"
-    assert report["evidence_policy"]["estimated_rows_excluded"] == {}
+    assert report["evidence_policy"]["source_data_class"] == (
+        "CERTIFIED_HISTORICAL_EVENT_CHRONOLOGY")
     assert set(report["evidence_policy"]["estimated_rows_in_source"]) == {
-        "player_stats", "team_stats"}
+        "player_game_stats", "team_game_stats"}
     assert report["promotion_decision"] == "INSUFFICIENT_EVIDENCE"
 
 
-@pytest.mark.parametrize("evidence_class", [None, "RESEARCH_ONLY"])
+@pytest.mark.parametrize(("evidence_mode", "evidence_class"), [
+    (None, None),
+    ("HISTORICAL_WALK_FORWARD", None),
+    ("HISTORICAL_WALK_FORWARD", "RESEARCH_ONLY"),
+    # Each mode accepts only its own certified class.
+    ("HISTORICAL_WALK_FORWARD", "OFFICIAL_PIT_FAITHFUL"),
+    ("LIVE_PIT", "CERTIFIED_HISTORICAL_EVENT_CHRONOLOGY"),
+    (None, "CERTIFIED_HISTORICAL_EVENT_CHRONOLOGY"),
+])
 def test_remote_training_never_reports_non_official_evidence_eligible(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, evidence_class: str | None
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, evidence_mode: str | None,
+    evidence_class: str | None,
 ) -> None:
     from nflprops.calibration import phase10c3a_runner as science
 
@@ -222,6 +240,8 @@ def test_remote_training_never_reports_non_official_evidence_eligible(
                   "registration": {"payload_sha256": "x"}}
         if evidence_class is not None:
             result["evidence_class"] = evidence_class
+        if evidence_mode is not None:
+            result["evidence_mode"] = evidence_mode
         return result
 
     monkeypatch.setattr(science, "run", fake_run)
@@ -234,7 +254,8 @@ def test_remote_training_never_reports_non_official_evidence_eligible(
     assert result["promotion_eligibility_result"]["eligible"] is False
 
     def official_run(config: science.RunnerConfig) -> dict:
-        return {**fake_run(config), "evidence_class": "OFFICIAL_PIT_FAITHFUL"}
+        return {**fake_run(config), "evidence_mode": "HISTORICAL_WALK_FORWARD",
+                "evidence_class": "CERTIFIED_HISTORICAL_EVENT_CHRONOLOGY"}
 
     monkeypatch.setattr(science, "run", official_run)
     main = rt.resolve_science_entrypoint(rt.DEFAULT_SCIENCE_ENTRYPOINT)  # binds `run` anew

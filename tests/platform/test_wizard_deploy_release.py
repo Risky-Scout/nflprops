@@ -544,6 +544,9 @@ def test_ops_workflow_is_main_only_fixed_menu() -> None:
         "checkpoint-repair-false-refusal",
         # PR #20: read-only outcome certification of one verified snapshot
         "snapshot-outcome-report",
+        # launch: guarded games-metadata backfill (dry-run unless apply) and
+        # its read-only report; certified champion install (registry only)
+        "games-backfill", "games-metadata-report", "champion-install",
     ]
     assert "refs/heads/main" in WIZARD_OPS.read_text()
     assert doc["jobs"]["ops"]["environment"] == "wizardofodds.com"

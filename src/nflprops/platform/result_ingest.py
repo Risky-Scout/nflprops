@@ -59,6 +59,7 @@ from nflprops.platform.immutable_bundle import (
     verify_directory_against_manifest,
 )
 from nflprops.platform.remote_checkpoint import (
+    OPTIONAL_RESULT_TABLES,
     RESULT_FILE,
     RESULT_SCHEMA_VERSION,
     RESULT_TABLES,
@@ -123,6 +124,9 @@ def _load_tables(bundle_dir: Path, run_id: str, counts: dict[str, int]) -> dict[
     for table, _key in RESULT_TABLES:
         path = bundle_dir / "tables" / f"{table}.parquet"
         frame = pl.read_parquet(path) if path.is_file() else pl.DataFrame()
+        if table in OPTIONAL_RESULT_TABLES and table not in counts and not path.is_file():
+            tables[table] = frame
+            continue
         if frame.height != int(counts.get(table, -1)):
             raise ResultIngestError(
                 f"{table}: {frame.height} rows in bundle, result.json says {counts.get(table)}"

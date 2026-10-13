@@ -165,6 +165,31 @@ def _full_roster_warehouse(tmp_path: Path, **kw) -> tuple[Warehouse, set[str]]:
         ),
     )
 
+    # One live roster batch per team (identity only): QB candidates must be
+    # structural roster members (nflprops.features.team_membership).
+    roster_teams = dict(
+        warehouse.read("player_game_stats")
+        .select("canonical_player_id", "canonical_team_id")
+        .unique()
+        .iter_rows()
+    )
+    warehouse.write(
+        "roster_snapshots",
+        pl.DataFrame(
+            [
+                {
+                    "canonical_player_id": p,
+                    "canonical_team_id": t,
+                    "depth": None,
+                    "available_at": hist_available_at,
+                    "available_at_is_estimated": False,
+                }
+                for p, t in sorted(roster_teams.items())
+            ],
+            schema_overrides={"depth": pl.Int64},
+        ),
+    )
+
     expected_eligible = {
         HOME_PLAYER_ID, AWAY_PLAYER_ID, AWAY_BACKUP_ID,
         "h:qb:starter", "h:rb:1", "h:k1:starter",
@@ -722,7 +747,7 @@ def test_dispatcher_end_to_end_persists_threshold_artifact_for_due_checkpoints(
     warehouse = _build_warehouse(tmp_path)
     results = checkpoint_dispatch_flow(
         warehouse=warehouse,
-        config=Config(data={}),
+        config=Config(data={"model": {"profile": "LIVE_ENHANCED"}}),
         season=SEASON,
         week=WEEK,
         now=AS_OF,

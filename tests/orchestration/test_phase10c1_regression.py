@@ -124,7 +124,9 @@ def test_migration_head_extends_the_linear_chain_through_0008() -> None:
         [sys.executable, "-m", "alembic", "heads"],
         cwd=str(repo_root), capture_output=True, text=True, timeout=30,
     )
-    assert "0009_compact_pmf_payload" in heads.stdout, heads.stdout + heads.stderr
+    # Gate 1's 0010_cal_model_profile (profile-bound calibration artifacts)
+    # extends main's 0009_compact_pmf_payload; both stay in the linear history.
+    assert "0010_cal_model_profile" in heads.stdout, heads.stdout + heads.stderr
 
     history = subprocess.run(
         [sys.executable, "-m", "alembic", "history"],
@@ -135,5 +137,6 @@ def test_migration_head_extends_the_linear_chain_through_0008() -> None:
         "0007_player_prop_distributions",
         "0008_calibration_registry",
         "0009_compact_pmf_payload",
+        "0010_cal_model_profile",
     ):
         assert revision in history.stdout, history.stdout + history.stderr

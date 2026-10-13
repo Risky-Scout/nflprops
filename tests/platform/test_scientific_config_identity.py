@@ -109,6 +109,10 @@ WIZARD_DATA_ROOT = "/home/wizard-deploy/nflprops/state"
 WIZARD_LEGACY_CLAIM = "a2df655ebffc4529b67f53e34561ba1cf1e6a58cbc4b5d2292d07e7cef0363ae"
 #: What the GitHub executor resolved for the same release.
 GITHUB_FULL_SHA = "303bdef39a616be18c9185f8151a3cde0557a7ad6c4f4aa97b6f1de731d5d332"
+#: The only resolved-config leaf added since the incident release (Gate 1:
+#: the model profile is part of every config identity). The pins above are
+#: proven against the incident release's configuration -- this one without it.
+GATE1_CONFIG_LEAVES = ("model.profile",)
 WORKFLOW_URL = "https://github.com/Risky-Scout/nflprops/actions/runs/37362214826"
 LEGACY_REFUSAL_DETAIL = f"GitHub executor verification refused the request: {WORKFLOW_URL}"
 
@@ -136,6 +140,19 @@ def _github_config(monkeypatch: pytest.MonkeyPatch) -> Config:
     monkeypatch.delenv("NFLPROPS_DATA_ROOT", raising=False)
     monkeypatch.delenv("NFLPROPS_LOG_LEVEL", raising=False)
     return load()
+
+
+def _incident_release(cfg: Config) -> Config:
+    """`cfg` as the 2026-10-05 incident release resolved it: without the
+    leaves Gate 1 added since (`GATE1_CONFIG_LEAVES`)."""
+    data = json.loads(json.dumps(cfg.data))
+    for leaf in GATE1_CONFIG_LEAVES:
+        *parents, key = leaf.split(".")
+        node = data
+        for part in parents:
+            node = node[part]
+        node.pop(key)
+    return cfg.model_copy(update={"data": data})
 
 
 def _leaves(tree: dict[str, Any], prefix: str = "") -> list[str]:
@@ -198,7 +215,8 @@ def wizard(tmp_path: Path, draws: int, monkeypatch: pytest.MonkeyPatch) -> dict:
         migration_head="0009_compact_pmf_payload", hostname="h", release_sha="a" * 40,
     )
     return {"root": root, "warehouse": warehouse, "layout": layout, "config": config,
-            "prepared": prepared}
+            "prepared": prepared,
+            "github_config_sha256": config_sha256(_github_config(monkeypatch))}
 
 
 def _republish_as_legacy(wizard: dict) -> str:
@@ -269,8 +287,9 @@ def _fixture_incident(wizard: dict, *, incident_id: str = "INC-test-fixture") ->
         refusal_workflow_run=WORKFLOW_URL,
         refusal_failure_code=FAILURE_REMOTE_EXECUTION_REFUSED,
         refusal_failure_detail=LEGACY_REFUSAL_DETAIL,
-        claimed_config_sha256=WIZARD_LEGACY_CLAIM,
-        executor_config_sha256=GITHUB_FULL_SHA,
+        # This release's analogues of WIZARD_LEGACY_CLAIM / GITHUB_FULL_SHA.
+        claimed_config_sha256=config_sha256(wizard["config"]),
+        executor_config_sha256=wizard["github_config_sha256"],
         cause="test",
         remediation_reason="test",
         remediation_change="test",
@@ -379,14 +398,26 @@ def test_5_legacy_wizard_claim_is_reproduced_byte_for_byte(
     release's configuration reproduces it exactly from the GitHub side (if
     the shipped configuration ever changes, legacy requests become
     unverifiable -- an OPERATIONAL refusal -- and this pin must be revisited
-    deliberately)."""
-    github_cfg = _github_config(monkeypatch)
+    deliberately).
+
+    Gate 1 changed the shipped configuration (`GATE1_CONFIG_LEAVES`): the
+    incident release's configuration still reproduces the claim exactly,
+    and this release refuses every legacy claim (OPERATIONAL)."""
+    current_cfg = _github_config(monkeypatch)
+    github_cfg = _incident_release(current_cfg)
+    assert sorted(set(_leaves(current_cfg.data)) - set(_leaves(github_cfg.data))) == sorted(
+        GATE1_CONFIG_LEAVES
+    )
     assert config_sha256(github_cfg) == GITHUB_FULL_SHA
-    assert config_sha256(_wizard_config(monkeypatch)) == WIZARD_LEGACY_CLAIM
+    assert config_sha256(_incident_release(_wizard_config(monkeypatch))) == WIZARD_LEGACY_CLAIM
     profile = LEGACY_CLAIMANT_OPERATIONAL_PROFILES["wizard-runtime"]
     assert config_sha256(with_operational_values(github_cfg, profile)) == WIZARD_LEGACY_CLAIM
     legacy = {"schema_version": LEGACY_REQUEST_SCHEMA_VERSION, "config_sha256": WIZARD_LEGACY_CLAIM}
     assert verify_config_identity(legacy, github_cfg) == "legacy:wizard-runtime"
+    with pytest.raises(RemoteExecutionError) as info:
+        verify_config_identity(legacy, current_cfg)
+    assert info.value.refusal_class == "OPERATIONAL"
+    assert info.value.refusal_code == "CONFIG_IDENTITY_MISMATCH"
     drifted = load(cli_overrides={"simulation.baseline.pace_shock_sd": 0.05})
     with pytest.raises(RemoteExecutionError) as info:
         verify_config_identity(legacy, drifted)
@@ -402,7 +433,7 @@ def test_5_old_valid_wizard_request_verifies_on_github(
         wizard, tmp_path, _github_config(monkeypatch), bundle_sha=legacy_sha
     )
     assert request["schema_version"] == LEGACY_REQUEST_SCHEMA_VERSION
-    assert request["config_sha256"] == WIZARD_LEGACY_CLAIM  # never rewritten
+    assert request["config_sha256"] == config_sha256(wizard["config"])  # never rewritten
     assert run.run_id == wizard["prepared"].run_id
     # A scientific drift still refuses the legacy request (not weakened).
     with pytest.raises(RemoteExecutionError, match="config SHA") as info:
@@ -422,7 +453,8 @@ def test_6_new_version_request_verifies_across_host_paths(
     assert request["schema_version"] == REQUEST_SCHEMA_VERSION
     assert request["scientific_config_hash_version"] == SCIENTIFIC_CONFIG_HASH_VERSION
     assert request["scientific_config_sha256"] == scientific_config_sha256(wizard["config"])
-    assert request["config_sha256"] == WIZARD_LEGACY_CLAIM  # full hash kept as provenance
+    # full hash kept as provenance
+    assert request["config_sha256"] == config_sha256(wizard["config"])
     github_cfg = _github_config(monkeypatch)
     _verify_on_github(wizard, tmp_path, github_cfg)
     _verify_on_github(wizard, tmp_path, load(cli_overrides={"run.log_level": "DEBUG"}))
@@ -819,8 +851,14 @@ def test_production_incident_pin_is_consistent_with_this_release(
     assert pinned.snapshot_id == "20261005T181551Z-df892b330493"
     assert pinned.refusal_workflow_run.endswith("/actions/runs/37362214826")
     assert pinned.refusal_failure_detail == LEGACY_REFUSAL_DETAIL
-    # The repair's proof (guard 5) holds for this release's configuration.
-    github_cfg = _github_config(monkeypatch)
+    # The repair's proof (guard 5) holds for the incident release's
+    # configuration -- and no longer for this release's (Gate 1 added
+    # `GATE1_CONFIG_LEAVES`), so this release can never re-run the repair.
+    current_cfg = _github_config(monkeypatch)
+    github_cfg = _incident_release(current_cfg)
+    assert config_sha256(current_cfg) not in (
+        pinned.claimed_config_sha256, pinned.executor_config_sha256
+    )
     profile = LEGACY_CLAIMANT_OPERATIONAL_PROFILES["wizard-runtime"]
     assert config_sha256(with_operational_values(github_cfg, profile)) == (
         pinned.claimed_config_sha256

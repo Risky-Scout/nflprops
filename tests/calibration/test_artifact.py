@@ -41,6 +41,7 @@ def _kwargs(**overrides: object) -> dict:
         algorithm_version="v1",
         scope_type=JOINT_GAME_SCOPE,
         checkpoint_scope="ALL_PREGAME_CHECKPOINTS",
+        model_profile="STRUCTURAL_CORE",
         base_model_version="2026.1.0",
         simulation_config_version="sim-v1",
         feature_contract_version="2026.1.0",
@@ -90,6 +91,7 @@ def test_calibration_artifact_id_matches_direct_recomputation() -> None:
         algorithm_version=art.algorithm_version,
         scope_type=art.scope_type,
         checkpoint_scope=art.checkpoint_scope,
+        model_profile=art.model_profile,
         base_model_version=art.base_model_version,
         simulation_config_version=art.simulation_config_version,
         feature_contract_version=art.feature_contract_version,
@@ -192,10 +194,12 @@ def test_compatibility_digest_excludes_training_and_payload_fields() -> None:
         "prop_contract_version",
         "calibration_contract_version",
         "checkpoint_scope",
+        "model_profile",
     ],
 )
 def test_compatibility_digest_changes_with_each_compatibility_field(field: str) -> None:
     base_kwargs = dict(
+        model_profile="STRUCTURAL_CORE",
         base_model_version="m1",
         simulation_config_version="s1",
         feature_contract_version="f1",
@@ -206,7 +210,10 @@ def test_compatibility_digest_changes_with_each_compatibility_field(field: str) 
     )
     d1 = compute_compatibility_digest(**base_kwargs)
     changed = dict(base_kwargs)
-    changed[field] = base_kwargs[field] + "-CHANGED" if field != "checkpoint_scope" else "T48H"
+    changed[field] = {
+        "checkpoint_scope": "T48H",
+        "model_profile": "LIVE_ENHANCED",
+    }.get(field, base_kwargs[field] + "-CHANGED")
     d2 = compute_compatibility_digest(**changed)
     assert d1 != d2
 

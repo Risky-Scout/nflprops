@@ -813,6 +813,115 @@ def outcome_report_cmd(
     typer.echo(json.dumps(report, indent=2, sort_keys=True, default=str))
 
 
+@app.command("games-backfill")
+def games_backfill(
+    season: int = typer.Option(..., help="Season, e.g. 2026."),
+    weeks: str = typer.Option(..., help="Comma-separated weeks, e.g. 1,2."),
+    expected_ids: str = typer.Option(
+        ..., help="Comma-separated EXACT canonical game ids the receipts must restore."
+    ),
+    apply: bool = typer.Option(
+        False, "--apply", help="Write (writer lock). Default: dry-run, read-only."
+    ),
+    postseason: bool = typer.Option(
+        False, "--postseason", help="Restore postseason games (postseason week numbers)."
+    ),
+) -> None:
+    """PR #21: restore missing `games` rows from GENUINE stored BDL
+    BDL games-endpoint receipts (`platform.games_backfill`): receipt-time
+    availability only, exact expected-ID guard, idempotent, never replaces
+    a row, never touches an immutable snapshot. DRY-RUN unless --apply."""
+    import json
+    from datetime import UTC, datetime
+
+    from nflprops.data.warehouse import Warehouse
+    from nflprops.platform.games_backfill import (
+        GamesBackfillError,
+        apply_games_backfill,
+        plan_games_backfill,
+    )
+
+    ids = tuple(part.strip() for part in expected_ids.split(",") if part.strip())
+    week_tuple = tuple(int(part) for part in weeks.split(",") if part.strip())
+    layout = _layout()
+    warehouse = Warehouse(layout.warehouse_root)
+    try:
+        if apply:
+            summary = apply_games_backfill(
+                warehouse, layout.raw_root, season=season, weeks=week_tuple,
+                expected_game_ids=ids, lock_path=layout.writer_lock, now=datetime.now(UTC),
+                postseason=postseason,
+            )
+        else:
+            plan = plan_games_backfill(
+                warehouse, layout.raw_root, season=season, weeks=week_tuple,
+                expected_game_ids=ids, postseason=postseason,
+            )
+            summary = {"applied": False, "dry_run": True, **plan.summary()}
+    except (GamesBackfillError, WriterLockError) as exc:
+        typer.echo(f"FAILED: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(summary, indent=2, sort_keys=True))
+
+
+@app.command("games-metadata-report")
+def games_metadata_report() -> None:
+    """READ-ONLY: state games (PIT-visible outcome history) with no `games`
+    metadata row, grouped as exact `games-backfill` arguments."""
+    import json
+    from datetime import UTC, datetime
+
+    from nflprops.data.warehouse import Warehouse
+    from nflprops.platform.games_backfill import (
+        GamesBackfillError,
+        missing_state_game_metadata,
+    )
+
+    layout = _layout()
+    try:
+        report = missing_state_game_metadata(
+            Warehouse(layout.warehouse_root), layout.raw_root, as_of=datetime.now(UTC))
+    except GamesBackfillError as exc:
+        typer.echo(f"FAILED: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(report, indent=2, sort_keys=True))
+
+
+@app.command("champion-install")
+def champion_install(
+    artifact_id: str = typer.Option(..., help="The certified production calibrator id."),
+    apply: bool = typer.Option(
+        False, "--apply", help="Write (writer lock). Default: verify only, read-only."
+    ),
+) -> None:
+    """Install the CERTIFIED production calibrator (a pin in
+    contracts/production_calibrators/certified.json, shipped with this
+    release) into the live registry and promote it to the STRUCTURAL_CORE
+    champion (`calibration.production_install`). Verify-only unless
+    --apply; idempotent; refuses any id that is not certified."""
+    import json
+    from datetime import UTC, datetime
+
+    from nflprops.calibration.production_install import (
+        CalibratorInstallError,
+        install_and_promote,
+    )
+    from nflprops.config import load
+    from nflprops.data.warehouse import Warehouse
+
+    layout = _layout()
+    try:
+        summary = install_and_promote(
+            Warehouse(layout.warehouse_root), calibrator_id=artifact_id,
+            lock_path=layout.writer_lock, now=datetime.now(UTC), apply=apply,
+            model_version=str(load().get_path("model.version")),
+        )
+    except (CalibratorInstallError, WriterLockError, ValueError) as exc:
+        typer.echo(f"FAILED: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    typer.echo(json.dumps(summary, indent=2, sort_keys=True, default=str))
+
+
 @app.command("ingest-stats")
 def ingest_stats(
     seasons: str = typer.Option(..., help="Comma-separated seasons, e.g. 2024,2025,2026."),
@@ -937,8 +1046,9 @@ def execute_checkpoint_cmd(
         raise typer.Exit(1) from exc
     result = executed.result
     typer.echo(json.dumps({k: result[k] for k in (
-        "run_id", "run", "row_counts", "calibration_gate", "decision", "decision_reasons",
-    )}, indent=2, sort_keys=True))
+        "run_id", "run", "row_counts", "calibration_gate", "quote_exclusions", "decision",
+        "decision_reasons", "public_ready",
+    )}, indent=2, sort_keys=True, default=str))
 
 
 @app.command("result-ingest")

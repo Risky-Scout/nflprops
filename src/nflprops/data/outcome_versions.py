@@ -134,13 +134,23 @@ def _final_status_rows(frame: pl.DataFrame) -> pl.DataFrame:
 
 
 def as_known_at(
-    frame: pl.DataFrame, table: str, as_of: datetime, *, strict: bool = False
+    frame: pl.DataFrame,
+    table: str,
+    as_of: datetime,
+    *,
+    strict: bool = False,
+    time_col: str = "available_at",
 ) -> pl.DataFrame:
     """The latest version of each outcome genuinely known at `as_of`
-    (`available_at <= as_of`, with `filter_pit`'s estimated-row rule)."""
+    (`available_at <= as_of`, with `filter_pit`'s estimated-row rule).
+    `time_col` is `filter_pit`'s eligibility clock: any other column is
+    HISTORICAL_WALK_FORWARD event chronology and requires a frame
+    `certify_event_derived` certified."""
     if frame.is_empty():
         return frame
-    return _select_one_per_key(filter_pit(frame, as_of, strict=strict), table, last=True)
+    return _select_one_per_key(
+        filter_pit(frame, as_of, strict=strict, time_col=time_col), table, last=True
+    )
 
 
 def latest_final(frame: pl.DataFrame, table: str) -> pl.DataFrame:

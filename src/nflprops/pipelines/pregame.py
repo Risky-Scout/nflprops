@@ -24,10 +24,21 @@ from nflprops.backtest.provenance import (
 )
 from nflprops.data.warehouse import Warehouse
 from nflprops.domain.hashing import hash_payload
-from nflprops.market.consensus import game_market_consensus, latest_prop_quotes
+from nflprops.domain.market_identity import (
+    PLAYER_PROP_BOOK_KEY,
+    PLAYER_PROP_MARKET_IDENTITY,
+)
+from nflprops.domain.model_profile import ModelProfile, ModelProfileError
+from nflprops.features.historical_evidence import EvidenceMode, slate_key
+from nflprops.market.consensus import (
+    GameMarketConsensus,
+    game_market_consensus,
+    latest_prop_quotes,
+)
 from nflprops.market.current_pricing import prediction_id, price_current_markets
 from nflprops.market.timing import latest_game_market_knowledge_time
 from nflprops.pipelines.games_asof import _latest_games_asof
+from nflprops.pipelines.model_inputs import build_model_inputs
 from nflprops.simulation.game import (
     GameSimulationInput,
     GameSimulationResult,
@@ -36,8 +47,8 @@ from nflprops.simulation.game import (
     simulate_game,
 )
 from nflprops.simulation.results import validate_draw_alignment
-from nflprops.state.player import PlayerState, PlayerStateConfig, build_player_states
-from nflprops.state.team import TeamState, TeamStateConfig, build_team_states
+from nflprops.state.player import PlayerState, PlayerStateConfig
+from nflprops.state.team import TeamState, TeamStateConfig
 
 _CONFIG_MISSING = object()
 
@@ -120,13 +131,21 @@ def _market_frames_for_mode(
         game_odds = warehouse.read("game_opening_odds")
         prop_quotes = warehouse.read("player_prop_openings")
 
-        # Historical openings were collected during backfill, so their
-        # collector_received_at is not the historical knowledge timestamp.
-        # Their canonical available_at was explicitly reconstructed from opened_at.
-        if "collector_received_at" in game_odds.columns:
-            game_odds = game_odds.drop("collector_received_at")
-        if "collector_received_at" in prop_quotes.columns:
-            prop_quotes = prop_quotes.drop("collector_received_at")
+        # STEP 2D: an opening quote is knowable only from its genuine
+        # receipt (`collector_received_at`), exactly like a live one. Its
+        # provider `opened_at` -- and any `available_at` reconstructed from
+        # it -- can predate receipt and must never make it visible earlier.
+        # Fail closed rather than let the selectors fall back to
+        # `available_at`.
+        for name, frame in (
+            ("game_opening_odds", game_odds),
+            ("player_prop_openings", prop_quotes),
+        ):
+            if not frame.is_empty() and "collector_received_at" not in frame.columns:
+                raise ValueError(
+                    f"{name} has no collector_received_at; opening quotes are "
+                    "knowable only from genuine receipt time"
+                )
 
         return game_odds, prop_quotes
 
@@ -213,7 +232,7 @@ def simulate_game_for_prediction(
     game: dict[str, object],
     team_states: dict[str, TeamState],
     player_states: dict[str, PlayerState],
-    game_odds: pl.DataFrame,
+    game_odds: pl.DataFrame | None,
     as_of: datetime,
     model_version: str,
     market_mode: str,
@@ -228,7 +247,10 @@ def simulate_game_for_prediction(
     legitimate GAME-LEVEL market input (spread/total consensus, already
     fed into `GameSimulationInput.implied_points`/`team_spread` before
     Phase 6); it is architecturally and conceptually distinct from
-    per-player prop quotes and is preserved exactly (§16).
+    per-player prop quotes and is preserved exactly (§16). `game_odds=None`
+    means the profile consumes no game market (STRUCTURAL_CORE): no
+    implied points, zero spread effect, no market TD-rate blend -- the
+    simulator's existing no-market path.
 
     Returns `None` when either team's structural state isn't yet
     trustworthy (the pre-existing expansion/new-provider skip behavior,
@@ -243,18 +265,21 @@ def simulate_game_for_prediction(
         # state is not yet trustworthy enough to publish a prop forecast.
         return None
 
-    game_market_available_at = latest_game_market_knowledge_time(
-        game_odds,
-        as_of=as_of,
-        game_id=game_id,
-        market_mode=market_mode,
-    )
-
-    market = game_market_consensus(
-        game_odds,
-        game_id,
-        as_of=as_of,
-    )
+    if game_odds is None:
+        game_market_available_at = None
+        market = GameMarketConsensus(game_id, None, None, 0, 0)
+    else:
+        game_market_available_at = latest_game_market_knowledge_time(
+            game_odds,
+            as_of=as_of,
+            game_id=game_id,
+            market_mode=market_mode,
+        )
+        market = game_market_consensus(
+            game_odds,
+            game_id,
+            as_of=as_of,
+        )
     home_points, away_points = _implied_points(
         market.total,
         market.home_spread,
@@ -327,9 +352,18 @@ class _PreparedPredictionInputs:
     player_states: dict[str, PlayerState]
     state_context: StateProvenanceContext
     latest_quotes: pl.DataFrame
-    game_odds: pl.DataFrame
+    game_odds: pl.DataFrame | None
     roster: pl.DataFrame
     injuries: pl.DataFrame
+    model_profile: ModelProfile
+
+
+def _target_slate(current_games: pl.DataFrame) -> tuple[int, int, int]:
+    """The single slate every target game belongs to (fails closed)."""
+    slates = {slate_key(row) for row in current_games.iter_rows(named=True)}
+    if len(slates) != 1:
+        raise ModelProfileError(f"target games span {len(slates)} slates: {sorted(slates)}")
+    return next(iter(slates))
 
 
 def _prepare_prediction_inputs(
@@ -344,6 +378,7 @@ def _prepare_prediction_inputs(
     team_state_config: TeamStateConfig | None,
     game_ids: set[str] | None,
     state_context_callback: Callable[[StateProvenanceContext], None] | None,
+    model_profile: ModelProfile,
 ) -> _PreparedPredictionInputs | None:
     """Read the warehouse once and build the PIT-visible target games, the
     learned team/player states, the state-provenance context, and the
@@ -393,38 +428,45 @@ def _prepare_prediction_inputs(
         week=week,
     )
 
-    # Historical backfill outcome timestamps are conservative estimates. We permit
-    # them here because their availability is deliberately set after game end; the
-    # as-of cutoff still applies. Live/current snapshots remain exact.
-    team_states = build_team_states(
-        team_stats,
-        player_stats,
+    # One shared assembly for every profile (nflprops.pipelines.model_inputs):
+    # LIVE_ENHANCED keeps the existing live behaviour; STRUCTURAL_CORE is the
+    # same model historical replay certifies.
+    model_inputs = build_model_inputs(
+        model_profile=model_profile,
+        evidence_mode=EvidenceMode.LIVE_PIT,
+        games=games,
+        player_stats=player_stats,
+        team_stats=team_stats,
+        players=players,
+        roster=roster,
+        injuries=injuries,
+        game_odds=game_odds,
         as_of=as_of,
-        strict=False,
-        config=team_state_config or TeamStateConfig(),
-    )
-    player_states = build_player_states(
-        player_stats,
-        team_stats,
-        players,
-        as_of=as_of,
-        roster=roster if not roster.is_empty() else None,
-        injuries=injuries if not injuries.is_empty() else None,
-        strict=False,
-        config=player_state_config or PlayerStateConfig(),
+        target_slate=_target_slate(current_games),
+        player_state_config=player_state_config,
+        team_state_config=team_state_config,
     )
 
-    latest_quotes = latest_prop_quotes(prop_quotes, as_of=as_of)
+    latest_quotes = latest_prop_quotes(
+        prop_quotes,
+        as_of=as_of,
+        # Live: a poll replaces a book's whole offer. Opening: every market's
+        # first observation stands on its own.
+        group_by=(
+            PLAYER_PROP_MARKET_IDENTITY if market_mode == "opening" else PLAYER_PROP_BOOK_KEY
+        ),
+    )
 
     return _PreparedPredictionInputs(
         current_games=current_games,
-        team_states=team_states,
-        player_states=player_states,
+        team_states=model_inputs.team_states,
+        player_states=model_inputs.player_states,
         state_context=state_context,
         latest_quotes=latest_quotes,
-        game_odds=game_odds,
-        roster=roster,
-        injuries=injuries,
+        game_odds=model_inputs.game_odds,
+        roster=model_inputs.roster,
+        injuries=model_inputs.injuries,
+        model_profile=model_inputs.model_profile,
     )
 
 
@@ -508,6 +550,7 @@ def predict_week(
     official_run_id: str | None = None,
     checkpoint_name: str | None = None,
     state_context_callback: Callable[[StateProvenanceContext], None] | None = None,
+    model_profile: ModelProfile | None = None,
 ) -> pl.DataFrame:
     """Build states, simulate each game once, and price every available quote.
 
@@ -526,6 +569,12 @@ def predict_week(
     called if no PIT games are found for `as_of`/`game_ids`, since no state
     is built in that case.
     """
+    if model_profile is None:
+        # An official run must name its profile; only unofficial
+        # research/backtest calls keep the legacy LIVE_ENHANCED behaviour.
+        if official_run_id is not None:
+            raise ModelProfileError("an official prediction run requires an explicit model_profile")
+        model_profile = ModelProfile.LIVE_ENHANCED
     inputs = _prepare_prediction_inputs(
         warehouse,
         season=season,
@@ -537,6 +586,7 @@ def predict_week(
         team_state_config=team_state_config,
         game_ids=game_ids,
         state_context_callback=state_context_callback,
+        model_profile=model_profile,
     )
     if inputs is None:
         return pl.DataFrame()
@@ -659,6 +709,7 @@ class GamePredictionComputation:
     latest_quotes: pl.DataFrame
     roster: pl.DataFrame
     injuries: pl.DataFrame
+    model_profile: ModelProfile
 
     @property
     def simulation(self) -> GameSimulationResult:
@@ -708,6 +759,7 @@ def compute_game_prediction(
     max_confidence_tier: int = 2,
     market_mode: str = "live",
     state_context_callback: Callable[[StateProvenanceContext], None] | None = None,
+    model_profile: ModelProfile,
 ) -> GamePredictionComputation | None:
     """Run exactly one coherent football simulation for `game_id` as of
     `as_of` and return it bundled with everything current-market pricing
@@ -731,6 +783,7 @@ def compute_game_prediction(
         team_state_config=team_state_config,
         game_ids={game_id},
         state_context_callback=state_context_callback,
+        model_profile=model_profile,
     )
     if inputs is None:
         return None
@@ -766,6 +819,7 @@ def compute_game_prediction(
         latest_quotes=inputs.latest_quotes,
         roster=inputs.roster,
         injuries=inputs.injuries,
+        model_profile=inputs.model_profile,
     )
 
 

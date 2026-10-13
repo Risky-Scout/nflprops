@@ -1,12 +1,12 @@
 """Canonical market quote-time semantics.
 
-For LIVE markets the knowledge timestamp is collector_received_at: a provider
-timestamp may describe when the provider changed a quote, but cannot prove when
-our system learned it.
-
-For reconstructed historical OPENING markets, available_at is the explicitly
-reconstructed opened_at knowledge timestamp. Backfill collector receipt times
-must never replace it.
+STEP 2D: for EVERY market mode the knowledge timestamp is
+collector_received_at -- when this system genuinely received the quote. A
+provider timestamp (`provider_updated_at`, `opened_at`) may describe when the
+provider changed or opened a quote, but cannot prove when our system knew it,
+so it never makes a quote visible to a prediction: a historical OPENING quote
+first received by a later backfill is not knowable before that receipt.
+`opened_at` stays on the row as metadata only. No post-cutoff tolerance.
 """
 
 from __future__ import annotations
@@ -52,7 +52,8 @@ def quote_time_source(
         return "collector_received_at"
 
     if market_mode == "opening":
-        return "available_at"
+        # Never `available_at`/`opened_at`: those can predate receipt.
+        return "collector_received_at"
 
     raise MarketTimingError(
         f"unsupported market_mode: {market_mode!r}"

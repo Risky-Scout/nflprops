@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING
 from nflprops.calibration.artifact import (
     TERMINAL_INELIGIBLE_EVENT_TYPES,
     CalibrationArtifact,
+    CalibrationArtifactError,
     CalibrationLifecycleEventType,
     compute_champion_key,
     compute_compatibility_digest,
@@ -62,6 +63,11 @@ from nflprops.calibration.payload_store import (
     get_calibration_payload,
 )
 from nflprops.collection.resource_availability import deterministic_id
+from nflprops.domain.model_profile import (
+    ModelProfileError,
+    parse_model_profile,
+    require_profile_match,
+)
 from nflprops.orchestration import calibration_store
 from nflprops.orchestration.calibration_store import (
     CalibrationChampion,
@@ -575,6 +581,7 @@ def resolve_calibration_champion(
     *,
     scope_type: str,
     checkpoint_scope: str,
+    model_profile: str,
     base_model_version: str,
     simulation_config_version: str,
     feature_contract_version: str,
@@ -589,7 +596,9 @@ def resolve_calibration_champion(
     holds exactly:
 
     * a `calibration_champions` row exists for the exact
-      `(scope_type, checkpoint_scope, compatibility_digest)` key;
+      `(scope_type, checkpoint_scope, compatibility_digest)` key -- the
+      digest includes `model_profile`, so a calibrator fitted on one
+      profile's predictions is never resolved for another profile;
     * the referenced artifact still exists;
     * the artifact has NOT reached a terminal lifecycle state
       (INVALIDATED/RETIRED), independent of what the champion row says;
@@ -611,7 +620,12 @@ def resolve_calibration_champion(
     if checkpoint_scope not in active_contract.checkpoint_scopes:
         return None
 
+    try:
+        profile = parse_model_profile(model_profile).value
+    except ModelProfileError:
+        return None
     compatibility_digest = compute_compatibility_digest(
+        model_profile=profile,
         base_model_version=base_model_version,
         simulation_config_version=simulation_config_version,
         feature_contract_version=feature_contract_version,
@@ -632,7 +646,11 @@ def resolve_calibration_champion(
     if champion.compatibility_digest != compatibility_digest:
         return None
 
-    artifact = load_artifact(backend, champion.calibration_artifact_id)
+    try:
+        artifact = load_artifact(backend, champion.calibration_artifact_id)
+    except CalibrationArtifactError:
+        # e.g. a legacy row without a model_profile: never applied.
+        return None
     if artifact is None:
         return None
 
@@ -663,7 +681,8 @@ def resolve_calibration_champion(
     if exact_compat != compatibility_digest:
         return None
     if (
-        artifact.base_model_version != base_model_version
+        artifact.model_profile != profile
+        or artifact.base_model_version != base_model_version
         or artifact.simulation_config_version != simulation_config_version
         or artifact.feature_contract_version != feature_contract_version
         or artifact.prop_contract_version != prop_contract_version
@@ -685,3 +704,14 @@ def resolve_calibration_champion(
             return None
 
     return artifact
+
+
+def require_calibrator_applicable(
+    artifact: CalibrationArtifact, *, prediction_profile: str
+) -> None:
+    """Fail closed unless `artifact` was fitted on predictions of
+    `prediction_profile` -- the explicit application-time check, in
+    addition to profile-scoped champion resolution."""
+    require_profile_match(
+        prediction_profile=prediction_profile, calibrator_profile=artifact.model_profile
+    )

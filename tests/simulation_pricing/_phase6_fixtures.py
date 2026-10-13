@@ -205,6 +205,18 @@ def build_multi_player_warehouse(
         ),
     )
 
+    # Each team's roster batch (identity only, no depth), received long
+    # before any cutoff: every real candidate is a structural member.
+    warehouse.write("roster_snapshots", pl.DataFrame(
+        [
+            {"canonical_player_id": pid, "canonical_team_id": team, "depth": None,
+             "available_at": HIST_KICKOFF, "available_at_is_estimated": False}
+            for pid, team in ((HOME_WR_ID, HOME_TEAM_ID), (HOME_RB_ID, HOME_TEAM_ID),
+                              (AWAY_WR_ID, AWAY_TEAM_ID))
+        ],
+        schema_overrides={"depth": pl.Int64},
+    ))
+
     quote_rows = [
         _quote_row(index=i, player_id=quote_player_id, available_at=quote_available_at)
         for i in range(n_quote_rows)

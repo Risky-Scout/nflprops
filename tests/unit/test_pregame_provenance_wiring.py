@@ -73,6 +73,8 @@ def test_provenance_attachment_preserves_original_values() -> None:
         "canonical_player_id": "player-1",
         "prop_type": "receiving_yards",
         "available_at": quote_available_at,
+        # STEP 2D: opening quotes are knowable only from genuine receipt.
+        "collector_received_at": quote_available_at,
     }
 
     roster = pl.DataFrame(
@@ -153,6 +155,8 @@ def test_case_c_no_injury_collection_at_all_records_data_unavailable() -> None:
         "canonical_player_id": "player-1",
         "prop_type": "receiving_yards",
         "available_at": quote_available_at,
+        # STEP 2D: opening quotes are knowable only from genuine receipt.
+        "collector_received_at": quote_available_at,
     }
 
     enriched = _audit_and_attach_prediction_provenance(
@@ -201,6 +205,8 @@ def test_case_b_zero_relevant_rows_from_successful_collection_still_available() 
         "canonical_player_id": "player-1",
         "prop_type": "receiving_yards",
         "available_at": quote_available_at,
+        # STEP 2D: opening quotes are knowable only from genuine receipt.
+        "collector_received_at": quote_available_at,
     }
 
     enriched = _audit_and_attach_prediction_provenance(
@@ -243,6 +249,7 @@ def test_future_quote_fails_before_persistence() -> None:
         "canonical_player_id": "player-1",
         "prop_type": "receiving_yards",
         "available_at": AS_OF + timedelta(seconds=1),
+        "collector_received_at": AS_OF + timedelta(seconds=1),
     }
 
     with pytest.raises(LeakageError):
@@ -303,7 +310,9 @@ def test_state_history_guard_precedes_state_build_and_simulation() -> None:
     """
     inputs_source = inspect.getsource(_prepare_prediction_inputs)
     history_guard = inputs_source.index("_assert_state_history_safe_for_games(")
-    state_build = inputs_source.index("build_team_states(")
+    # Gate 1: states are built via the shared, profile-aware
+    # `build_model_inputs(` (nflprops.pipelines.model_inputs).
+    state_build = inputs_source.index("build_model_inputs(")
     assert history_guard < state_build
 
     week_source = inspect.getsource(predict_week)

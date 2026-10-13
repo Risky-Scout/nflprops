@@ -60,6 +60,19 @@
 #   ingest-stats SEASON [WEEKS]
 #                          BLOCK 4: append final-game outcome versions
 #                          (genuine receipt time; never fabricated PIT)
+#   games-backfill SEASON WEEKS EXPECTED_IDS [apply] [postseason]
+#                          PR #21: restore missing games rows from genuine
+#                          stored BDL games-endpoint receipts (receipt-time PIT
+#                          only, exact expected-ID guard, idempotent).
+#                          READ-ONLY dry-run unless the literal 'apply'.
+#   games-metadata-report  READ-ONLY: state games missing games metadata,
+#                          grouped as exact games-backfill arguments
+#   champion-install ARTIFACT_ID [apply]
+#                          install the CERTIFIED production champion artifact
+#                          shipped with this release into the live registry
+#                          and set the STRUCTURAL_CORE champion pointer
+#                          (registry rows only -- no fitting, no compute).
+#                          Verify-only unless the literal 'apply'.
 #
 # Runs as wizard-deploy. Touches no other service, nginx, or any path
 # outside RUNTIME_ROOT; the only privileged action is the scoped restart.
@@ -568,6 +581,44 @@ main() {
       else
         runtime_python -m nflprops.platform.wizard_runtime ingest-stats \
           --seasons "$1" || die "ingest-stats failed"
+      fi
+      ;;
+    games-backfill)
+      { [ "$#" -ge 3 ] && [ "$#" -le 5 ]; } || die "games-backfill needs SEASON WEEKS EXPECTED_IDS [apply] [postseason]"
+      [[ "$1" =~ ^20[0-9]{2}$ ]] || die "season format"
+      [[ "$2" =~ ^[0-9]{1,2}(,[0-9]{1,2})*$ ]] || die "weeks format"
+      [[ "$3" =~ ^[0-9a-f-]{36}(,[0-9a-f-]{36})*$ ]] || die "expected ids format"
+      backfill_flags=()
+      backfill_apply=""
+      for token in "${@:4}"; do
+        if [ "$token" = "apply" ]; then
+          backfill_apply=1
+        elif [ "$token" = "postseason" ]; then
+          backfill_flags+=(--postseason)
+        else
+          die "4th argument must be the literal 'apply' (or 'postseason')"
+        fi
+      done
+      [ -n "$backfill_apply" ] && backfill_flags+=(--apply)
+      runtime_python -m nflprops.platform.wizard_runtime games-backfill \
+        --season "$1" --weeks "$2" --expected-ids "$3" "${backfill_flags[@]}" \
+        || die "games-backfill failed"
+      ;;
+    games-metadata-report)
+      [ "$#" -eq 0 ] || die "games-metadata-report takes no arguments"
+      runtime_python -m nflprops.platform.wizard_runtime games-metadata-report \
+        || die "games-metadata-report failed"
+      ;;
+    champion-install)
+      { [ "$#" -eq 1 ] || [ "$#" -eq 2 ]; } || die "champion-install needs ARTIFACT_ID [apply]"
+      [[ "$1" =~ ^[0-9a-f]{64}$ ]] || die "artifact id format"
+      if [ "$#" -eq 2 ]; then
+        [ "$2" = "apply" ] || die "2nd argument must be the literal 'apply'"
+        runtime_python -m nflprops.platform.wizard_runtime champion-install \
+          --artifact-id "$1" --apply || die "champion-install failed"
+      else
+        runtime_python -m nflprops.platform.wizard_runtime champion-install \
+          --artifact-id "$1" || die "champion-install verify failed"
       fi
       ;;
     *) die "unknown operation $op" ;;

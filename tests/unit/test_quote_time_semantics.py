@@ -57,19 +57,13 @@ def test_live_quote_knowledge_time_is_collector_receipt() -> None:
     )
 
 
-def test_opening_quote_uses_reconstructed_available_at() -> None:
-    opening_time = (
-        AS_OF
-        - timedelta(
-            days=2
-        )
-    )
-    backfill_receipt = (
-        AS_OF
-        + timedelta(
-            days=100
-        )
-    )
+def test_opening_quote_is_knowable_only_from_genuine_receipt() -> None:
+    """STEP 2D (inverts the pre-2D rule): an opening quote first received
+    by a backfill 100 days later is knowable only from that receipt --
+    never from its provider `opened_at` or an `available_at` copied from
+    it."""
+    opening_time = AS_OF - timedelta(days=2)
+    backfill_receipt = AS_OF + timedelta(days=100)
 
     quote = {
         "available_at": opening_time,
@@ -77,20 +71,17 @@ def test_opening_quote_uses_reconstructed_available_at() -> None:
         "collector_received_at": backfill_receipt,
     }
 
-    assert (
+    assert quote_knowledge_time(quote, market_mode="opening") == backfill_receipt
+    assert quote_time_source("opening") == "collector_received_at"
+
+
+def test_opening_quote_without_receipt_fails_closed() -> None:
+    with pytest.raises(MarketTimingError, match="collector_received_at"):
         quote_knowledge_time(
-            quote,
+            {"available_at": AS_OF - timedelta(days=2), "opened_at": AS_OF - timedelta(days=2),
+             "collector_received_at": None},
             market_mode="opening",
         )
-        == opening_time
-    )
-
-    assert (
-        quote_time_source(
-            "opening"
-        )
-        == "available_at"
-    )
 
 
 def test_live_quote_cannot_fall_back_to_provider_time() -> None:

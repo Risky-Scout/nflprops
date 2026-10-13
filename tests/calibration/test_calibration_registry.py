@@ -54,6 +54,7 @@ def _artifact(**overrides: object):
         algorithm_version="v1",
         scope_type="JOINT_GAME",
         checkpoint_scope="ALL_PREGAME_CHECKPOINTS",
+        model_profile="STRUCTURAL_CORE",
         base_model_version="2026.1.0",
         simulation_config_version="sim-v1",
         feature_contract_version="2026.1.0",
@@ -105,6 +106,7 @@ def _resolve_kwargs(**overrides: object) -> dict:
     base = dict(
         scope_type="JOINT_GAME",
         checkpoint_scope="ALL_PREGAME_CHECKPOINTS",
+        model_profile="STRUCTURAL_CORE",
         base_model_version="2026.1.0",
         simulation_config_version="sim-v1",
         feature_contract_version="2026.1.0",

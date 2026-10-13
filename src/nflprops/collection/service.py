@@ -36,6 +36,7 @@ from nflprops.collection.resource_availability import (
 from nflprops.config import Config, config_sha256
 from nflprops.data.warehouse import Warehouse, records_to_frame
 from nflprops.domain.hashing import hash_payload
+from nflprops.domain.market_identity import PLAYER_PROP_SNAPSHOT_KEY
 from nflprops.domain.protocols import (
     AvailabilityProvider,
     FullProvider,
@@ -459,13 +460,7 @@ def collect_once(
                 warehouse.append(
                     "player_prop_snapshots",
                     props_outcome.rows,
-                    key=[
-                        "canonical_game_id",
-                        "canonical_player_id",
-                        "prop_type",
-                        "vendor",
-                        "collector_received_at",
-                    ],
+                    key=list(PLAYER_PROP_SNAPSHOT_KEY),
                     sort_by=["collector_received_at"],
                 )
         if props_statuses and all(

@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
 import numpy as np
 import polars as pl
 
+from nflprops.domain.market_identity import (
+    PLAYER_PROP_BOOK_KEY,
+    PLAYER_PROP_MARKET_IDENTITY,
+)
 from nflprops.market.devig import proportional_two_sided
 
 
@@ -42,6 +47,13 @@ def game_market_consensus(
     *,
     as_of: datetime,
 ) -> GameMarketConsensus:
+    """Median spread/total across books' latest rows at `as_of`. No rows at
+    all -- including a frame with no columns, i.e. no market input (the
+    STRUCTURAL_CORE profile) -- is the explicit no-market result: both
+    values None, zero books; never a fabricated 0.0 line. A non-empty frame
+    missing its required columns still fails."""
+    if frame.is_empty():
+        return GameMarketConsensus(game_id, None, None, 0, 0)
     rows = _latest_vendor_rows(frame, as_of).filter(
         pl.col("canonical_game_id") == game_id
     )
@@ -72,7 +84,15 @@ def latest_prop_quotes(
     *,
     as_of: datetime,
     game_id: str | None = None,
+    group_by: Sequence[str] = PLAYER_PROP_BOOK_KEY,
 ) -> pl.DataFrame:
+    """Quotes known at `as_of`: per `group_by`, the rows of the latest
+    genuine receipt at or before it.
+
+    Live snapshots group by sportsbook/player/prop (`PLAYER_PROP_BOOK_KEY`):
+    each poll replaces a book's whole offer for that prop. Openings group
+    by market identity (`PLAYER_PROP_MARKET_IDENTITY`): each opening is an
+    independent, immutable first observation."""
     if frame.is_empty():
         return frame
     time_col = (
@@ -83,13 +103,15 @@ def latest_prop_quotes(
     out = frame.filter(pl.col(time_col).is_not_null() & (pl.col(time_col) <= as_of))
     if game_id is not None:
         out = out.filter(pl.col("canonical_game_id") == game_id)
-    keys = [
-        "canonical_game_id",
-        "canonical_player_id",
-        "prop_type",
-        "vendor",
-    ]
-    return out.sort(time_col).group_by(keys, maintain_order=True).tail(1)
+    # The LATEST genuine receipt at or before `as_of` per group -- and every
+    # market that receipt carried (a poll holds whole milestone ladders / alt
+    # lines; `domain.market_identity`). A market a later poll no longer
+    # offered is never resurrected from an older poll, and a tie never
+    # depends on row order.
+    keys = list(group_by)
+    latest = pl.col(time_col) == pl.col(time_col).max().over(keys)
+    order = [c for c in (*PLAYER_PROP_MARKET_IDENTITY, time_col) if c in out.columns]
+    return out.filter(latest).sort(order, nulls_last=True, maintain_order=True)
 
 
 def fair_over_probability(over_odds: int, under_odds: int) -> float:

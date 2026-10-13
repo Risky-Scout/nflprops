@@ -1,0 +1,37 @@
+{
+  "schema_version": "nflprops.certified_production_calibrators/v1",
+  "note": "The ONLY calibrators the live checkpoint path may apply. Each entry pins the identity a resolved registry champion must equal exactly, and the payload bytes shipped beside this file (payloads/<object_uri>). Adding an entry requires a PROMOTION_CERTIFIED historical run and a GitHub Linux fit (production-calibrator.yml); it never approves or promotes anything by itself.",
+  "calibrators": [
+    {
+      "production_calibrator_id": "ea5965cc6cc5d8b00584c86aa6e4956200d949ec53a85e706bbd48c2f55ea9f5",
+      "object_uri": "calibration/structural-core-production-2026.json",
+      "payload_sha256": "6131b060e73f263326fa62f13e2103969ea9b1a50f1d5d4801cb494f3fe41db5",
+      "payload_byte_count": 627,
+      "scientific_content_sha256": "a11807a4c729d8243dabb2ce7c21e92d81b3d578798768538e616b55396623e8",
+      "algorithm": "joint_game_entropy_tilting_softmax/v1",
+      "model_profile": "STRUCTURAL_CORE",
+      "model_profile_id": "2026.1.0+structural-core.v3-roster-eligible-player-universe",
+      "scope_type": "JOINT_GAME",
+      "checkpoint_scope": "ALL_PREGAME_CHECKPOINTS",
+      "simulation_config_version": "sim-v1",
+      "feature_contract_version": "joint_game_calibration_features/v1",
+      "prop_contract_version": "2026.1.0",
+      "calibration_contract_version": "2026.1.0",
+      "regularization_lambda": 0.01,
+      "evidence_model_version": "phase10c3a-real-run-v1",
+      "evidence_model_config_sha256": "dc52bdca3d9a3f625cc49dbb9018c7965bad349055beb2fb2e1dde9e36aba0db",
+      "evidence_sim_config_sha256": "13b1f9c96de0813dbf206e10ff47a57e58ac13040a59b6e28a093700e88c06f5",
+      "science_base_sha": "c7e955197bd175cec6c69f25d4a4cb5b9c198753",
+      "certification_run_id": "38119578780",
+      "fit_run_id": "38127194420",
+      "training_cutoff": "2026-05-26T11:55:00+00:00",
+      "registry_rows": {
+        "source": "GitHub Actions run 38127194420 artifact production-calibrator (registry_warehouse/)",
+        "calibration_artifacts.parquet": "c6fc2f405c8ab8545eddaa9584207f95961074a87e571ecce89805f12c872dbd",
+        "calibration_validations.parquet": "c1c42681a9dd793c9fd45f1bfb21a80e597358a7267d4ed01abe0a33031916df",
+        "calibration_lifecycle_events.parquet": "afc1ef1b987ed030f08195e88546f08d68c16cc198d58a49c672f66a01844dfc"
+      },
+      "fit_manifest_sha256": "3e03716ba7e9ca9c8a0c612afd387ece3eeb89d8f984ee7da3b1928c8955f301"
+    }
+  ]
+}

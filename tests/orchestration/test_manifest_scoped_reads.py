@@ -189,6 +189,13 @@ def _partitioned(root: Path) -> Warehouse:
     return wh
 
 
+@pytest.fixture(autouse=True)
+def _fresh_manifest_cache() -> None:
+    """These tests observe the manifest's own reads/page-cache calls, so
+    every build must really compute (not hit the per-process memo)."""
+    manifest_module._manifest_cache.clear()
+
+
 @pytest.fixture(scope="module")
 def warehouses(tmp_path_factory: pytest.TempPathFactory) -> tuple[Warehouse, Warehouse]:
     base = tmp_path_factory.mktemp("manifest")

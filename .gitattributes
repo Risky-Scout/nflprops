@@ -1,0 +1,2 @@
+contracts/production_calibrators/payloads/** -text -diff binary
+src/nflprops/resources/contracts/production_calibrators/payloads/** -text -diff binary

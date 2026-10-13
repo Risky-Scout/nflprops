@@ -50,7 +50,7 @@ def test_official_checkpoint_uses_one_simulation_and_persists_run_provenance(
     monkeypatch.setattr(pregame_module, "simulate_game", _spy)
 
     results = checkpoint_dispatch_flow(
-        warehouse=warehouse, config=Config(data={}), season=SEASON, week=WEEK, now=as_of
+        warehouse=warehouse, config=Config(data={"model": {"profile": "LIVE_ENHANCED"}}), season=SEASON, week=WEEK, now=as_of
     )
 
     t30m = [r for r in results if r.checkpoint_name == CheckpointName.T30M.value]
@@ -108,7 +108,7 @@ def test_catch_up_simulation_uses_scheduled_as_of_not_actual_execution_time(
     monkeypatch.setattr(pregame_module, "simulate_game", _spy)
 
     results = checkpoint_dispatch_flow(
-        warehouse=warehouse, config=Config(data={}), season=SEASON, week=WEEK, now=late_now
+        warehouse=warehouse, config=Config(data={"model": {"profile": "LIVE_ENHANCED"}}), season=SEASON, week=WEEK, now=late_now
     )
 
     t90m = [r for r in results if r.checkpoint_name == CheckpointName.T90M.value]

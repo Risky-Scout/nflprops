@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 
 import typer
 
+from nflprops.domain.model_profile import resolve_model_profile
 from nflprops.paths import repository_root, runtime_resource
 from nflprops.providers.bdl.spec import DEFAULT_SPEC_URL, pin_spec
 from nflprops.providers.bdl.spec import drift as bdl_spec_drift
@@ -443,6 +444,7 @@ def checkpoint_run_cmd(
             n_draws=draws,
             official_run_id=run_id,
             checkpoint_name=CheckpointName.MANUAL.value,
+            model_profile=resolve_model_profile(cfg),
         )
     except Exception as exc:
         update_run_status(
@@ -575,6 +577,7 @@ def predict(
         player_state_config=player_state_cfg,
         team_state_config=team_state_cfg,
         max_confidence_tier=int(cfg.get_path("market.max_confidence_tier", 2)),
+        model_profile=resolve_model_profile(cfg),
     )
     if out.is_empty():
         typer.echo("No priceable prop quotes found.")
