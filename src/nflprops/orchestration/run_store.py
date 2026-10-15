@@ -35,6 +35,11 @@ FAILURE_CHECKPOINT_MISSED = "CHECKPOINT_MISSED"
 #: cutoff predates the start of production collection). Identity and
 #: cutoff stay recorded; it is never executed as PIT-faithful science.
 FAILURE_INSUFFICIENT_PRE_CUTOFF_PIT_DATA = "INSUFFICIENT_PRE_CUTOFF_PIT_DATA"
+#: OPERATIONAL, like CHECKPOINT_MISSED: the claimed checkpoint was never
+#: executed and its request was retired once its execution window closed
+#: (`nflprops.platform.request_retirement`). Says nothing about the
+#: checkpoint's inputs or science.
+FAILURE_REQUEST_RETIRED_OBSOLETE = "REQUEST_RETIRED_OBSOLETE"
 
 
 class PredictionRunStatus(str, Enum):  # noqa: UP042
