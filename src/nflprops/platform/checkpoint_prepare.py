@@ -121,6 +121,11 @@ STATE_PENDING_REMOTE_EXECUTION = "PENDING_REMOTE_EXECUTION"
 #: The reason is the run's `failure_code`
 #: (FAILURE_INSUFFICIENT_PRE_CUTOFF_PIT_DATA).
 STATE_NOT_EXECUTABLE = "NOT_EXECUTABLE"
+#: Terminal, OPERATIONAL (never a scientific verdict): a request that was
+#: never executed and whose execution window has closed, retired with an
+#: immutable audit record (`request_retirement`). Its run is FAILED /
+#: REQUEST_RETIRED_OBSOLETE; its snapshot falls back to bounded retention.
+STATE_RETIRED_OBSOLETE = "RETIRED_OBSOLETE"
 
 #: Provider feeds a live official checkpoint's model inputs come from. Each
 #: must have been successfully checked (collector_resource_runs semantics,
@@ -252,7 +257,13 @@ def protected_snapshot_ids(warehouse: Warehouse) -> frozenset[str]:
     request references -- never pruned -- plus the snapshot of a pinned,
     still-unremediated false refusal (`refusal_incidents`), which the
     audited remediation must be able to re-verify."""
-    requests = _read_requests(warehouse).filter(
+    return protected_snapshot_ids_in(_read_requests(warehouse))
+
+
+def protected_snapshot_ids_in(requests: pl.DataFrame) -> frozenset[str]:
+    """`protected_snapshot_ids` over request rows already in hand (e.g. the
+    rows as they would be after a retirement)."""
+    requests = requests.filter(
         pl.col("state").is_in(list(SNAPSHOT_PROTECTING_STATES))
         | (
             (pl.col("state") == STATE_NOT_EXECUTABLE)

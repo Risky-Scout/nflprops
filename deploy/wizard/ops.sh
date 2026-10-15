@@ -48,6 +48,16 @@
 #                          BLOCK 4: audited remediation of ONE pinned false
 #                          NOT_EXECUTABLE refusal (refusal_repair); refuses
 #                          every request that is not the pinned incident
+#   checkpoint-retire-obsolete [CONFIRMATION_TOKEN]
+#                          audited retirement of the OPERATOR_BACKLOG
+#                          (request_retirement): never-executed requests
+#                          prepared before automatic retirement, kickoff
+#                          + 72h passed, nothing depending on them.
+#                          READ-ONLY dry run (exact requests, snapshots
+#                          retention would delete, exact bytes freed,
+#                          token) unless the dry run's token is given ->
+#                          RETIRED_OBSOLETE + audit rows, then ordinary
+#                          snapshot retention once.
 #   outcome-ingest-hold    BLOCK 4: create $ROOT/state/outcome_ingest.hold --
 #                          the runtime's recurring outcome ingest never starts
 #   outcome-ingest-release BLOCK 4: remove that hold file
@@ -570,6 +580,17 @@ main() {
       [[ "$2" =~ ^INC-[A-Za-z0-9-]{1,80}$ ]] || die "incident id format"
       runtime_python -m nflprops.platform.wizard_runtime checkpoint repair-false-refusal \
         --run-id "$1" --incident-id "$2" || die "false-refusal repair failed"
+      ;;
+    checkpoint-retire-obsolete)
+      [ "$#" -le 1 ] || die "checkpoint-retire-obsolete takes at most CONFIRMATION_TOKEN"
+      if [ "$#" -eq 1 ]; then
+        [[ "$1" =~ ^[a-p]{64}$ ]] || die "confirmation token format"
+        runtime_python -m nflprops.platform.wizard_runtime checkpoint retire-obsolete \
+          --apply --confirmation "$1" || die "request retirement failed"
+      else
+        runtime_python -m nflprops.platform.wizard_runtime checkpoint retire-obsolete \
+          || die "request retirement dry run failed"
+      fi
       ;;
     ingest-stats)
       [ "$#" -ge 1 ] && [ "$#" -le 2 ] || die "ingest-stats needs SEASON [WEEKS]"

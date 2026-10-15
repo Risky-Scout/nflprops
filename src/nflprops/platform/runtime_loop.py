@@ -114,6 +114,7 @@ from nflprops.platform.checkpoint_worker import (
     prepare_due_checkpoints_in_worker,
     supervise_child,
 )
+from nflprops.platform.request_retirement import MODE_AUTOMATIC, retire_requests
 from nflprops.platform.runtime_layout import RuntimeLayout
 from nflprops.platform.storage_guard import (
     LEVEL_FAIL_CLOSED,
@@ -799,6 +800,7 @@ class RuntimeLoop:
                 retained = prune_raw_payloads(
                     self.layout, retention_days=self.raw_retention_days, now=now
                 )
+            self._retire_expired_requests(now)
         self._prune()
         free = free_gib(self.layout.root)
         self._disk_level = disk_level(free)
@@ -823,6 +825,33 @@ class RuntimeLoop:
             _log("storage_housekeeping", **storage)
         if self._disk_level != LEVEL_OK:
             _log("disk_level", logging.WARNING, disk_level=self._disk_level, free_gib=round(free, 3))
+
+    def _retire_expired_requests(self, now: datetime) -> None:
+        """AUTOMATIC request retirement (`request_retirement`), under the
+        writer lock the caller holds, before retention runs: a request whose
+        execution window closed unexecuted stops pinning its snapshot. Runs
+        even when the disk is FAIL_CLOSED -- it only ever releases
+        protection. A failure is reported, never fatal to housekeeping."""
+        try:
+            result = retire_requests(
+                self.layout, self.warehouse, mode=MODE_AUTOMATIC, now=now,
+                keep=self.snapshot_retention, retiring_release_sha=self.release_sha,
+                lock_held=True,
+            )
+        except Exception as exc:  # retirement must never stop housekeeping
+            error = f"{type(exc).__name__}: {exc}"[:500]
+            self._last["request_retirement"] = {"at": now.isoformat(), "status": "FAILED",
+                                                "error": error}
+            _log("request_retirement_failed", logging.ERROR, error=error)
+            return
+        self._last["request_retirement"] = {
+            "at": now.isoformat(), "status": result["status"],
+            "retired": len(result["retired"]), "held": result["held"],
+        }
+        if result["retired"]:
+            _log("requests_retired", retired=result["retired"],
+                 cohort_digest=result["cohort_digest"],
+                 snapshots_released=result["snapshots_released"])
 
     def _prune(self) -> None:
         pruned = prune_snapshots(

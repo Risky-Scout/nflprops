@@ -767,6 +767,73 @@ def checkpoint_repair_false_refusal(
     typer.echo(json.dumps(record, sort_keys=True, default=str))
 
 
+@checkpoint_app.command("retire-obsolete")
+def checkpoint_retire_obsolete(
+    apply: bool = typer.Option(False, "--apply", help="Write (default: dry run, read-only)."),
+    confirmation: str = typer.Option(
+        "", help="--apply: the dry run's confirmation_token for the exact request set."
+    ),
+) -> None:
+    """WIZARD SIDE: audited retirement of the OPERATOR_BACKLOG -- the
+    never-executed requests prepared before automatic retirement took
+    effect whose execution window has closed (`request_retirement`).
+    Dry run (default): the exact requests, the snapshots retention would
+    then delete, the exact bytes freed and the confirmation token. With
+    --apply and that token: append the immutable retirement records, retire
+    the requests (RETIRED_OBSOLETE, never NOT_EXECUTABLE), then run the
+    ordinary snapshot retention once and report what it freed."""
+    import json
+    import shutil
+    from datetime import UTC, datetime
+
+    from nflprops.config import load
+    from nflprops.data.warehouse import Warehouse
+    from nflprops.platform.checkpoint_prepare import protected_snapshot_ids
+    from nflprops.platform.request_retirement import (
+        MODE_OPERATOR_BACKLOG,
+        RequestRetirementError,
+        plan_retirement,
+        retire_requests,
+    )
+    from nflprops.platform.runtime_layout import running_release_sha
+
+    layout = _layout()
+    warehouse = Warehouse(layout.warehouse_root)
+    keep = snapshot_retention()
+    now = datetime.now(UTC)
+    if not apply:
+        plan = plan_retirement(
+            layout, warehouse, mode=MODE_OPERATOR_BACKLOG, now=now, keep=keep, config=load()
+        )
+        payload = {**plan.as_dict(), "status": "DRY_RUN", "proofs": plan.proofs}
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return
+    if not confirmation:
+        raise typer.BadParameter("--apply requires --confirmation <confirmation_token>")
+    free_before = shutil.disk_usage(layout.root).free
+    try:
+        result = retire_requests(
+            layout, warehouse, mode=MODE_OPERATOR_BACKLOG, now=now, keep=keep,
+            retiring_release_sha=running_release_sha(), confirmation=confirmation,
+            config=load(),
+        )
+        pruned = prune_snapshots(
+            layout.snapshots, keep=keep,
+            protected=lambda: protected_snapshot_ids(warehouse),
+            lock_path=layout.writer_lock,
+        )
+    except (RequestRetirementError, WriterLockError) as exc:
+        typer.echo(f"FAILED: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    payload = {
+        **result,
+        "snapshots_pruned": pruned,
+        "free_bytes_before": free_before,
+        "free_bytes_after": shutil.disk_usage(layout.root).free,
+    }
+    typer.echo(json.dumps(payload, indent=2, sort_keys=True, default=str))
+
+
 # ------------------------------------------------------------ BLOCK 4
 
 
