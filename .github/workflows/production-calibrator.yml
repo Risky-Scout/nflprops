@@ -63,7 +63,7 @@ jobs:
           echo "CERTIFIED_RUN_ID=$RUN_ID" >> "$GITHUB_ENV"
 
       - name: Download certified data root
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: phase10c3a-data-root
           path: ${{ runner.temp }}/data-root
@@ -71,7 +71,7 @@ jobs:
           github-token: ${{ github.token }}
 
       - name: Download certified compact shards
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: phase10c3a-compact-s*
           path: ${{ runner.temp }}/shards
@@ -79,7 +79,7 @@ jobs:
           github-token: ${{ github.token }}
 
       - name: Download certified science output
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: phase10c3a-science-output
           path: ${{ runner.temp }}/science
