@@ -547,6 +547,9 @@ def test_ops_workflow_is_main_only_fixed_menu() -> None:
         # launch: guarded games-metadata backfill (dry-run unless apply) and
         # its read-only report; certified champion install (registry only)
         "games-backfill", "games-metadata-report", "champion-install",
+        # audited retirement of the never-executed request backlog (dry run
+        # unless the dry run's confirmation token is given)
+        "checkpoint-retire-obsolete",
     ]
     assert "refs/heads/main" in WIZARD_OPS.read_text()
     assert doc["jobs"]["ops"]["environment"] == "wizardofodds.com"
