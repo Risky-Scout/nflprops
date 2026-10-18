@@ -231,6 +231,18 @@ def _read_requests(warehouse: Warehouse) -> pl.DataFrame:
     return frame
 
 
+def _still_preparing(warehouse: Warehouse, claimed: pl.DataFrame) -> pl.DataFrame:
+    """The CURRENT rows of the `claimed` requests that are still PREPARING.
+    Call under the writer lock: `claimed` was read outside it, and another
+    writer (an operator retirement) may have moved a row on since -- writing
+    the stale copy back would resurrect it."""
+    current = _read_requests(warehouse).filter(
+        pl.col("request_id").is_in(claimed["request_id"].to_list())
+        & (pl.col("state") == STATE_PREPARING)
+    )
+    return current.sort(_PREPARING_ORDER)
+
+
 def _upsert_request(warehouse: Warehouse, row: dict[str, Any]) -> None:
     frame = pl.DataFrame([row], schema=_REQUEST_SCHEMA)
     warehouse.append(
@@ -620,7 +632,7 @@ def _finish_preparing(
             # reference it first, so it is never observable as an ordinary,
             # unprotected periodic snapshot -- not by pruning, not by the
             # storage_growth health check.
-            for request in preparing.iter_rows(named=True):
+            for request in _still_preparing(warehouse, preparing).iter_rows(named=True):
                 _upsert_request(
                     warehouse,
                     {
@@ -641,7 +653,7 @@ def _finish_preparing(
         )
     prepared: list[PreparedCheckpoint] = []
     with WriterLock(layout.writer_lock, timeout_seconds=lock_timeout_seconds):
-        for request in preparing.iter_rows(named=True):
+        for request in _still_preparing(warehouse, preparing).iter_rows(named=True):
             bundle_sha, bundle_dir = _publish_request_bundle(
                 layout, warehouse, request, snapshot=snapshot, market_mode=market_mode,
                 config=config,

@@ -488,3 +488,40 @@ def test_terminal_requests_are_never_retired(env: dict) -> None:
     plan = _backlog_plan(env)
     assert refused not in [row["run_id"] for row in plan.candidates]
     assert refused not in plan.held
+
+
+def test_a_request_without_kickoff_is_held_not_dropped(env: dict) -> None:
+    undated = env["backlog"][1]
+    _upsert_request(env["warehouse"], {**_request(env, undated), "kickoff_at": None})
+    plan = _backlog_plan(env)
+    assert plan.held == {undated: "NO_KICKOFF"}
+    assert undated not in [row["run_id"] for row in plan.candidates]
+
+
+def test_a_prep_pass_racing_an_operator_retirement_never_resurrects_it(
+    env: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The prep worker claims PREPARING rows outside the writer lock; an
+    operator apply that retires one of them in between must win -- the
+    worker's stale copy is never written back as PREPARING or PENDING."""
+    from nflprops.platform import checkpoint_prepare as cp
+
+    racing = env["backlog"][0]
+    _upsert_request(env["warehouse"], {**_request(env, racing), "state": cp.STATE_PREPARING})
+    token = _backlog_plan(env).confirmation_token
+    real_create = cp.create_snapshot
+
+    def _retire_then_snapshot(**kwargs: Any):
+        _retire_backlog(env, token)  # lands after the worker's claim read
+        return real_create(**kwargs)
+
+    monkeypatch.setattr(cp, "create_snapshot", _retire_then_snapshot)
+    monkeypatch.setattr(cp, "_published_claim_snapshot", lambda *_a, **_k: None)
+    _snapshot, prepared = cp._finish_preparing(
+        env["layout"], env["warehouse"], config=env["config"],
+        migration_head="0009_compact_pmf_payload", hostname="h",
+        lock_timeout_seconds=5.0, market_mode="live",
+    )
+    assert prepared == []
+    assert _request(env, racing)["state"] == STATE_RETIRED_OBSOLETE
+    assert racing not in executable_requests(env["warehouse"])["run_id"].to_list()

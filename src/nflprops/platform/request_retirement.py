@@ -254,11 +254,14 @@ def _dependency(layout: RuntimeLayout, warehouse: Warehouse, run_id: str) -> str
     if run.status is not PredictionRunStatus.SCHEDULED and not _interrupted_retirement(run):
         return f"RUN_{run.status.value}"
     bundle_id = result_bundle_id(run_id)
-    if (layout.publications / bundle_id).exists():
-        return "RESULT_BUNDLE_PUBLISHED"
+    # Staging first: bundle-publish renames _incoming/<id>.* -> <id>, so
+    # checking in this order can never miss a bundle that moves between
+    # the two checks.
     incoming = layout.publications / "_incoming"
     if incoming.is_dir() and any(p.name.startswith(f"{bundle_id}.") for p in incoming.iterdir()):
         return "RESULT_UPLOAD_IN_PROGRESS"
+    if (layout.publications / bundle_id).exists():
+        return "RESULT_BUNDLE_PUBLISHED"
     for table in (RESULTS_TABLE, *(name for name, _key in RESULT_TABLES)):
         if warehouse.exists(table) and not warehouse.read(
             table, where=pl.col("run_id") == run_id
@@ -307,15 +310,16 @@ def plan_retirement(
         raise RequestRetirementError(f"unknown retirement mode {mode!r}")
     requests = _read_requests(warehouse)
     open_rows = requests.filter(pl.col("state").is_in(list(_RETIRABLE_STATES)))
-    expired = [
-        row
-        for row in open_rows.sort(["scheduled_as_of", "run_id"]).iter_rows(named=True)
-        if _in_mode(row["prepared_at"], mode)
-        and row["kickoff_at"] is not None
-        and row["kickoff_at"] + EXECUTION_HORIZON <= now
-    ]
     candidates: list[dict[str, Any]] = []
     held: dict[str, str] = {}
+    expired: list[dict[str, Any]] = []
+    for row in open_rows.sort(["scheduled_as_of", "run_id"]).iter_rows(named=True):
+        if not _in_mode(row["prepared_at"], mode):
+            continue
+        if row["kickoff_at"] is None:
+            held[row["run_id"]] = "NO_KICKOFF"  # never retired; surfaced for review
+        elif row["kickoff_at"] + EXECUTION_HORIZON <= now:
+            expired.append(row)
     proofs: dict[str, dict[str, Any]] = {}
     for row in expired:
         blocker = _dependency(layout, warehouse, row["run_id"])
