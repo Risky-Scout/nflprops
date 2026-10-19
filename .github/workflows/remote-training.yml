@@ -129,7 +129,7 @@ jobs:
       # workspace cleanup below deletes it.
       - name: Upload full science output
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: remote-training-output-${{ inputs.mode }}-${{ github.run_id }}
           if-no-files-found: warn
@@ -144,7 +144,7 @@ jobs:
 
       - name: Upload run report and logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: remote-training-${{ inputs.mode }}-${{ github.run_id }}
           if-no-files-found: warn
