@@ -121,6 +121,11 @@ STATE_PENDING_REMOTE_EXECUTION = "PENDING_REMOTE_EXECUTION"
 #: The reason is the run's `failure_code`
 #: (FAILURE_INSUFFICIENT_PRE_CUTOFF_PIT_DATA).
 STATE_NOT_EXECUTABLE = "NOT_EXECUTABLE"
+#: Terminal, OPERATIONAL (never a scientific verdict): a request that was
+#: never executed and whose execution window has closed, retired with an
+#: immutable audit record (`request_retirement`). Its run is FAILED /
+#: REQUEST_RETIRED_OBSOLETE; its snapshot falls back to bounded retention.
+STATE_RETIRED_OBSOLETE = "RETIRED_OBSOLETE"
 
 #: Provider feeds a live official checkpoint's model inputs come from. Each
 #: must have been successfully checked (collector_resource_runs semantics,
@@ -226,6 +231,18 @@ def _read_requests(warehouse: Warehouse) -> pl.DataFrame:
     return frame
 
 
+def _still_preparing(warehouse: Warehouse, claimed: pl.DataFrame) -> pl.DataFrame:
+    """The CURRENT rows of the `claimed` requests that are still PREPARING.
+    Call under the writer lock: `claimed` was read outside it, and another
+    writer (an operator retirement) may have moved a row on since -- writing
+    the stale copy back would resurrect it."""
+    current = _read_requests(warehouse).filter(
+        pl.col("request_id").is_in(claimed["request_id"].to_list())
+        & (pl.col("state") == STATE_PREPARING)
+    )
+    return current.sort(_PREPARING_ORDER)
+
+
 def _upsert_request(warehouse: Warehouse, row: dict[str, Any]) -> None:
     frame = pl.DataFrame([row], schema=_REQUEST_SCHEMA)
     warehouse.append(
@@ -252,7 +269,13 @@ def protected_snapshot_ids(warehouse: Warehouse) -> frozenset[str]:
     request references -- never pruned -- plus the snapshot of a pinned,
     still-unremediated false refusal (`refusal_incidents`), which the
     audited remediation must be able to re-verify."""
-    requests = _read_requests(warehouse).filter(
+    return protected_snapshot_ids_in(_read_requests(warehouse))
+
+
+def protected_snapshot_ids_in(requests: pl.DataFrame) -> frozenset[str]:
+    """`protected_snapshot_ids` over request rows already in hand (e.g. the
+    rows as they would be after a retirement)."""
+    requests = requests.filter(
         pl.col("state").is_in(list(SNAPSHOT_PROTECTING_STATES))
         | (
             (pl.col("state") == STATE_NOT_EXECUTABLE)
@@ -609,7 +632,7 @@ def _finish_preparing(
             # reference it first, so it is never observable as an ordinary,
             # unprotected periodic snapshot -- not by pruning, not by the
             # storage_growth health check.
-            for request in preparing.iter_rows(named=True):
+            for request in _still_preparing(warehouse, preparing).iter_rows(named=True):
                 _upsert_request(
                     warehouse,
                     {
@@ -630,7 +653,7 @@ def _finish_preparing(
         )
     prepared: list[PreparedCheckpoint] = []
     with WriterLock(layout.writer_lock, timeout_seconds=lock_timeout_seconds):
-        for request in preparing.iter_rows(named=True):
+        for request in _still_preparing(warehouse, preparing).iter_rows(named=True):
             bundle_sha, bundle_dir = _publish_request_bundle(
                 layout, warehouse, request, snapshot=snapshot, market_mode=market_mode,
                 config=config,

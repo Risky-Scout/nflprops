@@ -39,7 +39,8 @@ from __future__ import annotations
 import logging
 import os
 import shutil
-from collections.abc import Callable
+import stat
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -361,13 +362,37 @@ def prune_snapshots(
     resolved_lock_path = lock_path or default_lock_path(snapshot_root.parent)
     with WriterLock(resolved_lock_path, timeout_seconds=lock_timeout_seconds):
         keep_ids = protected() if callable(protected) else protected
-        snapshots = [
-            s for s in list_snapshots(snapshot_root) if s.snapshot_id not in keep_ids
-        ]
-        doomed = snapshots[:-keep] if len(snapshots) > keep else []
-        for info in doomed:
-            shutil.rmtree(snapshot_root / info.snapshot_id)
-    return [info.snapshot_id for info in doomed]
+        doomed = plan_prune(snapshot_root, keep=keep, protected=keep_ids)
+        for snapshot_id in doomed:
+            shutil.rmtree(snapshot_root / snapshot_id)
+    return doomed
+
+
+def plan_prune(snapshot_root: Path, *, keep: int, protected: frozenset[str]) -> list[str]:
+    """The snapshot_ids `prune_snapshots` would delete now, oldest first:
+    every unprotected snapshot except the newest `keep`. Read-only (the
+    caller holds the writer lock when the answer must stay true)."""
+    if keep < 1:
+        raise WarehouseSnapshotError("plan_prune requires keep >= 1")
+    snapshots = [s for s in list_snapshots(snapshot_root) if s.snapshot_id not in protected]
+    return [s.snapshot_id for s in (snapshots[:-keep] if len(snapshots) > keep else [])]
+
+
+def exclusive_bytes(snapshot_root: Path, snapshot_ids: Iterable[str]) -> int:
+    """Exact on-disk bytes deleting `snapshot_ids` would free. Snapshots
+    hard-link unchanged files from their predecessor, so a file is freed
+    only when EVERY link to its inode lies inside the deleted set; bytes
+    still linked from a kept snapshot (or anywhere else) are not counted.
+    Read-only."""
+    seen: dict[tuple[int, int], list[int]] = {}  # (dev, ino) -> [links seen, nlink, bytes]
+    for snapshot_id in snapshot_ids:
+        for path in (snapshot_root / snapshot_id).rglob("*"):
+            st = path.lstat()
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            entry = seen.setdefault((st.st_dev, st.st_ino), [0, st.st_nlink, st.st_blocks * 512])
+            entry[0] += 1
+    return sum(size for links, nlink, size in seen.values() if links >= nlink)
 
 
 def list_snapshots(snapshot_root: Path) -> list[SnapshotInfo]:
