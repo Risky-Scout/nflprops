@@ -80,14 +80,17 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Validate required inputs (explicit snapshot_id + expected manifest SHA)
+        env:
+          SNAPSHOT_ID: ${{ inputs.snapshot_id }}
+          EXPECTED_MANIFEST_SHA256: ${{ inputs.expected_manifest_sha256 }}
         run: |
-          if [ -z "${{ inputs.snapshot_id }}" ]; then
+          if [ -z "$SNAPSHOT_ID" ]; then
             echo "::error::snapshot_id is required"; exit 1
           fi
-          if ! [[ "${{ inputs.snapshot_id }}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+          if ! [[ "$SNAPSHOT_ID" =~ ^[A-Za-z0-9_.-]+$ ]]; then
             echo "::error::snapshot_id must be a plain identifier (no path separators)"; exit 1
           fi
-          if ! [[ "${{ inputs.expected_manifest_sha256 }}" =~ ^[0-9a-fA-F]{64}$ ]]; then
+          if ! [[ "$EXPECTED_MANIFEST_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
             echo "::error::expected_manifest_sha256 must be an explicit 64-character hex SHA-256"; exit 1
           fi
 
@@ -111,19 +114,23 @@ jobs:
         # gets its own option string -- never the shared ssh SSH_OPTS.
         env:
           SCP_OPTS: -i ~/.ssh/wizard_deploy_key -P ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+          SNAPSHOT_ID: ${{ inputs.snapshot_id }}
         run: |
           REMOTE="${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}"
           mkdir -p "$RUNNER_TEMP/snapshot-download"
           # shellcheck disable=SC2086
           scp -r $SCP_OPTS \
-            "$REMOTE:$SNAPSHOT_ROOT/${{ inputs.snapshot_id }}" \
-            "$RUNNER_TEMP/snapshot-download/${{ inputs.snapshot_id }}"
+            "$REMOTE:$SNAPSHOT_ROOT/$SNAPSHOT_ID" \
+            "$RUNNER_TEMP/snapshot-download/$SNAPSHOT_ID"
 
       - name: Verify manifest SHA-256 + every file's SHA/size (fails closed on any mismatch)
+        env:
+          SNAPSHOT_ID: ${{ inputs.snapshot_id }}
+          EXPECTED_MANIFEST_SHA256: ${{ inputs.expected_manifest_sha256 }}
         run: |
           python -m nflprops.platform.wizard_runtime bundle-verify \
-            --bundle-dir "$RUNNER_TEMP/snapshot-download/${{ inputs.snapshot_id }}" \
-            --expected-manifest-sha256 "${{ inputs.expected_manifest_sha256 }}"
+            --bundle-dir "$RUNNER_TEMP/snapshot-download/$SNAPSHOT_ID" \
+            --expected-manifest-sha256 "$EXPECTED_MANIFEST_SHA256"
 
       - name: Cleanup downloaded snapshot workspace
         if: always()
@@ -138,14 +145,17 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Validate required inputs
+        env:
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+          SOURCE_DIR: ${{ inputs.source_dir }}
         run: |
-          if [ -z "${{ inputs.bundle_id }}" ]; then
+          if [ -z "$BUNDLE_ID" ]; then
             echo "::error::bundle_id is required"; exit 1
           fi
-          if ! [[ "${{ inputs.bundle_id }}" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+          if ! [[ "$BUNDLE_ID" =~ ^[A-Za-z0-9_.-]+$ ]]; then
             echo "::error::bundle_id must be a plain identifier (no path separators)"; exit 1
           fi
-          if [ -z "${{ inputs.source_dir }}" ]; then
+          if [ -z "$SOURCE_DIR" ]; then
             echo "::error::source_dir is required"; exit 1
           fi
 
@@ -156,12 +166,16 @@ jobs:
       - run: pip install -e ".[dev]"
 
       - name: Build the result bundle + deterministic manifest
+        env:
+          BUNDLE_ID: ${{ inputs.bundle_id }}
+          SOURCE_DIR: ${{ inputs.source_dir }}
+          SCIENCE_SHA: ${{ inputs.science_sha }}
         run: |
           python -m nflprops.platform.wizard_runtime result-bundle build \
-            --bundle-id "${{ inputs.bundle_id }}" \
-            --source-dir "${{ inputs.source_dir }}" \
+            --bundle-id "$BUNDLE_ID" \
+            --source-dir "$SOURCE_DIR" \
             --staging-dir "$RUNNER_TEMP/result-bundle-staging" \
-            --science-sha "${{ inputs.science_sha }}" \
+            --science-sha "$SCIENCE_SHA" \
             --workflow-sha "${{ github.sha }}"
 
       - name: Install SSH key and verified known_hosts
@@ -179,11 +193,12 @@ jobs:
         env:
           SSH_OPTS: -i ~/.ssh/wizard_deploy_key -p ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
           SCP_OPTS: -i ~/.ssh/wizard_deploy_key -P ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+          BUNDLE_ID: ${{ inputs.bundle_id }}
         run: |
           REMOTE="${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}"
           REMOTE_INCOMING_PARENT="$RESULT_BUNDLE_ROOT/_incoming"
-          REMOTE_STAGING="$REMOTE_INCOMING_PARENT/${{ inputs.bundle_id }}"
-          REMOTE_FINAL="$RESULT_BUNDLE_ROOT/${{ inputs.bundle_id }}"
+          REMOTE_STAGING="$REMOTE_INCOMING_PARENT/$BUNDLE_ID"
+          REMOTE_FINAL="$RESULT_BUNDLE_ROOT/$BUNDLE_ID"
 
           # shellcheck disable=SC2086
           ssh $SSH_OPTS "$REMOTE" "mkdir -p '$REMOTE_INCOMING_PARENT'"
