@@ -106,7 +106,7 @@ jobs:
           RELEASE_SHA="$(git rev-parse HEAD)"
           {
             echo "RELEASE_SHA=$RELEASE_SHA"
-            echo "RELEASE_ID=$RELEASE_SHA-${{ github.run_id }}-${{ github.run_attempt }}"
+            echo "RELEASE_ID=${RELEASE_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
             echo "UNIT_SHA256=$(sha256sum deploy/systemd/nflprops-runtime.service | cut -d' ' -f1)"
           } >> "$GITHUB_ENV"
 

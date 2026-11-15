@@ -130,12 +130,23 @@ jobs:
           SNAPSHOT_ID: ${{ steps.select.outputs.snapshot_id }}
           SNAPSHOT_SHA: ${{ steps.select.outputs.snapshot_manifest_sha256 }}
         run: |
+          if ! [[ "$RUN_ID" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::run_id must be 64 lowercase hex before remote copy"; exit 1
+          fi
+          if ! [[ "$SNAPSHOT_ID" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$ ]]; then
+            echo "::error::snapshot_id must be a plain identifier (no path separators)"; exit 1
+          fi
+          if ! [[ "$REQUEST_SHA" =~ ^[0-9a-f]{64}$ ]] || ! [[ "$SNAPSHOT_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::bundle and snapshot manifest SHAs must be 64 lowercase hex"; exit 1
+          fi
           mkdir -p "$RUNNER_TEMP/snapshots"
+          q_request=$(printf '%q' "$RUNTIME_ROOT/publications/checkpoint_requests/$RUN_ID")
+          q_snapshot=$(printf '%q' "$RUNTIME_ROOT/snapshots/$SNAPSHOT_ID")
           # shellcheck disable=SC2086
-          scp -r $SCP_OPTS "$REMOTE:$RUNTIME_ROOT/publications/checkpoint_requests/$RUN_ID" \
+          scp -r $SCP_OPTS "$REMOTE:$q_request" \
             "$RUNNER_TEMP/request"
           # shellcheck disable=SC2086
-          scp -r $SCP_OPTS "$REMOTE:$RUNTIME_ROOT/snapshots/$SNAPSHOT_ID" \
+          scp -r $SCP_OPTS "$REMOTE:$q_snapshot" \
             "$RUNNER_TEMP/snapshots/$SNAPSHOT_ID"
           python -m nflprops.platform.wizard_runtime bundle-verify \
             --bundle-dir "$RUNNER_TEMP/request" --expected-manifest-sha256 "$REQUEST_SHA"
@@ -190,7 +201,14 @@ jobs:
           REFUSAL_CODE: ${{ steps.execute.outputs.refusal_code }}
         run: |
           # The Wizard side re-checks REFUSAL_CODE is scientific and
-          # refuses anything else.
+          # refuses anything else. Arguments are separate argv, after an
+          # allowlist, never concatenated into the remote command string.
+          if ! [[ "$RUN_ID" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::run_id must be 64 lowercase hex"; exit 1
+          fi
+          if ! [[ "$REFUSAL_CODE" =~ ^[A-Z][A-Z_]{2,63}$ ]]; then
+            echo "::error::bad refusal code"; exit 1
+          fi
           # shellcheck disable=SC2086
           ssh $SSH_OPTS "$REMOTE" bash -s -- checkpoint-refuse "$RUNTIME_ROOT" \
             "$RUN_ID" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
@@ -203,6 +221,12 @@ jobs:
           BUNDLE_ID: ${{ steps.select.outputs.bundle_id }}
           SNAPSHOT_ID: ${{ steps.select.outputs.snapshot_id }}
         run: |
+          if ! [[ "$BUNDLE_ID" =~ ^checkpoint-result-[0-9a-f]{64}$ ]]; then
+            echo "::error::bundle_id must be checkpoint-result-<64 hex> with no path separators"; exit 1
+          fi
+          if ! [[ "$SNAPSHOT_ID" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{12}$ ]]; then
+            echo "::error::snapshot_id must be a plain identifier (no path separators)"; exit 1
+          fi
           out="$(python -m nflprops.platform.wizard_runtime result-bundle build \
             --bundle-id "$BUNDLE_ID" \
             --source-dir "$RUNNER_TEMP/out" \
@@ -234,12 +258,19 @@ jobs:
           BUNDLE_ID: ${{ steps.select.outputs.bundle_id }}
           MANIFEST_SHA: ${{ steps.bundle.outputs.manifest_sha256 }}
         run: |
+          if ! [[ "$BUNDLE_ID" =~ ^checkpoint-result-[0-9a-f]{64}$ ]]; then
+            echo "::error::bundle_id must be checkpoint-result-<64 hex> with no path separators"; exit 1
+          fi
+          if ! [[ "$MANIFEST_SHA" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::manifest SHA must be 64 lowercase hex"; exit 1
+          fi
           incoming="$RUNTIME_ROOT/publications/_incoming"
           staging="$incoming/$BUNDLE_ID.$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT"
           final="$RUNTIME_ROOT/publications/$BUNDLE_ID"
           # Quote every value before it is placed in the remote shell.
-          # Safe paths are unchanged by %q; a quote or metacharacter cannot
-          # break out. SSH_OPTS / SCP_OPTS stay unquoted (secret options only).
+          # Identifiers above are allowlisted, so %q leaves safe paths
+          # unchanged and still cannot break out. SSH_OPTS / SCP_OPTS stay
+          # unquoted (secret options only).
           q_incoming=$(printf '%q' "$incoming")
           q_staging=$(printf '%q' "$staging")
           q_final=$(printf '%q' "$final")
@@ -248,7 +279,7 @@ jobs:
           # shellcheck disable=SC2086
           ssh $SSH_OPTS "$REMOTE" "mkdir -p $q_incoming && rm -rf $q_staging"
           # shellcheck disable=SC2086
-          scp -r $SCP_OPTS "$RUNNER_TEMP/bundle/$BUNDLE_ID" "$REMOTE:$staging"
+          scp -r $SCP_OPTS "$RUNNER_TEMP/bundle/$BUNDLE_ID" "$REMOTE:$q_staging"
           # shellcheck disable=SC2086
           ssh $SSH_OPTS "$REMOTE" \
             "$q_python -m nflprops.platform.wizard_runtime bundle-verify --bundle-dir $q_staging --expected-manifest-sha256 $q_manifest && $q_python -m nflprops.platform.wizard_runtime bundle-publish --staging-dir $q_staging --final-dir $q_final"
@@ -262,6 +293,9 @@ jobs:
           BUNDLE_ID: ${{ steps.select.outputs.bundle_id }}
           MANIFEST_SHA: ${{ steps.bundle.outputs.manifest_sha256 || steps.select.outputs.published_sha256 }}
         run: |
+          if ! [[ "$BUNDLE_ID" =~ ^checkpoint-result-[0-9a-f]{64}$ ]]; then
+            echo "::error::bundle_id must be checkpoint-result-<64 hex> with no path separators"; exit 1
+          fi
           [[ "$MANIFEST_SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::no result manifest SHA"; exit 1; }
           # shellcheck disable=SC2086
           ssh $SSH_OPTS "$REMOTE" bash -s -- result-ingest "$RUNTIME_ROOT" "$BUNDLE_ID" "$MANIFEST_SHA" \
@@ -290,6 +324,9 @@ jobs:
           else code=EXECUTOR_FAILED
           fi
           [[ "$code" =~ ^[A-Z][A-Z_]{2,63}$ ]] || code=EXECUTOR_FAILED
+          if ! [[ "$RUN_ID" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::run_id must be 64 lowercase hex"; exit 1
+          fi
           echo "::error::operational failure $code recorded; request $RUN_ID stays PENDING_REMOTE_EXECUTION"
           # shellcheck disable=SC2086
           ssh $SSH_OPTS "$REMOTE" bash -s -- checkpoint-operational-failure "$RUNTIME_ROOT" \

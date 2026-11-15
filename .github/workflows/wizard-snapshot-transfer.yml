@@ -87,7 +87,7 @@ jobs:
           if [ -z "$SNAPSHOT_ID" ]; then
             echo "::error::snapshot_id is required"; exit 1
           fi
-          if ! [[ "$SNAPSHOT_ID" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+          if ! [[ "$SNAPSHOT_ID" =~ ^[A-Za-z0-9_.-]+$ ]] || [[ "$SNAPSHOT_ID" == "." || "$SNAPSHOT_ID" == ".." || "$SNAPSHOT_ID" == *..* ]]; then
             echo "::error::snapshot_id must be a plain identifier (no path separators)"; exit 1
           fi
           if ! [[ "$EXPECTED_MANIFEST_SHA256" =~ ^[0-9a-fA-F]{64}$ ]]; then
@@ -116,11 +116,15 @@ jobs:
           SCP_OPTS: -i ~/.ssh/wizard_deploy_key -P ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
           SNAPSHOT_ID: ${{ inputs.snapshot_id }}
         run: |
+          if ! [[ "$SNAPSHOT_ID" =~ ^[A-Za-z0-9_.-]+$ ]] || [[ "$SNAPSHOT_ID" == "." || "$SNAPSHOT_ID" == ".." || "$SNAPSHOT_ID" == *..* ]]; then
+            echo "::error::snapshot_id must be a plain identifier (no path separators)"; exit 1
+          fi
           REMOTE="${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}"
           mkdir -p "$RUNNER_TEMP/snapshot-download"
+          q_remote=$(printf '%q' "$SNAPSHOT_ROOT/$SNAPSHOT_ID")
           # shellcheck disable=SC2086
           scp -r $SCP_OPTS \
-            "$REMOTE:$SNAPSHOT_ROOT/$SNAPSHOT_ID" \
+            "$REMOTE:$q_remote" \
             "$RUNNER_TEMP/snapshot-download/$SNAPSHOT_ID"
 
       - name: Verify manifest SHA-256 + every file's SHA/size (fails closed on any mismatch)
@@ -152,7 +156,7 @@ jobs:
           if [ -z "$BUNDLE_ID" ]; then
             echo "::error::bundle_id is required"; exit 1
           fi
-          if ! [[ "$BUNDLE_ID" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+          if ! [[ "$BUNDLE_ID" =~ ^[A-Za-z0-9_.-]+$ ]] || [[ "$BUNDLE_ID" == "." || "$BUNDLE_ID" == ".." || "$BUNDLE_ID" == *..* ]]; then
             echo "::error::bundle_id must be a plain identifier (no path separators)"; exit 1
           fi
           if [ -z "$SOURCE_DIR" ]; then
@@ -195,6 +199,9 @@ jobs:
           SCP_OPTS: -i ~/.ssh/wizard_deploy_key -P ${{ secrets.WIZARD_SSH_PORT }} -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
           BUNDLE_ID: ${{ inputs.bundle_id }}
         run: |
+          if ! [[ "$BUNDLE_ID" =~ ^[A-Za-z0-9_.-]+$ ]] || [[ "$BUNDLE_ID" == "." || "$BUNDLE_ID" == ".." || "$BUNDLE_ID" == *..* ]]; then
+            echo "::error::bundle_id must be a plain identifier (no path separators)"; exit 1
+          fi
           REMOTE="${{ secrets.WIZARD_SSH_USER }}@${{ secrets.WIZARD_SSH_HOST }}"
           REMOTE_INCOMING_PARENT="$RESULT_BUNDLE_ROOT/_incoming"
           REMOTE_STAGING="$REMOTE_INCOMING_PARENT/$BUNDLE_ID"
@@ -207,7 +214,7 @@ jobs:
           # shellcheck disable=SC2086
           ssh $SSH_OPTS "$REMOTE" "mkdir -p $q_parent"
           # shellcheck disable=SC2086
-          scp -r $SCP_OPTS "$RUNNER_TEMP/result-bundle-staging" "$REMOTE:$REMOTE_STAGING"
+          scp -r $SCP_OPTS "$RUNNER_TEMP/result-bundle-staging" "$REMOTE:$q_staging"
           # Publication (verify-then-atomic-rename, never overwriting
           # different content) happens through the WIZARD RUNTIME OWNER's
           # own already-deployed CLI -- GitHub never opens the live

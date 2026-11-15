@@ -32,7 +32,7 @@ on:
           - smoke
         default: smoke
       smoke_n_draws:
-        description: "Draw count for smoke mode only. Ignored in production mode, which is always exactly 20,000."
+        description: "Optional smoke-mode draw count. Empty omits --smoke-n-draws. A non-empty value must be a decimal integer from 1 to 2000 with no sign or leading zeros (MAX_SMOKE_N_DRAWS). Ignored in production mode, which is always exactly 20,000."
         required: false
         type: string
         default: ""
@@ -132,7 +132,18 @@ jobs:
             --mode "$MODE"
             --entry-point "$ENTRY_POINT"
           )
-          if [[ "$SMOKE_N_DRAWS" =~ ^[0-9]+$ ]]; then
+          # Empty omits the flag. Any other value must be one integer in
+          # 1..2000. Invalid non-empty input fails instead of being dropped
+          # or spliced into the command line.
+          if [ -n "$SMOKE_N_DRAWS" ]; then
+            if ! [[ "$SMOKE_N_DRAWS" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::smoke_n_draws must be a decimal integer from 1 to 2000, or empty to omit the flag"
+              exit 1
+            fi
+            if [ "${#SMOKE_N_DRAWS}" -gt 4 ] || [ "$SMOKE_N_DRAWS" -gt 2000 ]; then
+              echo "::error::smoke_n_draws must be a decimal integer from 1 to 2000, got ${SMOKE_N_DRAWS}"
+              exit 1
+            fi
             args+=(--smoke-n-draws "$SMOKE_N_DRAWS")
           fi
           python -m nflprops.platform.remote_training run \
