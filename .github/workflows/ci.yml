@@ -170,10 +170,13 @@ jobs:
         with:
           fetch-depth: 0
       - name: Diff against PR base
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
-          git fetch origin "${{ github.event.pull_request.base.ref }}" --quiet
-          BASE="$(git merge-base origin/${{ github.event.pull_request.base.ref }} HEAD)"
-          echo "Comparing HEAD against merge-base $BASE (PR base: ${{ github.event.pull_request.base.ref }})"
+          git fetch --quiet origin -- "$PR_BASE_REF"
+          ref="origin/${PR_BASE_REF}"
+          BASE="$(git merge-base "$ref" HEAD)"
+          echo "Comparing HEAD against merge-base ${BASE} (PR base: ${PR_BASE_REF})"
           git diff --name-only "$BASE"...HEAD > /tmp/changed_files.txt
           cat /tmp/changed_files.txt
 
