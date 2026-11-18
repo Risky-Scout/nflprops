@@ -98,7 +98,7 @@ jobs:
 
       - name: Upload reproducibility evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: historical-repro-${{ github.run_id }}
           if-no-files-found: warn
